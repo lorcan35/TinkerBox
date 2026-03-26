@@ -21,8 +21,8 @@ from aiohttp import web
 HOST = "0.0.0.0"
 PORT = 3501
 CDP_HOST = "127.0.0.1"
-CDP_PORT = 18800
-SCREENCAST_QUALITY = 60   # JPEG quality (0-100)
+CDP_PORT = 9222
+SCREENCAST_QUALITY = 80   # JPEG quality (0-100) — 80 optimal per streaming research
 SCREENCAST_MAX_W = 720
 SCREENCAST_MAX_H = 1280
 SCREENCAST_FPS = 15

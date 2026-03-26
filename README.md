@@ -72,7 +72,7 @@ Connects to Chromium via Chrome DevTools Protocol and bridges to Tab5:
 ### launch-chromium.sh — Browser Launcher
 
 Starts Chromium with:
-- Remote debugging on port 18800 (CDP)
+- Remote debugging on port 9222 (CDP)
 - Mobile viewport (720x1280) matching Tab5 display
 - GPU acceleration disabled (software rendering for stability)
 - No first-run dialogs
@@ -89,7 +89,7 @@ Edit `dragon_server.py` top-level constants:
 HOST = "0.0.0.0"           # Listen on all interfaces
 PORT = 3501                 # Dragon server port
 CDP_HOST = "127.0.0.1"     # Chromium CDP host
-CDP_PORT = 18800            # Chromium CDP port
+CDP_PORT = 9222             # Chromium CDP port
 SCREENCAST_QUALITY = 60     # JPEG quality (0-100)
 SCREENCAST_MAX_W = 720      # Match Tab5 display width
 SCREENCAST_MAX_H = 1280     # Match Tab5 display height

@@ -6,7 +6,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CDP_PORT="${CDP_PORT:-18800}"
+CDP_PORT="${CDP_PORT:-9222}"
 DRAGON_PORT="${DRAGON_PORT:-3501}"
 
 echo "======================================"

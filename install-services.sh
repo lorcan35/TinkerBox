@@ -20,7 +20,7 @@ Wants=network-online.target
 Type=simple
 User=$USER
 Environment=DISPLAY=:0
-Environment=CDP_PORT=18800
+Environment=CDP_PORT=9222
 WorkingDirectory=$SCRIPT_DIR
 ExecStart=/bin/bash $SCRIPT_DIR/launch-chromium.sh
 Restart=on-failure

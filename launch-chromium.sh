@@ -2,9 +2,9 @@
 # Launch Chromium with CDP remote debugging for TinkerBox
 #
 # Tab5 display: 720x1280 portrait
-# CDP port: 18800 (dragon_server.py connects here)
+# CDP port: 9222 (dragon_server.py connects here)
 
-CDP_PORT="${CDP_PORT:-18800}"
+CDP_PORT="${CDP_PORT:-9222}"
 WINDOW_SIZE="720,1280"
 START_URL="${START_URL:-https://www.google.com}"
 

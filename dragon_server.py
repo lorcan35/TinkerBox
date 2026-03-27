@@ -306,11 +306,17 @@ async def touch_ws_handler(request):
 async def index_handler(request):
     """Status page."""
     status = "connected" if cdp_ws and not cdp_ws.closed else "disconnected"
+    udp_info = ""
+    if udp_streamer:
+        s = udp_streamer.stats()
+        udp_info = (f"UDP Stream: {s['backend']} → {s['target'] or 'no target'} "
+                    f"({s['fps']} fps, {s['capture_ms']}ms capture)\n")
     return web.Response(
         text=f"Dragon Streaming Server (TinkerClaw)\n"
              f"CDP: {status} (port {CDP_PORT})\n"
              f"MJPEG: http://{request.host}/stream\n"
              f"Touch WS: ws://{request.host}/ws/touch\n"
+             f"{udp_info}"
              f"Frames: {frame_count}, FPS: {fps:.1f}\n"
              f"Browser viewport: {browser_size[0]}x{browser_size[1]}\n",
         content_type='text/plain')
@@ -328,8 +334,18 @@ async def health_handler(request):
     })
 
 
+async def udp_stats_handler(request):
+    """Return UDP streamer statistics."""
+    if udp_streamer:
+        return web.json_response(udp_streamer.stats())
+    return web.json_response({"error": "UDP streamer not running"}, status=503)
+
+
 async def handshake_handler(request):
-    """Handshake endpoint — Tab5 sends identity, Dragon returns stream params."""
+    """Handshake endpoint — Tab5 sends identity, Dragon returns stream params.
+
+    When a Tab5 connects, also update the UDP streamer target to its IP.
+    """
     device = request.query.get("device", "unknown")
     fw = request.query.get("fw", "unknown")
     w = int(request.query.get("w", 720))
@@ -337,17 +353,56 @@ async def handshake_handler(request):
 
     print(f"[HANDSHAKE] Device: {device}, FW: {fw}, Display: {w}x{h}")
 
-    return web.json_response({
+    # Auto-set UDP streamer target to the connecting Tab5's IP
+    tab5_ip = request.remote
+    if udp_streamer and tab5_ip:
+        udp_streamer.set_target(tab5_ip, UDP_STREAM_PORT)
+        print(f"[HANDSHAKE] UDP streamer target set to {tab5_ip}:{UDP_STREAM_PORT}")
+
+    # Build response — include UDP streaming info if available
+    resp = {
         "stream": "/stream",
         "touch": "/ws/touch",
         "viewport": [SCREENCAST_MAX_W, SCREENCAST_MAX_H],
         "quality": SCREENCAST_QUALITY,
         "fps": SCREENCAST_FPS,
-    })
+    }
+
+    if udp_streamer:
+        resp["udp_stream"] = {
+            "available": True,
+            "port": UDP_STREAM_PORT,
+            "backend": udp_streamer.backend_name,
+            "jpeg_quality": udp_streamer.jpeg_quality,
+            "chunk_size": 1400,
+        }
+    else:
+        resp["udp_stream"] = {"available": False}
+
+    return web.json_response(resp)
 
 
 async def on_startup(app):
-    """Connect to CDP on server start."""
+    """Connect to CDP and start UDP streamer on server start."""
+    global udp_streamer
+
+    # Start UDP JPEG streamer (runs alongside MJPEG for low-latency display)
+    try:
+        udp_streamer = UDPStreamer(
+            target_ip=None,  # Will be set on handshake or via mDNS
+            target_port=UDP_STREAM_PORT,
+            jpeg_quality=50,
+            fps=SCREENCAST_FPS,
+            width=SCREENCAST_MAX_W,
+            height=SCREENCAST_MAX_H,
+        )
+        await udp_streamer.start()
+        print(f"[UDP] Streamer started (backend: {udp_streamer.backend_name}, port: {UDP_STREAM_PORT})")
+    except Exception as e:
+        print(f"[UDP] WARNING: Could not start UDP streamer: {e}")
+        udp_streamer = None
+
+    # Connect to CDP for MJPEG fallback + touch input
     for attempt in range(10):
         try:
             ok = await cdp_connect()
@@ -360,18 +415,32 @@ async def on_startup(app):
     print("[CDP] WARNING: Could not connect to Chrome. MJPEG stream will be empty until Chrome is available.")
 
 
+async def on_shutdown(app):
+    """Stop UDP streamer on server shutdown."""
+    if udp_streamer:
+        await udp_streamer.stop()
+        print("[UDP] Streamer stopped.")
+
+
 app = web.Application()
 app.router.add_get('/', index_handler)
 app.router.add_get('/health', health_handler)
 app.router.add_get('/api/handshake', handshake_handler)
+app.router.add_get('/api/udp-stats', udp_stats_handler)
 app.router.add_get('/stream', mjpeg_handler)
 app.router.add_get('/ws/touch', touch_ws_handler)
 app.on_startup.append(on_startup)
+app.on_shutdown.append(on_shutdown)
 
 if __name__ == '__main__':
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    )
     print(f"Dragon Streaming Server (TinkerClaw)")
     print(f"  CDP: ws://{CDP_HOST}:{CDP_PORT}")
     print(f"  MJPEG: http://0.0.0.0:{PORT}/stream")
     print(f"  Touch: ws://0.0.0.0:{PORT}/ws/touch")
+    print(f"  UDP:   port {UDP_STREAM_PORT} (KMS/DRM grab → JPEG → chunked UDP)")
     print(f"  Screencast: {SCREENCAST_MAX_W}x{SCREENCAST_MAX_H} q={SCREENCAST_QUALITY}")
     web.run_app(app, host=HOST, port=PORT, print=None)

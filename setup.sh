@@ -8,7 +8,7 @@ echo "======================================"
 
 # Python dependencies
 echo "[1/3] Installing Python packages..."
-pip3 install --break-system-packages aiohttp 2>/dev/null || pip3 install aiohttp
+pip3 install --break-system-packages aiohttp Pillow zeroconf 2>/dev/null || pip3 install aiohttp Pillow zeroconf
 
 # Verify Chromium
 echo "[2/3] Checking Chromium..."

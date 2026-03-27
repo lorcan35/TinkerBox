@@ -12,10 +12,15 @@ Tab5 sees a live view of the browser. Taps on Tab5 = clicks in the browser.
 
 import asyncio
 import json
+import logging
 import time
 
 import aiohttp
 from aiohttp import web
+
+from udp_streamer import UDPStreamer
+
+log = logging.getLogger("dragon_server")
 
 # Config
 HOST = "0.0.0.0"
@@ -26,6 +31,7 @@ SCREENCAST_QUALITY = 80   # JPEG quality (0-100) — 80 optimal per streaming re
 SCREENCAST_MAX_W = 720
 SCREENCAST_MAX_H = 1280
 SCREENCAST_FPS = 15
+UDP_STREAM_PORT = 5000     # Port for UDP JPEG streaming to Tab5
 
 # State
 cdp_ws = None                # CDP WebSocket connection
@@ -37,6 +43,7 @@ browser_size = (720, 1280)   # Actual browser viewport size for coordinate mappi
 frame_count = 0
 fps = 0.0
 server_start_time = time.time()
+udp_streamer: UDPStreamer = None  # UDP JPEG streamer instance
 
 
 async def get_cdp_target():
@@ -232,17 +239,6 @@ async def touch_ws_handler(request):
         msg_id += 1
 
     last_touch = None
-    last_touch_time = 0
-    release_task = None
-
-    async def auto_release():
-        """Auto-release mouse if no touch for 150ms (Tab5 doesn't send release events)."""
-        nonlocal last_touch
-        await asyncio.sleep(0.15)
-        if last_touch:
-            await dispatch_mouse(last_touch[0], last_touch[1], "mouseReleased")
-            print(f"[TOUCH] Auto-release at ({last_touch[0]},{last_touch[1]})")
-            last_touch = None
 
     # Start heartbeat ping task
     async def heartbeat_ping():
@@ -266,11 +262,10 @@ async def touch_ws_handler(request):
 
                 touches = data.get('t', [])
                 if not touches:
-                    # Explicit touch release
-                    if release_task:
-                        release_task.cancel()
+                    # Explicit touch release from Tab5
                     if last_touch:
                         await dispatch_mouse(last_touch[0], last_touch[1], "mouseReleased")
+                        print(f"[TOUCH] Released at ({last_touch[0]},{last_touch[1]})")
                         last_touch = None
                     continue
 
@@ -282,10 +277,6 @@ async def touch_ws_handler(request):
                 bx = int(tx * bw / SCREENCAST_MAX_W)
                 by = int(ty * bh / SCREENCAST_MAX_H)
 
-                # Cancel pending auto-release
-                if release_task:
-                    release_task.cancel()
-
                 if last_touch is None:
                     # Touch down
                     await dispatch_mouse(bx, by, "mousePressed")
@@ -294,10 +285,6 @@ async def touch_ws_handler(request):
                     await dispatch_mouse(bx, by, "mouseMoved")
 
                 last_touch = (bx, by)
-
-                # Schedule auto-release (fires if no more touch events arrive)
-                release_task = asyncio.create_task(auto_release())
-
                 print(f"[TOUCH] Tab5({tx},{ty}) → Browser({bx},{by})")
 
             except json.JSONDecodeError:

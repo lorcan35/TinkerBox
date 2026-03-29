@@ -55,8 +55,45 @@ sshpass -p 'radxa' ssh radxa@192.168.1.89 "echo 'radxa' | sudo -S systemctl rest
 - **Audio rates:** Piper TTS outputs 22050Hz, resampled to 16kHz before sending to Tab5. Tab5 upsamples 16k→48k.
 - **moonshine-voice API:** v0.0.51+ changed download API. Check cache before downloading.
 
+## Current Sprint: Phase 0 — The Foundation (March 2026)
+
+**Build order:** Sessions → Conversation Engine → Unified Voice+Text → REST API → Notes → SD Card → Dashboard Viewer
+
+### Issues
+| # | Title | Status |
+|---|-------|--------|
+| #16 | Session management infrastructure | IN PROGRESS |
+| #17 | Multi-turn conversation engine | BLOCKED on #16 |
+| #18 | Unified voice + text input | BLOCKED on #17 |
+| #21 | REST API framework | BLOCKED on #16 |
+| #19 | Notes feature | BLOCKED on #16, #17 |
+| #20 | Tab5 SD card storage | BLOCKED on #19 |
+| #22 | Dashboard conversation viewer | BLOCKED on #21 |
+
+### Architecture Decisions (from scaffolding research)
+- **Session != Connection.** Sessions survive disconnects. Device reconnects → resume.
+- **Conversation items are append-only.** Never mutate messages.
+- **Device is first-class.** Registered with capabilities, tracked online/offline.
+- **OpenAI message format** as universal LLM context representation (convert at adapter layer).
+- **Notes = sessions tagged type='recording'.** Not a parallel system.
+- **Event bus** for decoupled real-time updates (dashboard, notes, skills all subscribe).
+- **Scoped config:** global → device → session. More specific wins.
+- **aiosqlite** for async SQLite. Single db.py module — no raw SQL scattered across files.
+- **Patterns stolen:** LiveKit ChatContext item model, Vocode Transcript metadata, Pipecat Frame taxonomy, StackFlow lifecycle verbs (create/resume/pause/end).
+
+### Schema
+See `schema.sql` — 6 tables: devices, sessions, messages, notes, events, config.
+
+### Acceptance Tests (must pass before features)
+- Create session → send 5 messages → retrieve full history
+- List devices → see which are online
+- Hot-swap LLM backend mid-session
+- Paginate through old sessions via REST API
+- Dashboard shows live conversation via WebSocket events
+
 ## File Structure
 ```
+schema.sql            — Foundation database schema (review before coding)
 dragon_server.py      — CDP streaming + touch WebSocket
 dashboard.py          — Web dashboard (aggregates 3501+3502)
 dragon_voice/         — Voice pipeline package
@@ -67,5 +104,7 @@ dragon_voice/         — Voice pipeline package
   stt/                — STT backends (moonshine, whisper, vosk)
   tts/                — TTS backends (piper, kokoro, edge)
   llm/                — LLM backends (ollama, openrouter, lmstudio, npu_genie)
+  notes/              — Notes module (db, service, api) — being refactored onto sessions
 LEARNINGS.md          — Institutional knowledge (MANDATORY)
+tests/                — E2E test scripts (run on Dragon)
 ```

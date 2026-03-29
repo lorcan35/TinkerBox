@@ -51,11 +51,31 @@ RestartSec=3
 WantedBy=multi-user.target
 EOF
 
+# Voice server service
+cat > /etc/systemd/system/tinkerbox-voice.service << EOF
+[Unit]
+Description=TinkerBox Voice Server (STT/LLM/TTS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$USER
+WorkingDirectory=$SCRIPT_DIR
+ExecStart=/usr/bin/python3 -u -m dragon_voice --log-level INFO
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
 systemctl daemon-reload
-systemctl enable tinkerbox-chromium tinkerbox-dragon
+systemctl enable tinkerbox-chromium tinkerbox-dragon tinkerbox-voice
 
 echo ""
 echo "Services installed! Commands:"
-echo "  sudo systemctl start tinkerbox-chromium tinkerbox-dragon"
+echo "  sudo systemctl start tinkerbox-chromium tinkerbox-dragon tinkerbox-voice"
 echo "  sudo systemctl status tinkerbox-dragon"
-echo "  journalctl -u tinkerbox-dragon -f"
+echo "  sudo systemctl status tinkerbox-voice"
+echo "  journalctl -u tinkerbox-voice -f"

@@ -3,3 +3,5 @@ __pycache__/
 .venv/
 .env
 *.log
+config.local.yaml
+secrets.yaml

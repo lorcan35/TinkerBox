@@ -1,4 +1,5 @@
 aiohttp>=3.9
+aiosqlite>=0.19
 pyyaml>=6.0
 numpy>=1.24
 # STT backends (install what you need)

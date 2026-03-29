@@ -55,6 +55,8 @@ class LLMConfig:
     openrouter_url: str = "https://openrouter.ai/api/v1"
     lmstudio_url: str = "http://localhost:1234/v1"
     lmstudio_model: str = "default"
+    genie_model_dir: str = "/home/radxa/qairt/models/llama32-1b"
+    genie_config: str = "htp-model-config-llama32-1b-gqa.json"
     system_prompt: str = (
         "You are Glyph, a helpful AI assistant on a portable device called "
         "TinkerClaw. Keep responses concise and conversational — they will "

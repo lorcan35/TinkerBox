@@ -33,7 +33,8 @@ Before writing any fix, CHECK LEARNINGS.md first. Your bug might already be docu
 | Voice | 3502 | tinkerclaw-voice | STT/LLM/TTS voice pipeline |
 | mDNS | — | tinkerclaw-mdns | Advertises _tinkerclaw._tcp |
 | Chromium | 9222 | (launched by tinkerclaw) | CDP target browser |
-| Ollama | 11434 | ollama | Local LLM inference |
+| Ollama | 11434 | ollama | Local LLM inference (CPU, slow) |
+| NPU Genie | — | (via voice pipeline) | Llama 3.2 1B on QCS6490 HTP (~8 tok/s) |
 
 ## Deploy
 ```bash
@@ -46,7 +47,8 @@ sshpass -p 'radxa' ssh radxa@192.168.1.89 "echo 'radxa' | sudo -S systemctl rest
 ```
 
 ## Key Technical Notes
-- **ARM64 performance:** Ollama gemma3:4b takes ~20-30s for STT→LLM→TTS. This is expected. Timeouts must be generous (120s+).
+- **NPU inference (preferred):** Llama 3.2 1B on Genie/HTP achieves ~8 tok/s. Use `npu_genie` backend. See `docs/npu-setup.md`.
+- **ARM64 CPU fallback:** Ollama gemma3:4b is ~0.24 tok/s — 30x slower than NPU. Use only when NPU unavailable.
 - **Python packages:** Use `pip install --break-system-packages` on Dragon (PEP 668)
 - **User is radxa, NOT rock:** All service files, paths, and caches must use /home/radxa/
 - **PYTHONPATH:** dragon_voice runs as `python3 -m dragon_voice` with PYTHONPATH=/home/radxa
@@ -64,6 +66,6 @@ dragon_voice/         — Voice pipeline package
   config.yaml         — Default configuration
   stt/                — STT backends (moonshine, whisper, vosk)
   tts/                — TTS backends (piper, kokoro, edge)
-  llm/                — LLM backends (ollama, openrouter, lmstudio)
+  llm/                — LLM backends (ollama, openrouter, lmstudio, npu_genie)
 LEARNINGS.md          — Institutional knowledge (MANDATORY)
 ```

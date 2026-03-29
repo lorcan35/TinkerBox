@@ -7,6 +7,7 @@ _BACKENDS = {
     "ollama": "dragon_voice.llm.ollama_llm.OllamaBackend",
     "openrouter": "dragon_voice.llm.openrouter_llm.OpenRouterBackend",
     "lmstudio": "dragon_voice.llm.lmstudio_llm.LMStudioBackend",
+    "npu_genie": "dragon_voice.llm.npu_genie.NPUGenieBackend",
 }
 
 

@@ -208,3 +208,31 @@ sequentially across the whole file (don't restart per section).
 - **Root Cause:** Unknown. The voice server is confirmed listening on `0.0.0.0:3502` and is accessible from the workstation (curl, browser, wscat all connect fine). Only the ESP32-P4 fails to connect. Suspected causes: ESP-IDF WebSocket transport bug, DNS/host resolution difference between ports, or a subtle socket option mismatch.
 - **Fix:** Still investigating. Workarounds under consideration: reverse proxy through port 3501, use raw TCP instead of WebSocket, or test with a different ESP-IDF WebSocket client library.
 - **Prevention:** When adding a new network service, always test connectivity from the ESP32 client immediately -- do not assume that "if one port works, they all work."
+
+### 25. QAIRT SDK zip extraction fails with unzip
+- **Date:** 2026-03-29
+- **Symptom:** `unzip qairt-v2.37.1.zip` says "cannot find zipfile directory"
+- **Root Cause:** The 1.3GB zip exceeds unzip's internal limits for large archives.
+- **Fix:** Use `7z x` (from `p7zip-full` package) instead of `unzip`.
+- **Prevention:** Always use `7z` for archives over 500MB.
+
+### 26. QCS6490 NPU — V68 vs V73 confusion
+- **Date:** 2026-03-29
+- **Symptom:** `qnn-platform-validator --backend dsp --testBackend` fails looking for V68 calculator stub, even with V73 libs deployed.
+- **Root Cause:** The platform validator hardcodes V68 as first probe target. The Radxa modelscope package (`radxa/Llama3.2-1B-4096-qairt-v68`) ships V68 libs and uses `dsp_arch: v68` in config, suggesting QCS6490 exposes HTP as V68 to userspace despite having V73 hardware.
+- **Fix:** Use the bundled libs from the modelscope download, not the SDK V73 libs. The model package knows the correct HTP version for this SoC.
+- **Prevention:** Always check the model package's `htp_backend_ext_config.json` for `dsp_arch` rather than assuming the HTP version from Qualcomm datasheets.
+
+### 27. NPU Genie — 30x faster than Ollama on ARM64
+- **Date:** 2026-03-29
+- **Symptom:** Ollama gemma3:4b generates at ~0.24 tok/s on QCS6490 CPU — too slow for real-time voice.
+- **Root Cause:** Ollama runs on CPU (ARM Cortex-A78) with no NPU offload. The QCS6490's Hexagon DSP is designed for exactly this workload.
+- **Fix:** Installed QAIRT SDK + Llama 3.2 1B via `genie-t2t-run`. Achieves ~8 tok/s on NPU (HTP backend). ~110 tokens in ~13.6s generation time + ~2s model load.
+- **Prevention:** Always prefer NPU inference on Qualcomm SoCs. CPU-only LLM inference on ARM64 is a last resort.
+
+### 28. genie-t2t-run is stateless (new process per request)
+- **Date:** 2026-03-29
+- **Symptom:** Each genie-t2t-run invocation takes ~2s for model loading before generation begins.
+- **Root Cause:** genie-t2t-run loads the full 1.66GB model from disk into shared memory on every invocation. There is no persistent server mode.
+- **Fix:** Acceptable for now (~2s overhead on ~15s total). Future optimization: write a persistent Genie server that keeps the model loaded in memory.
+- **Prevention:** Factor in cold-start latency when benchmarking NPU inference. Report total time (load+generate) and generation-only time separately.

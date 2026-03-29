@@ -1,7 +1,11 @@
 """WebSocket server for Dragon Voice.
 
 Serves the voice pipeline over WebSocket and provides HTTP endpoints
-for health checks, status, and configuration management.
+for health checks, status, configuration, and the REST API.
+
+Integrates: Database, SessionManager, MessageStore, ConversationEngine, API routes.
+
+refs #16, #17, #18
 """
 
 import asyncio
@@ -12,33 +16,51 @@ from typing import Optional
 
 from aiohttp import web, WSMsgType
 
+from dragon_voice.api import APIRoutes
 from dragon_voice.config import VoiceConfig, config_to_dict, load_config
+from dragon_voice.conversation import ConversationEngine
+from dragon_voice.db import Database
+from dragon_voice.messages import MessageStore
 from dragon_voice.pipeline import VoicePipeline
+from dragon_voice.sessions import SessionManager
 
 logger = logging.getLogger(__name__)
 
 
 class VoiceServer:
-    """Aiohttp-based WebSocket server for the Dragon Voice pipeline."""
+    """Aiohttp-based WebSocket server for the Dragon Voice pipeline.
+
+    Manages device registration, session lifecycle, conversation persistence,
+    and the voice pipeline (STT -> LLM -> TTS).
+    """
 
     def __init__(self, config: VoiceConfig) -> None:
         self._config = config
         self._app: Optional[web.Application] = None
         self._start_time = time.time()
-        self._session_count = 0
-        self._active_sessions: dict[str, VoicePipeline] = {}
 
-        # A shared pipeline for the status page — backends are per-session
-        # but we track the configured names here
+        # Legacy counters (kept for backward compat on status page)
+        self._session_count = 0
+
+        # Active WebSocket sessions: ws_id -> {pipeline, session_id, device_id}
+        self._active_connections: dict[str, dict] = {}
+
+        # Backend names for status page
         self._stt_name = config.stt.backend
         self._tts_name = config.tts.backend
         self._llm_name = config.llm.backend
+
+        # Foundation modules (initialized in on_startup)
+        self._db: Optional[Database] = None
+        self._session_mgr: Optional[SessionManager] = None
+        self._message_store: Optional[MessageStore] = None
+        self._conversation: Optional[ConversationEngine] = None
 
     def create_app(self) -> web.Application:
         """Create and configure the aiohttp application."""
         app = web.Application()
 
-        # HTTP routes
+        # HTTP routes (legacy)
         app.router.add_get("/", self._handle_status)
         app.router.add_get("/health", self._handle_health)
         app.router.add_get("/api/config", self._handle_get_config)
@@ -48,10 +70,64 @@ class VoiceServer:
         app.router.add_get("/ws/voice", self._handle_ws_voice)
 
         # Lifecycle hooks
+        app.on_startup.append(self._on_startup)
         app.on_shutdown.append(self._on_shutdown)
 
         self._app = app
         return app
+
+    # --------------------------------------------------------------- Lifecycle
+
+    async def _on_startup(self, app: web.Application) -> None:
+        """Initialize foundation modules on server start."""
+        logger.info("Initializing foundation modules...")
+
+        # Database
+        self._db = Database()
+        await self._db.initialize()
+
+        # Session manager (with background cleanup)
+        self._session_mgr = SessionManager(self._db)
+        await self._session_mgr.start()
+
+        # Message store
+        self._message_store = MessageStore(self._db)
+
+        # Conversation engine (shared LLM backend for text/API input)
+        self._conversation = ConversationEngine(
+            self._db, self._message_store, self._config.llm
+        )
+        await self._conversation.initialize()
+
+        # REST API routes
+        api = APIRoutes(self._db, self._session_mgr, self._message_store)
+        api.register(app)
+
+        logger.info("Foundation modules initialized")
+
+    async def _on_shutdown(self, app: web.Application) -> None:
+        """Clean up all active sessions and foundation modules on server shutdown."""
+        logger.info("Server shutting down — closing %d connections", len(self._active_connections))
+
+        # Shut down pipelines
+        tasks = []
+        for ws_id, conn in list(self._active_connections.items()):
+            pipeline = conn.get("pipeline")
+            if pipeline:
+                tasks.append(pipeline.shutdown())
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._active_connections.clear()
+
+        # Shut down foundation
+        if self._conversation:
+            await self._conversation.shutdown()
+        if self._session_mgr:
+            await self._session_mgr.stop()
+        if self._db:
+            await self._db.close()
+
+        logger.info("Shutdown complete")
 
     # ------------------------------------------------------------------ HTTP
 
@@ -80,7 +156,7 @@ class VoiceServer:
     <p>TTS Backend: <span class="val">{self._tts_name}</span></p>
     <p>LLM Backend: <span class="val">{self._llm_name}</span></p>
     <p>Uptime: <span class="val">{hours}h {minutes}m {seconds}s</span></p>
-    <p>Active Sessions: <span class="val">{len(self._active_sessions)}</span></p>
+    <p>Active Connections: <span class="val">{len(self._active_connections)}</span></p>
     <p>Total Sessions: <span class="val">{self._session_count}</span></p>
   </div>
 </body>
@@ -93,7 +169,7 @@ class VoiceServer:
             {
                 "status": "ok",
                 "uptime_seconds": round(time.time() - self._start_time, 1),
-                "active_sessions": len(self._active_sessions),
+                "active_connections": len(self._active_connections),
                 "backends": {
                     "stt": self._stt_name,
                     "tts": self._tts_name,
@@ -153,11 +229,13 @@ class VoiceServer:
             self._tts_name = new_config.tts.backend
             self._llm_name = new_config.llm.backend
 
-            # Swap backends on all active sessions
+            # Swap backends on all active pipelines
             swap_tasks = []
-            for session_id, pipeline in self._active_sessions.items():
-                logger.info("Swapping backends for session %s", session_id)
-                swap_tasks.append(pipeline.swap_backends(new_config))
+            for ws_id, conn in self._active_connections.items():
+                pipeline = conn.get("pipeline")
+                if pipeline:
+                    logger.info("Swapping backends for connection %s", ws_id)
+                    swap_tasks.append(pipeline.swap_backends(new_config))
 
             if swap_tasks:
                 await asyncio.gather(*swap_tasks, return_exceptions=True)
@@ -165,7 +243,7 @@ class VoiceServer:
             return web.json_response(
                 {
                     "status": "ok",
-                    "message": f"Config updated, {len(swap_tasks)} sessions reloaded",
+                    "message": f"Config updated, {len(swap_tasks)} pipelines reloaded",
                     "backends": {
                         "stt": new_config.stt.backend,
                         "tts": new_config.tts.backend,
@@ -185,22 +263,15 @@ class VoiceServer:
     async def _handle_ws_voice(self, request: web.Request) -> web.WebSocketResponse:
         """Main voice WebSocket endpoint.
 
-        Protocol:
-          Client -> Server:
-            - Binary frames: raw PCM int16 16kHz mono audio
-            - Text frames (JSON):
-              {"type": "start"}  — begin a new session / reset
-              {"type": "stop"}   — end of speech, process now
-              {"type": "cancel"} — abort current processing
+        Protocol (see docs/protocol.md):
+          Tab5 -> Dragon:
+            - JSON: register, start, stop, cancel, text, record_start, record_stop
+            - Binary: raw PCM int16 16kHz mono audio
 
-          Server -> Client:
-            - Binary frames: PCM int16 audio at TTS sample rate
-            - Text frames (JSON):
-              {"type": "stt", "text": "..."}
-              {"type": "llm", "text": "..."}
-              {"type": "tts_start"}
-              {"type": "tts_end"}
-              {"type": "error", "message": "..."}
+          Dragon -> Tab5:
+            - JSON: session_start, stt, llm, tts_start, tts_end, note_created,
+                    config_update, error, event
+            - Binary: PCM int16 audio at config.tts_sample_rate
         """
         ws = web.WebSocketResponse(
             max_msg_size=10 * 1024 * 1024,  # 10MB max message
@@ -208,11 +279,20 @@ class VoiceServer:
         )
         await ws.prepare(request)
 
-        session_id = f"s{self._session_count}"
+        ws_id = f"ws{self._session_count}"
         self._session_count += 1
-
         peer = request.remote or "unknown"
-        logger.info("WebSocket connected: %s (session %s)", peer, session_id)
+        logger.info("WebSocket connected: %s (ws_id=%s)", peer, ws_id)
+
+        # Connection state — populated after register
+        conn_state: dict = {
+            "ws_id": ws_id,
+            "pipeline": None,
+            "session_id": None,
+            "device_id": None,
+            "registered": False,
+        }
+        self._active_connections[ws_id] = conn_state
 
         # Callbacks for the pipeline
         async def on_audio(audio_bytes: bytes) -> None:
@@ -220,108 +300,235 @@ class VoiceServer:
                 try:
                     await ws.send_bytes(audio_bytes)
                 except Exception:
-                    logger.warning("Failed to send audio to %s", session_id)
+                    logger.warning("Failed to send audio to %s", ws_id)
 
         async def on_event(event: dict) -> None:
             if not ws.closed:
                 try:
                     await ws.send_json(event)
                 except Exception:
-                    logger.warning("Failed to send event to %s", session_id)
-
-        # Create pipeline for this session
-        pipeline = VoicePipeline(self._config, on_audio, on_event)
-
-        try:
-            await pipeline.initialize()
-        except Exception as e:
-            logger.exception("Failed to initialize pipeline for %s", session_id)
-            await ws.send_json(
-                {"type": "error", "message": f"Pipeline init failed: {e}"}
-            )
-            await ws.close()
-            return ws
-
-        self._active_sessions[session_id] = pipeline
-
-        # Send session info
-        await ws.send_json(
-            {
-                "type": "session_start",
-                "session_id": session_id,
-                "stt": pipeline.stt_name,
-                "tts": pipeline.tts_name,
-                "llm": pipeline.llm_name,
-                "tts_sample_rate": pipeline.tts_sample_rate,
-            }
-        )
+                    logger.warning("Failed to send event to %s", ws_id)
 
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.BINARY:
-                    # Raw PCM audio data
-                    logger.debug("Session %s: binary frame %d bytes (buf=%d)",
-                                 session_id, len(msg.data), len(pipeline._audio_buffer))
-                    await pipeline.feed_audio(msg.data)
+                    # Raw PCM audio data — forward to pipeline
+                    pipeline = conn_state.get("pipeline")
+                    if pipeline:
+                        await pipeline.feed_audio(msg.data)
 
                 elif msg.type == WSMsgType.TEXT:
                     try:
                         cmd = json.loads(msg.data)
                     except json.JSONDecodeError:
-                        logger.warning("Invalid JSON from %s: %s", session_id, msg.data[:100])
+                        logger.warning("Invalid JSON from %s: %s", ws_id, msg.data[:100])
                         continue
 
                     cmd_type = cmd.get("type", "")
 
-                    if cmd_type == "start":
-                        pipeline.clear_history()
-                        pipeline._audio_buffer.clear()
-                        logger.info("Session %s: start (history cleared)", session_id)
+                    if cmd_type == "register":
+                        await self._handle_register(ws, conn_state, cmd, on_audio, on_event)
+
+                    elif cmd_type == "start":
+                        pipeline = conn_state.get("pipeline")
+                        if pipeline:
+                            pipeline.clear_history()
+                            pipeline._audio_buffer.clear()
+                            logger.info("Connection %s: start (buffer cleared)", ws_id)
 
                     elif cmd_type == "stop":
-                        buf_size = len(pipeline._audio_buffer)
-                        logger.info("Session %s: stop (buffer=%d bytes, processing=%s)",
-                                    session_id, buf_size, pipeline._processing)
-                        await pipeline.start_processing()
+                        pipeline = conn_state.get("pipeline")
+                        if pipeline:
+                            buf_size = len(pipeline._audio_buffer)
+                            logger.info("Connection %s: stop (buffer=%d bytes)", ws_id, buf_size)
+                            await pipeline.start_processing()
 
                     elif cmd_type == "cancel":
-                        logger.info("Session %s: cancel", session_id)
-                        await pipeline.cancel()
+                        pipeline = conn_state.get("pipeline")
+                        if pipeline:
+                            logger.info("Connection %s: cancel", ws_id)
+                            await pipeline.cancel()
+
+                    elif cmd_type == "text":
+                        await self._handle_text(ws, conn_state, cmd)
+
+                    elif cmd_type == "record_start":
+                        # TODO: recording mode (notes pipeline) — refs future work
+                        logger.info("Connection %s: record_start (not yet implemented)", ws_id)
+
+                    elif cmd_type == "record_stop":
+                        # TODO: recording mode (notes pipeline) — refs future work
+                        logger.info("Connection %s: record_stop (not yet implemented)", ws_id)
+
+                    elif cmd_type == "ping":
+                        # ESP-IDF sends application-level pings (LEARNINGS.md #11)
+                        pass
+
+                    elif cmd_type == "config_ack":
+                        logger.debug("Connection %s: config_ack %s", ws_id, cmd.get("applied"))
 
                     else:
-                        logger.warning("Unknown command from %s: %s", session_id, cmd_type)
+                        logger.warning("Unknown command from %s: %s", ws_id, cmd_type)
 
                 elif msg.type == WSMsgType.ERROR:
-                    logger.error(
-                        "WebSocket error for %s: %s",
-                        session_id,
-                        ws.exception(),
-                    )
+                    logger.error("WebSocket error for %s: %s", ws_id, ws.exception())
                     break
 
         except asyncio.CancelledError:
             pass
         except Exception:
-            logger.exception("WebSocket handler error for %s", session_id)
+            logger.exception("WebSocket handler error for %s", ws_id)
         finally:
-            # Clean up
-            self._active_sessions.pop(session_id, None)
-            await pipeline.shutdown()
-            logger.info("WebSocket disconnected: %s (session %s)", peer, session_id)
+            # Clean up: pause session, mark device offline, shut down pipeline
+            await self._handle_disconnect(conn_state)
+            self._active_connections.pop(ws_id, None)
+            logger.info("WebSocket disconnected: %s (ws_id=%s)", peer, ws_id)
 
         return ws
 
-    # ---------------------------------------------------------------- Lifecycle
+    async def _handle_register(
+        self,
+        ws: web.WebSocketResponse,
+        conn_state: dict,
+        cmd: dict,
+        on_audio,
+        on_event,
+    ) -> None:
+        """Handle device registration message."""
+        device_id = cmd.get("device_id", "")
+        hardware_id = cmd.get("hardware_id", "")
+        requested_session = cmd.get("session_id")
 
-    async def _on_shutdown(self, app: web.Application) -> None:
-        """Clean up all active sessions on server shutdown."""
-        logger.info("Server shutting down — closing %d sessions", len(self._active_sessions))
-        tasks = []
-        for session_id, pipeline in list(self._active_sessions.items()):
-            tasks.append(pipeline.shutdown())
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._active_sessions.clear()
+        if not device_id:
+            await ws.send_json({"type": "error", "code": "session_invalid",
+                                "message": "device_id is required"})
+            return
+
+        ws_id = conn_state["ws_id"]
+        logger.info("Registering device %s (hw=%s) on connection %s", device_id, hardware_id, ws_id)
+
+        # Upsert device in DB
+        await self._db.upsert_device(
+            device_id=device_id,
+            hardware_id=hardware_id,
+            name=cmd.get("name", ""),
+            firmware_ver=cmd.get("firmware_ver", ""),
+            platform=cmd.get("platform", ""),
+            capabilities=cmd.get("capabilities"),
+        )
+        await self._db.add_event(
+            "device.connected", device_id=device_id,
+            data={"platform": cmd.get("platform", ""), "firmware_ver": cmd.get("firmware_ver", "")}
+        )
+
+        # Get or create session
+        session, resumed = await self._session_mgr.get_or_create_session(
+            device_id=device_id,
+            requested_session_id=requested_session,
+            system_prompt=self._config.llm.system_prompt,
+        )
+        session_id = session["id"]
+
+        # Create voice pipeline for this connection
+        pipeline = VoicePipeline(self._config, on_audio, on_event)
+        try:
+            await pipeline.initialize()
+        except Exception as e:
+            logger.exception("Failed to initialize pipeline for %s", ws_id)
+            await ws.send_json({"type": "error", "code": "internal",
+                                "message": f"Pipeline init failed: {e}"})
+            return
+
+        # Update connection state
+        conn_state["pipeline"] = pipeline
+        conn_state["session_id"] = session_id
+        conn_state["device_id"] = device_id
+        conn_state["registered"] = True
+
+        # Send session_start response (per protocol.md)
+        await ws.send_json({
+            "type": "session_start",
+            "session_id": session_id,
+            "device_id": device_id,
+            "resumed": resumed,
+            "message_count": session.get("message_count", 0),
+            "config": {
+                "stt": pipeline.stt_name,
+                "tts": pipeline.tts_name,
+                "llm": pipeline.llm_name,
+                "tts_sample_rate": pipeline.tts_sample_rate,
+                "response_mode": "match_input",
+                "system_prompt": self._config.llm.system_prompt,
+            },
+        })
+
+        logger.info(
+            "Device %s registered on session %s (resumed=%s, ws_id=%s)",
+            device_id, session_id, resumed, ws_id,
+        )
+
+    async def _handle_text(
+        self, ws: web.WebSocketResponse, conn_state: dict, cmd: dict
+    ) -> None:
+        """Handle text input message — goes directly to conversation engine."""
+        session_id = conn_state.get("session_id")
+        if not session_id or not self._conversation:
+            await ws.send_json({"type": "error", "code": "session_invalid",
+                                "message": "Not registered — send register first"})
+            return
+
+        content = cmd.get("content", "").strip()
+        if not content:
+            return
+
+        logger.info("Text input on session %s: %s", session_id, content[:80])
+
+        try:
+            # Stream LLM response via conversation engine
+            full_response = []
+            async for token in self._conversation.process_text_stream(
+                session_id=session_id,
+                text=content,
+                input_mode="text",
+            ):
+                full_response.append(token)
+                if not ws.closed:
+                    await ws.send_json({"type": "llm", "text": token})
+
+            response_text = "".join(full_response)
+
+            # TODO: if response_mode == "always_speak", synthesize TTS here
+            # For now, text input gets text-only response (match_input mode)
+
+            logger.info("Text response on session %s: %s", session_id, response_text[:80])
+
+        except Exception:
+            logger.exception("Text processing error on session %s", session_id)
+            if not ws.closed:
+                await ws.send_json({"type": "error", "code": "llm_failed",
+                                    "message": "Text processing failed"})
+
+    async def _handle_disconnect(self, conn_state: dict) -> None:
+        """Handle WebSocket disconnect: pause session, mark device offline."""
+        session_id = conn_state.get("session_id")
+        device_id = conn_state.get("device_id")
+        pipeline = conn_state.get("pipeline")
+
+        # Pause session (not end — it can be resumed)
+        if session_id and self._session_mgr:
+            await self._session_mgr.pause_session(session_id)
+
+        # Mark device offline
+        if device_id and self._db:
+            await self._db.set_device_online(device_id, False)
+            await self._db.add_event(
+                "device.disconnected", device_id=device_id,
+                data={"session_id": session_id},
+            )
+
+        # Shut down pipeline
+        if pipeline:
+            await pipeline.shutdown()
 
 
 def run_server(config: VoiceConfig) -> None:

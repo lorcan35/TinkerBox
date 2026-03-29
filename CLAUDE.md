@@ -1,9 +1,20 @@
-# TinkerBox — Dragon Server Stack
+# TinkerBox — Dragon Server Stack (THE BRAIN)
+
+## Repo Separation — READ THIS FIRST
+- **TinkerBox** (this repo) = Dragon Q6A server. Python. ALL intelligence lives here.
+  - Owns: STT, LLM, TTS, embeddings, session management, conversation engine, REST API, dashboard, database
+  - Tab5 is a THIN CLIENT. Dragon is the BRAIN.
+- **TinkerTab** (github.com/lorcan35/TinkerTab) = Tab5 firmware. C/ESP-IDF. Display + sensors only.
+  - Owns: LVGL UI, mic/speaker, camera, touch, SD card, WiFi, NVS settings
+  - Sends audio/text to Dragon, receives responses. No AI logic on Tab5.
+- **Protocol:** `docs/protocol.md` defines the WebSocket contract between them. Both repos reference it.
 
 ## Overview
-TinkerBox is the Dragon-side (ARM64) server stack for the TinkerClaw AI device. It runs on a Radxa Zero 3W ("Dragon") and provides:
-- CDP browser streaming to Tab5 (port 3501)
+TinkerBox runs on a Radxa Zero 3W ("Dragon Q6A") and provides:
+- Session management + conversation engine (port 3502)
 - Voice pipeline: STT → LLM → TTS (port 3502)
+- REST API for sessions, notes, devices, config (port 3502)
+- CDP browser streaming to Tab5 (port 3501)
 - Web dashboard for device management (port 3500)
 - mDNS service discovery
 

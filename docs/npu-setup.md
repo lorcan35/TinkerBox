@@ -122,6 +122,23 @@ Expected output:
 
 NPU is **~30x faster** than CPU for LLM inference.
 
+## Model Size Limitations (HTP v68)
+
+The QCS6490's Hexagon DSP presents as **HTP v68**. Genie context binaries are
+compiled for a specific HTP instruction set and are NOT cross-compatible.
+
+| Model | v68 (QCS6490) | v73+ (8 Gen 2+) |
+|-------|---------------|------------------|
+| Llama 3.2 1B | Yes (radxa/modelscope) | Yes |
+| Llama 3.2 3B | **No** — no binaries exist | Yes (HuggingFace, AI Hub) |
+| Llama 3.1 8B+ | No | Varies by SoC |
+
+**The blocker for 3B is HTP architecture, not RAM.** Dragon has 12GB RAM (enough
+for 3B weights at ~2.5GB), but no v68-compatible 3B context binaries exist.
+Sources checked (2026-03-29): HuggingFace Volko76, Radxa ModelScope, Qualcomm AI Hub.
+
+To run 3B+ on NPU, you need a v73+ board (Snapdragon 8 Gen 2 or newer).
+
 ## TinkerBox Integration
 
 Set `llm.backend: npu_genie` in `config.yaml`:

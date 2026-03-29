@@ -236,3 +236,10 @@ sequentially across the whole file (don't restart per section).
 - **Root Cause:** genie-t2t-run loads the full 1.66GB model from disk into shared memory on every invocation. There is no persistent server mode.
 - **Fix:** Acceptable for now (~2s overhead on ~15s total). Future optimization: write a persistent Genie server that keeps the model loaded in memory.
 - **Prevention:** Factor in cold-start latency when benchmarking NPU inference. Report total time (load+generate) and generation-only time separately.
+
+### 29. QCS6490 HTP v68 limits NPU models to 1B parameter class
+- **Date:** 2026-03-29
+- **Symptom:** Wanted to run Llama 3.2 3B on NPU for better quality. Dragon has 12GB RAM — plenty for 3B weights (~2.5GB).
+- **Root Cause:** QCS6490 Hexagon DSP presents as HTP v68. Genie context binaries (`.serialized.bin`) are compiled for a specific HTP instruction set architecture and are NOT cross-compatible between versions. All available 3B quantized models target v73+ (Snapdragon 8 Gen 2 and newer). Sources checked: HuggingFace Volko76 (v73 only), Radxa ModelScope (1B only for v68), Qualcomm AI Hub (QCS6490 not a supported target for 3B export).
+- **Fix:** Stay with Llama 3.2 1B on NPU (~8 tok/s). The blocker is HTP architecture, not RAM.
+- **Prevention:** When evaluating Qualcomm SoCs for LLM inference, check the HTP version (v68/v73/v75/v79), not just RAM. The HTP arch determines which pre-quantized models are available. v73+ (Snapdragon 8 Gen 2+) is the minimum for 3B+ models.

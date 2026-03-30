@@ -90,17 +90,14 @@ class ConversationEngine:
         # Touch session activity
         await self._db.touch_session(session_id)
 
-        # Get system prompt from session
-        session = await self._db.get_session(session_id)
-        system_prompt = ""
-        if session and session.get("system_prompt"):
-            system_prompt = session["system_prompt"]
+        # Build full context from DB (system prompt + last N messages)
+        context = await self._messages.get_context(session_id)
 
-        # Generate LLM response (streaming, collect full text)
+        # Generate LLM response with full conversation context
         t0 = time.monotonic()
         full_response = []
 
-        async for token in self._llm.generate_stream(text, system_prompt):
+        async for token in self._llm.generate_stream_with_messages(context):
             full_response.append(token)
 
         response_text = "".join(full_response)
@@ -158,17 +155,14 @@ class ConversationEngine:
         # Touch session activity
         await self._db.touch_session(session_id)
 
-        # Get system prompt from session
-        session = await self._db.get_session(session_id)
-        system_prompt = ""
-        if session and session.get("system_prompt"):
-            system_prompt = session["system_prompt"]
+        # Build full context from DB (system prompt + last N messages)
+        context = await self._messages.get_context(session_id)
 
-        # Stream LLM response, yielding tokens and collecting full text
+        # Stream LLM response with full conversation context
         t0 = time.monotonic()
         full_response = []
 
-        async for token in self._llm.generate_stream(text, system_prompt):
+        async for token in self._llm.generate_stream_with_messages(context):
             full_response.append(token)
             yield token
 

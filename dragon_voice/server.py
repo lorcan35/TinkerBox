@@ -332,9 +332,10 @@ class VoiceServer:
                     elif cmd_type == "start":
                         pipeline = conn_state.get("pipeline")
                         if pipeline:
-                            pipeline.clear_history()
+                            # Clear audio buffer for new utterance, but NOT conversation
+                            # history — that lives in the DB and persists across turns
                             pipeline._audio_buffer.clear()
-                            logger.info("Connection %s: start (buffer cleared)", ws_id)
+                            logger.info("Connection %s: start (audio buffer cleared)", ws_id)
 
                     elif cmd_type == "stop":
                         pipeline = conn_state.get("pipeline")
@@ -429,8 +430,12 @@ class VoiceServer:
         )
         session_id = session["id"]
 
-        # Create voice pipeline for this connection
-        pipeline = VoicePipeline(self._config, on_audio, on_event)
+        # Create voice pipeline with conversation engine for multi-turn
+        pipeline = VoicePipeline(
+            self._config, on_audio, on_event,
+            conversation_engine=self._conversation,
+            session_id=session_id,
+        )
         try:
             await pipeline.initialize()
         except Exception as e:

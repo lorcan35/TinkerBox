@@ -40,6 +40,8 @@ class VoicePipeline:
         config: VoiceConfig,
         on_audio: Callable[[bytes], Awaitable[None]],
         on_event: Callable[[dict], Awaitable[None]],
+        conversation_engine=None,
+        session_id: str = "",
     ) -> None:
         """Initialize the pipeline.
 
@@ -49,10 +51,16 @@ class VoicePipeline:
                      to send back to the client.
             on_event: Async callback invoked with JSON-serializable event
                      dicts (stt results, llm tokens, status, errors).
+            conversation_engine: Optional ConversationEngine for multi-turn.
+                               If provided, LLM calls go through the engine
+                               (which stores messages in DB for context).
+            session_id: Active session ID (required if conversation_engine is set).
         """
         self._config = config
         self._on_audio = on_audio
         self._on_event = on_event
+        self._conversation_engine = conversation_engine
+        self._session_id = session_id
 
         self._stt: Optional[STTBackend] = None
         self._tts: Optional[TTSBackend] = None
@@ -63,7 +71,7 @@ class VoicePipeline:
         self._last_voice_time = 0.0
         self._is_speaking = False
 
-        # Conversation history (last N turns)
+        # Conversation history (last N turns) — only used without conversation_engine
         self._max_history = 10
 
         # Pipeline state
@@ -222,9 +230,24 @@ class VoicePipeline:
             sentence_buffer = ""
             full_response = ""
 
-            async for token in self._llm.generate_stream(
-                transcript, self._config.llm.system_prompt
-            ):
+            # Choose LLM path: conversation engine (multi-turn) or direct (legacy)
+            if self._conversation_engine and self._session_id:
+                # Multi-turn: routes through ConversationEngine which stores
+                # messages in DB and builds context from history
+                audio_duration = len(audio_data) / (self._config.audio.input_sample_rate * 2)
+                llm_stream = self._conversation_engine.process_text_stream(
+                    session_id=self._session_id,
+                    text=transcript,
+                    input_mode="voice",
+                    audio_duration_s=audio_duration,
+                )
+            else:
+                # Legacy stateless path (no session)
+                llm_stream = self._llm.generate_stream(
+                    transcript, self._config.llm.system_prompt
+                )
+
+            async for token in llm_stream:
                 if self._cancelled:
                     return
 
@@ -253,8 +276,8 @@ class VoicePipeline:
             llm_ms = (time.monotonic() - t0) * 1000
             logger.info("LLM (%.0fms): %s", llm_ms, full_response[:80])
 
-            # Trim conversation history on the LLM backend
-            if hasattr(self._llm, "trim_history"):
+            # Trim in-memory history on legacy path only
+            if not self._conversation_engine and hasattr(self._llm, "trim_history"):
                 self._llm.trim_history(self._max_history)
 
         except asyncio.CancelledError:

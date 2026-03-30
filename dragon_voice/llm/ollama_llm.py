@@ -143,6 +143,56 @@ class OllamaBackend(LLMBackend):
             {"role": "assistant", "content": "".join(full_response)}
         )
 
+    async def generate_stream_with_messages(
+        self, messages: list[dict]
+    ) -> AsyncIterator[str]:
+        """Native multi-turn using Ollama /api/chat with full message context."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=None, sock_read=None)
+            )
+
+        payload = {
+            "model": self._model,
+            "messages": messages,
+            "stream": True,
+            "options": {
+                "num_predict": self._config.max_tokens,
+                "temperature": self._config.temperature,
+            },
+        }
+
+        try:
+            async with self._session.post(
+                f"{self._base_url}/api/chat",
+                json=payload,
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    logger.error("Ollama error %d: %s", resp.status, error_text[:200])
+                    yield f"[Ollama error: {resp.status}]"
+                    return
+
+                async for raw_line in resp.content:
+                    line = raw_line.decode("utf-8", errors="replace").strip()
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if chunk.get("done"):
+                        break
+
+                    token = chunk.get("message", {}).get("content", "")
+                    if token:
+                        yield token
+
+        except aiohttp.ClientError as e:
+            logger.error("Ollama request failed: %s", e)
+            yield f"[Connection error: {e}]"
+
     def clear_history(self) -> None:
         """Clear conversation history."""
         self._conversation.clear()

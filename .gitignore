@@ -1,7 +1,15 @@
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
 .venv/
 .env
 *.log
+*.db
+*.db-shm
+*.db-wal
+*.wav
 config.local.yaml
 secrets.yaml
+.pytest_cache/
+/tmp/

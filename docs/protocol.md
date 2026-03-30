@@ -112,7 +112,9 @@ Sent immediately after registration is processed.
 | Tab5 → Dragon | JSON | `text` | Text input (keyboard/API) |
 | Tab5 → Dragon | JSON | `record_start` | Begin recording mode (for notes) |
 | Tab5 → Dragon | JSON | `record_stop` | End recording — process as note |
-| Dragon → Tab5 | Binary | — | TTS audio: PCM int16 at config.tts_sample_rate |
+| Tab5 → Dragon | JSON | `ping` | Application-level heartbeat (see LEARNINGS.md #11) |
+| Tab5 → Dragon | JSON | `config_ack` | Acknowledge a config_update from Dragon |
+| Dragon → Tab5 | Binary | — | TTS audio: PCM int16 16kHz mono (resampled from TTS engine rate) |
 | Dragon → Tab5 | JSON | `session_start` | Session assignment (section 1.2) |
 | Dragon → Tab5 | JSON | `stt` | Transcription result |
 | Dragon → Tab5 | JSON | `llm` | LLM response text (may stream) |
@@ -234,11 +236,12 @@ Error codes: `stt_failed`, `llm_failed`, `tts_failed`, `session_invalid`, `rate_
 | Encoding | PCM signed 16-bit little-endian |
 | Sample rate (Tab5 → Dragon) | 16000 Hz |
 | Channels | 1 (mono) |
-| Sample rate (Dragon → Tab5) | Specified in `config.tts_sample_rate` (default 22050) |
+| Sample rate (Dragon → Tab5) | 16000 Hz (Dragon resamples from TTS engine rate before sending) |
 | Tab5 hardware rate | 48000 Hz (Tab5 resamples internally) |
 
 Tab5 captures at 48kHz from ES7210, downsamples 3:1 to 16kHz before sending.
-Tab5 receives TTS at config rate, upsamples to 48kHz for ES8388 DAC playback.
+Dragon resamples TTS output (e.g. 22050 Hz from Piper) to 16kHz before sending.
+Tab5 receives 16kHz TTS audio, upsamples to 48kHz for ES8388 DAC playback.
 
 ---
 

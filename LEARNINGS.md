@@ -237,7 +237,35 @@ sequentially across the whole file (don't restart per section).
 - **Fix:** Acceptable for now (~2s overhead on ~15s total). Future optimization: write a persistent Genie server that keeps the model loaded in memory.
 - **Prevention:** Factor in cold-start latency when benchmarking NPU inference. Report total time (load+generate) and generation-only time separately.
 
-### 29. QCS6490 HTP v68 limits NPU models to 1B parameter class
+### 29. Multi-turn conversation via ConversationEngine
+- **Date:** 2026-03-30
+- **Symptom:** N/A (new feature).
+- **Root Cause:** Voice pipeline originally had no conversation memory — each utterance was stateless. Users could not have multi-turn dialogues.
+- **Fix:** Created `ConversationEngine` in `conversation.py` backed by `MessageStore` and `Database`. All messages (user + assistant) are stored in SQLite and the last N messages are loaded as OpenAI-format context for every LLM call. Works identically for voice (post-STT) and text (keyboard/API) input.
+- **Prevention:** Any new input modality must route through ConversationEngine to maintain context. Never call the LLM directly from a handler — always go through the engine.
+
+### 30. Session resume across WebSocket disconnects
+- **Date:** 2026-03-30
+- **Symptom:** Disconnecting and reconnecting (Wi-Fi drop, Tab5 sleep, etc.) started a fresh conversation with no history.
+- **Root Cause:** Sessions were tied to the WebSocket connection lifetime. No persistence layer.
+- **Fix:** `SessionManager` in `sessions.py` implements create/resume/pause/end lifecycle. On disconnect, session status goes to `paused` (not `ended`). On reconnect, Tab5 sends the previous `session_id` in the `register` message and Dragon resumes the session with full message history intact. Auto-cleanup task ends stale sessions after 30 minutes of inactivity.
+- **Prevention:** Session state must always be in the database, never in-memory only. The WebSocket connection is a transport — session lifecycle is independent.
+
+### 31. aiosqlite for async database access
+- **Date:** 2026-03-30
+- **Symptom:** Synchronous sqlite3 calls would block the aiohttp event loop during DB writes, causing audio dropouts and increased latency.
+- **Root Cause:** Python's `sqlite3` module is synchronous. The voice server is fully async (aiohttp).
+- **Fix:** Used `aiosqlite` with WAL journal mode for non-blocking reads and writes. All DB access goes through a single `Database` class in `db.py` — no raw SQL elsewhere.
+- **Prevention:** Never use synchronous I/O in the voice server. All file and database operations must be async or run in a thread pool.
+
+### 32. NPU Genie cold start latency
+- **Date:** 2026-03-30
+- **Symptom:** First genie-t2t-run invocation after boot takes significantly longer than subsequent calls.
+- **Root Cause:** The Hexagon DSP runtime and shared memory mappings are initialized on first use. The 1.66GB model must be loaded from eMMC into shared memory. Subsequent calls within the same session still re-load (genie-t2t-run is stateless per invocation) but benefit from filesystem cache.
+- **Fix:** Acceptable for now. The ~2s model load per call (see #28) is the dominant overhead. A persistent Genie server process would eliminate this entirely.
+- **Prevention:** When benchmarking NPU performance, always discard the first cold-start measurement. Report warm-start latency as the representative number.
+
+### 33. QCS6490 HTP v68 limits NPU models to 1B parameter class
 - **Date:** 2026-03-29
 - **Symptom:** Wanted to run Llama 3.2 3B on NPU for better quality. Dragon has 12GB RAM — plenty for 3B weights (~2.5GB).
 - **Root Cause:** QCS6490 Hexagon DSP presents as HTP v68. Genie context binaries (`.serialized.bin`) are compiled for a specific HTP instruction set architecture and are NOT cross-compatible between versions. All available 3B quantized models target v73+ (Snapdragon 8 Gen 2 and newer). Sources checked: HuggingFace Volko76 (v73 only), Radxa ModelScope (1B only for v68), Qualcomm AI Hub (QCS6490 not a supported target for 3B export).

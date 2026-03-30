@@ -39,7 +39,7 @@ llm:
   lmstudio_url: "http://localhost:1234/v1"
   lmstudio_model: "default"
 
-  system_prompt: "You are Glyph, a helpful AI assistant on a portable device called TinkerClaw. Keep responses concise and conversational — they will be spoken aloud."
+  system_prompt: "You are Tinker, a helpful AI assistant. Give brief, direct answers. Never simulate user responses. Never generate text after your answer. Stop immediately after answering."
   max_tokens: 256
   temperature: 0.7
 

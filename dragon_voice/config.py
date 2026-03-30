@@ -58,9 +58,9 @@ class LLMConfig:
     genie_model_dir: str = "/home/radxa/qairt/models/llama32-1b"
     genie_config: str = "htp-model-config-llama32-1b-gqa.json"
     system_prompt: str = (
-        "You are Glyph, a helpful AI assistant on a portable device called "
-        "TinkerClaw. Keep responses concise and conversational — they will "
-        "be spoken aloud."
+        "You are Tinker, a helpful AI assistant. Give brief, direct answers. "
+        "Never simulate user responses. Never generate text after your answer. "
+        "Stop immediately after answering."
     )
     max_tokens: int = 256
     temperature: float = 0.7

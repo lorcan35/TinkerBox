@@ -24,6 +24,13 @@ logger = logging.getLogger(__name__)
 _SENTENCE_END = re.compile(r"[.!?]\s*$")
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 
+# Hallucination stop patterns — LLMs sometimes simulate user turns or continue
+# generating after answering. Truncate response at these markers.
+_HALLUCINATION_STOPS = re.compile(
+    r"(?:^|\n\n\n|\n)(User:|Human:|Assistant:|<\|end|<\|im_end)",
+    re.IGNORECASE,
+)
+
 # VAD constants
 _SILENCE_THRESHOLD = 500  # RMS amplitude below this = silence (int16 range)
 
@@ -251,9 +258,30 @@ class VoicePipeline:
                 if self._cancelled:
                     return
 
+                # Check for hallucination markers in accumulated response
+                full_response += token
+                halt_match = _HALLUCINATION_STOPS.search(full_response)
+                if halt_match:
+                    # Truncate at the marker — don't send the hallucinated part
+                    logger.warning(
+                        "LLM hallucination detected at pos %d: '%s' — truncating",
+                        halt_match.start(),
+                        halt_match.group()[:30],
+                    )
+                    # Only keep token content before the marker
+                    keep_end = halt_match.start()
+                    discard_start = len(full_response) - len(token)
+                    if keep_end > discard_start:
+                        # Part of this token is before the marker
+                        partial = token[: keep_end - discard_start]
+                        if partial.strip():
+                            await self._on_event({"type": "llm", "text": partial})
+                            sentence_buffer += partial
+                    full_response = full_response[:keep_end]
+                    break
+
                 await self._on_event({"type": "llm", "text": token})
                 sentence_buffer += token
-                full_response += token
 
                 # Check for sentence boundary — flush to TTS
                 if _SENTENCE_END.search(sentence_buffer):

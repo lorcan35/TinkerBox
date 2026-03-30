@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 # Markers emitted by genie-t2t-run around generated text
 _BEGIN_MARKER = "[BEGIN]:"
 _END_MARKER = "[END]"
+_MAX_RESPONSE_CHARS = 300  # Hard limit — kill genie process after this many chars
 
 
 class NPUGenieBackend(LLMBackend):
@@ -102,6 +103,7 @@ class NPUGenieBackend(LLMBackend):
 
         full_response = []
         in_response = False
+        total_chars = 0
 
         async for raw_line in proc.stdout:
             line = raw_line.decode("utf-8", errors="replace")
@@ -117,7 +119,12 @@ class NPUGenieBackend(LLMBackend):
                 text = text.lstrip()
                 if text:
                     full_response.append(text)
+                    total_chars += len(text)
                     yield text
+                if total_chars >= _MAX_RESPONSE_CHARS:
+                    logger.warning("NPU Genie hit %d char limit — killing process", total_chars)
+                    proc.kill()
+                    break
                 continue
 
             if in_response:
@@ -128,7 +135,12 @@ class NPUGenieBackend(LLMBackend):
                     text = line
                 if text:
                     full_response.append(text)
+                    total_chars += len(text)
                     yield text
+                if total_chars >= _MAX_RESPONSE_CHARS:
+                    logger.warning("NPU Genie hit %d char limit — killing process", total_chars)
+                    proc.kill()
+                    break
 
         await proc.wait()
 

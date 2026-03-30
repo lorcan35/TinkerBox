@@ -58,11 +58,11 @@ class LLMConfig:
     genie_model_dir: str = "/home/radxa/qairt/models/llama32-1b"
     genie_config: str = "htp-model-config-llama32-1b-gqa.json"
     system_prompt: str = (
-        "You are Tinker, a helpful AI assistant. Give brief, direct answers. "
-        "Never simulate user responses. Never generate text after your answer. "
-        "Stop immediately after answering."
+        "You are Tinker, a helpful AI assistant. Reply in 1-2 sentences maximum. "
+        "Be concise. Never simulate user responses. Never generate text after "
+        "your answer. Stop immediately after answering."
     )
-    max_tokens: int = 256
+    max_tokens: int = 128
     temperature: float = 0.7
 
 

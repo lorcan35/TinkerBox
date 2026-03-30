@@ -10,7 +10,7 @@
 - **Protocol:** `docs/protocol.md` defines the WebSocket contract between them. Both repos reference it.
 
 ## Overview
-TinkerBox runs on a Radxa Zero 3W ("Dragon Q6A") and provides:
+TinkerBox runs on a Dragon Q6A (Radxa, Qualcomm QCS6490) and provides:
 - Session management + conversation engine (port 3502)
 - Voice pipeline: STT → LLM → TTS (port 3502)
 - REST API for sessions, notes, devices, config (port 3502)
@@ -73,11 +73,11 @@ sshpass -p 'radxa' ssh radxa@192.168.1.89 "echo 'radxa' | sudo -S systemctl rest
 ### Issues
 | # | Title | Status |
 |---|-------|--------|
-| #16 | Session management infrastructure | IN PROGRESS |
-| #17 | Multi-turn conversation engine | BLOCKED on #16 |
-| #18 | Unified voice + text input | BLOCKED on #17 |
-| #21 | REST API framework | BLOCKED on #16 |
-| #19 | Notes feature | BLOCKED on #16, #17 |
+| #16 | Session management infrastructure | DONE (sessions.py, db.py) |
+| #17 | Multi-turn conversation engine | DONE (conversation.py, messages.py) |
+| #18 | Unified voice + text input | DONE (server.py handles both voice and text) |
+| #21 | REST API framework | DONE (api.py, /api/v1/ routes) |
+| #19 | Notes feature | BLOCKED on #16, #17 (schema ready, notes/ module stubbed) |
 | #20 | Tab5 SD card storage | BLOCKED on #19 |
 | #22 | Dashboard conversation viewer | BLOCKED on #21 |
 
@@ -104,18 +104,32 @@ See `schema.sql` — 6 tables: devices, sessions, messages, notes, events, confi
 
 ## File Structure
 ```
-schema.sql            — Foundation database schema (review before coding)
-dragon_server.py      — CDP streaming + touch WebSocket
-dashboard.py          — Web dashboard (aggregates 3501+3502)
-dragon_voice/         — Voice pipeline package
-  server.py           — aiohttp WebSocket voice server
-  pipeline.py         — STT→LLM→TTS orchestration
-  config.py           — Config dataclasses
+schema.sql            — Foundation database schema (6 tables)
+dragon_server.py      — CDP streaming + touch WebSocket (port 3501)
+dashboard.py          — Web dashboard (port 3500, aggregates 3501+3502)
+udp_streamer.py       — UDP JPEG streaming for low-latency display
+dragon_voice/         — Voice pipeline package (port 3502)
+  __init__.py         — Package init
+  __main__.py         — Entry point: python3 -m dragon_voice
+  server.py           — aiohttp WebSocket server + HTTP endpoints
+  pipeline.py         — STT→LLM→TTS orchestration with VAD
+  conversation.py     — Multi-turn ConversationEngine (DB-backed context)
+  sessions.py         — SessionManager (create/resume/pause/end lifecycle)
+  messages.py         — MessageStore (append-only, LLM context builder)
+  db.py               — Async SQLite layer (aiosqlite, WAL mode)
+  api.py              — REST API v1 routes (/api/v1/*)
+  config.py           — Config dataclasses with YAML + env var loading
   config.yaml         — Default configuration
-  stt/                — STT backends (moonshine, whisper, vosk)
-  tts/                — TTS backends (piper, kokoro, edge)
+  stt/                — STT backends (moonshine, whisper_cpp, vosk)
+  tts/                — TTS backends (piper, kokoro, edge_tts)
   llm/                — LLM backends (ollama, openrouter, lmstudio, npu_genie)
-  notes/              — Notes module (db, service, api) — being refactored onto sessions
-LEARNINGS.md          — Institutional knowledge (MANDATORY)
-tests/                — E2E test scripts (run on Dragon)
+  notes/              — Notes module (db, service, api) — stubbed, not yet wired
+tests/                — E2E tests (run on Dragon)
+  test_foundation.py  — Foundation module tests
+  test_multiturn_live.py — Multi-turn conversation tests
+  test_resume_live.py — Session resume tests
+docs/
+  protocol.md         — WebSocket protocol spec (Tab5 ↔ Dragon)
+  npu-setup.md        — Qualcomm NPU / QAIRT SDK setup guide
+LEARNINGS.md          — Institutional knowledge (MANDATORY reading)
 ```

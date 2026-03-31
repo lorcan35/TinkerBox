@@ -1,0 +1,17 @@
+[Unit]
+Description=TinkerClaw Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=radxa
+WorkingDirectory=/home/radxa/TinkerBox
+EnvironmentFile=/home/radxa/tinkerclaw/telegram.env
+ExecStart=/usr/bin/python3 -u /home/radxa/TinkerBox/telegram_bot.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

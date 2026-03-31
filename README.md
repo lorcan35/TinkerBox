@@ -45,6 +45,7 @@ Tab5 (ESP32-P4)                         Dragon Q6A (this repo)
 | Dashboard | 3500 | tinkerclaw-dashboard | Web UI for status, config, device management |
 | Dragon CDP | 3501 | tinkerclaw | MJPEG screencast + touch relay via Chrome DevTools Protocol |
 | Voice + API | 3502 | tinkerclaw-voice | Voice pipeline (STT/LLM/TTS), sessions, REST API |
+| Telegram Bot | -- | tinkerclaw-telegram | Isolated Telegram chat bot using OpenRouter |
 | mDNS | -- | tinkerclaw-mdns | Advertises `_tinkerclaw._tcp` for Tab5 discovery |
 | Chromium | 9222 | (launched by tinkerclaw) | CDP target browser |
 | Ollama | 11434 | ollama | Local LLM inference (CPU fallback, ~0.24 tok/s) |
@@ -78,7 +79,15 @@ pip3 install --break-system-packages -r requirements.txt
 
 # Or install as systemd services for auto-start on boot
 sudo ./install-services.sh
+
+# Optional: isolated Telegram bot service
+cp telegram.env.example telegram.env   # fill in token + OpenRouter key
+sudo install -m 644 systemd/tinkerclaw-telegram.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now tinkerclaw-telegram.service
 ```
+
+See [docs/telegram-bot.md](docs/telegram-bot.md) for the isolated Telegram deployment path.
 
 ### Deploy from workstation
 
@@ -121,6 +130,11 @@ tests/                      -- E2E tests (run on Dragon)
 docs/
   protocol.md               -- WebSocket protocol spec (Tab5 <-> Dragon)
   npu-setup.md              -- Qualcomm NPU / QAIRT SDK setup guide
+  telegram-bot.md           -- Isolated Telegram bot deployment notes
+systemd/
+  tinkerclaw-telegram.service -- Optional Telegram bot service unit
+telegram_bot.py             -- Standalone Telegram polling bot (OpenRouter-backed)
+telegram.env.example        -- Example environment file for Telegram bot secrets
 CLAUDE.md                   -- Dev guide, sprint status, architecture decisions
 LEARNINGS.md                -- Institutional knowledge (MANDATORY reading)
 install-services.sh         -- Install systemd services

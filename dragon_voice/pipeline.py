@@ -86,6 +86,11 @@ class VoicePipeline:
         self._cancelled = False
         self._process_task: Optional[asyncio.Task] = None
 
+        # Dictation mode state
+        self._dictation_mode = False
+        self._segment_buffer = bytearray()
+        self._dictation_segments: list[str] = []
+
     async def initialize(self) -> None:
         """Create and initialize all backends."""
         logger.info("Initializing voice pipeline...")
@@ -113,10 +118,15 @@ class VoicePipeline:
 
         Buffers audio and uses simple VAD to detect end of speech.
         When silence is detected after speech, triggers processing.
+        In dictation mode, Tab5 handles VAD — Dragon just buffers.
         """
+        if self._dictation_mode:
+            # Dictation: buffer in segment buffer, no Dragon-side VAD.
+            # Tab5 sends {"type":"segment"} markers when it detects pauses.
+            self._segment_buffer.extend(audio_bytes)
+            return
+
         if self._processing:
-            # If already processing a previous utterance, ignore new audio
-            # (or could queue it — for now, drop)
             return
 
         self._audio_buffer.extend(audio_bytes)
@@ -194,7 +204,85 @@ class VoicePipeline:
         self._processing = False
         self._cancelled = False
         self._audio_buffer.clear()
+        self._segment_buffer.clear()
         logger.info("Pipeline processing cancelled")
+
+    # ── Dictation mode ─────────────────────────────────────────────
+
+    async def process_segment(self) -> None:
+        """Transcribe audio accumulated since the last segment marker.
+
+        Called when Tab5 sends {"type":"segment"} (VAD pause detected).
+        Sends stt_partial back with the transcribed text.
+        """
+        if len(self._segment_buffer) < 1600:  # < 50ms at 16kHz
+            self._segment_buffer.clear()
+            return
+
+        audio_data = bytes(self._segment_buffer)
+        self._segment_buffer.clear()
+
+        try:
+            t0 = time.monotonic()
+            transcript = await self._stt.transcribe(
+                audio_data, self._config.audio.input_sample_rate
+            )
+            stt_ms = (time.monotonic() - t0) * 1000
+
+            if transcript.strip():
+                self._dictation_segments.append(transcript.strip())
+                await self._on_event({
+                    "type": "stt_partial",
+                    "text": transcript.strip(),
+                })
+                logger.info(
+                    "Dictation segment (%.0fms, %d bytes): %s",
+                    stt_ms, len(audio_data), transcript.strip()[:80],
+                )
+        except Exception:
+            logger.exception("Dictation segment transcription failed")
+
+    async def finish_dictation(self) -> None:
+        """Finalize dictation: transcribe remaining audio, send full transcript.
+
+        Called on {"type":"stop"} when in dictation mode.
+        Skips LLM and TTS — only sends STT results.
+        """
+        # Transcribe any remaining audio in the segment buffer
+        if len(self._segment_buffer) >= 1600:
+            audio_data = bytes(self._segment_buffer)
+            self._segment_buffer.clear()
+            try:
+                transcript = await self._stt.transcribe(
+                    audio_data, self._config.audio.input_sample_rate
+                )
+                if transcript.strip():
+                    self._dictation_segments.append(transcript.strip())
+                    await self._on_event({
+                        "type": "stt_partial",
+                        "text": transcript.strip(),
+                    })
+            except Exception:
+                logger.exception("Final dictation segment transcription failed")
+        else:
+            self._segment_buffer.clear()
+
+        # Send full combined transcript
+        full_text = " ".join(self._dictation_segments)
+        await self._on_event({"type": "stt", "text": full_text})
+
+        logger.info(
+            "Dictation complete: %d segments, %d chars",
+            len(self._dictation_segments), len(full_text),
+        )
+
+        # Reset dictation state
+        self._dictation_segments.clear()
+        self._segment_buffer.clear()
+        self._audio_buffer.clear()
+        self._dictation_mode = False
+
+    # ── Ask mode (existing) ────────────────────────────────────────
 
     async def _process_utterance(self, audio_data: bytes) -> None:
         """Run the full STT -> LLM -> TTS pipeline on a chunk of audio."""

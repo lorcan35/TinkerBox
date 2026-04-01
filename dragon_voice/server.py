@@ -100,7 +100,7 @@ class VoiceServer:
         await self._conversation.initialize()
 
         # REST API routes
-        api = APIRoutes(self._db, self._session_mgr, self._message_store)
+        api = APIRoutes(self._db, self._session_mgr, self._message_store, self._conversation)
         api.register(app)
 
         logger.info("Foundation modules initialized")
@@ -291,6 +291,7 @@ class VoiceServer:
             "session_id": None,
             "device_id": None,
             "registered": False,
+            "mode": "ask",  # "ask" or "dictate"
         }
         self._active_connections[ws_id] = conn_state
 
@@ -332,17 +333,31 @@ class VoiceServer:
                     elif cmd_type == "start":
                         pipeline = conn_state.get("pipeline")
                         if pipeline:
-                            # Clear audio buffer for new utterance, but NOT conversation
-                            # history — that lives in the DB and persists across turns
+                            mode = cmd.get("mode", "ask")
+                            conn_state["mode"] = mode
                             pipeline._audio_buffer.clear()
-                            logger.info("Connection %s: start (audio buffer cleared)", ws_id)
+                            pipeline._dictation_mode = (mode == "dictate")
+                            if mode == "dictate":
+                                pipeline._segment_buffer.clear()
+                                pipeline._dictation_segments.clear()
+                            logger.info("Connection %s: start (mode=%s, audio buffer cleared)", ws_id, mode)
+
+                    elif cmd_type == "segment":
+                        pipeline = conn_state.get("pipeline")
+                        if pipeline and conn_state.get("mode") == "dictate":
+                            logger.info("Connection %s: segment marker", ws_id)
+                            await pipeline.process_segment()
 
                     elif cmd_type == "stop":
                         pipeline = conn_state.get("pipeline")
                         if pipeline:
-                            buf_size = len(pipeline._audio_buffer)
-                            logger.info("Connection %s: stop (buffer=%d bytes)", ws_id, buf_size)
-                            await pipeline.start_processing()
+                            mode = conn_state.get("mode", "ask")
+                            buf_size = len(pipeline._audio_buffer) + len(pipeline._segment_buffer)
+                            logger.info("Connection %s: stop (mode=%s, buffer=%d bytes)", ws_id, mode, buf_size)
+                            if mode == "dictate":
+                                await pipeline.finish_dictation()
+                            else:
+                                await pipeline.start_processing()
 
                     elif cmd_type == "cancel":
                         pipeline = conn_state.get("pipeline")
@@ -353,13 +368,9 @@ class VoiceServer:
                     elif cmd_type == "text":
                         await self._handle_text(ws, conn_state, cmd)
 
-                    elif cmd_type == "record_start":
-                        # TODO: recording mode (notes pipeline) — refs future work
-                        logger.info("Connection %s: record_start (not yet implemented)", ws_id)
-
-                    elif cmd_type == "record_stop":
-                        # TODO: recording mode (notes pipeline) — refs future work
-                        logger.info("Connection %s: record_stop (not yet implemented)", ws_id)
+                    elif cmd_type == "record_start" or cmd_type == "record_stop":
+                        # Superseded by dictation mode (start with mode=dictate)
+                        logger.info("Connection %s: %s (use mode=dictate instead)", ws_id, cmd_type)
 
                     elif cmd_type == "ping":
                         # ESP-IDF sends application-level pings (LEARNINGS.md #11)

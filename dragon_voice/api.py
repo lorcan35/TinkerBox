@@ -15,6 +15,7 @@ from aiohttp import web
 from dragon_voice.db import Database
 from dragon_voice.sessions import SessionManager
 from dragon_voice.messages import MessageStore
+from dragon_voice.conversation import ConversationEngine
 
 logger = logging.getLogger(__name__)
 
@@ -45,10 +46,12 @@ class APIRoutes:
         db: Database,
         session_mgr: SessionManager,
         message_store: MessageStore,
+        conversation: ConversationEngine | None = None,
     ) -> None:
         self._db = db
         self._session_mgr = session_mgr
         self._messages = message_store
+        self._conversation = conversation
 
     def register(self, app: web.Application) -> None:
         """Register all API routes on the aiohttp app."""
@@ -60,6 +63,7 @@ class APIRoutes:
 
         # Messages
         app.router.add_get("/api/v1/sessions/{session_id}/messages", self.list_messages)
+        app.router.add_post("/api/v1/sessions/{session_id}/chat", self.send_chat)
 
         # Devices
         app.router.add_get("/api/v1/devices", self.list_devices)
@@ -137,6 +141,51 @@ class APIRoutes:
             session_id, limit=limit, offset=offset
         )
         return _paginated_response(messages, limit, offset)
+
+    async def send_chat(self, request: web.Request) -> web.Response:
+        """POST /api/v1/sessions/{session_id}/chat {text}
+
+        Send a text message and stream back the LLM response as SSE.
+        """
+        session_id = request.match_info["session_id"]
+        session = await self._session_mgr.get_session(session_id)
+        if not session:
+            return _json_error("Session not found", 404)
+
+        if not self._conversation:
+            return _json_error("Conversation engine not available", 503)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return _json_error("Invalid JSON body")
+
+        text = body.get("text", "").strip()
+        if not text:
+            return _json_error("'text' field is required")
+
+        # Stream SSE response
+        response = web.StreamResponse(headers={
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            "Access-Control-Allow-Origin": "*",
+        })
+        await response.prepare(request)
+
+        try:
+            async for token in self._conversation.process_text_stream(
+                session_id=session_id,
+                text=text,
+                input_mode="text",
+            ):
+                data = json.dumps({"token": token})
+                await response.write(f"data: {data}\n\n".encode())
+        except Exception as e:
+            logger.exception("Chat error on session %s", session_id)
+            await response.write(f"data: {json.dumps({'error': str(e)})}\n\n".encode())
+
+        await response.write(b"data: [DONE]\n\n")
+        return response
 
     # ── Devices ────────────────────────────────────────────────────────
 

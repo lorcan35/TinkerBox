@@ -100,7 +100,8 @@ class VoiceServer:
         await self._conversation.initialize()
 
         # REST API routes
-        api = APIRoutes(self._db, self._session_mgr, self._message_store, self._conversation)
+        api = APIRoutes(self._db, self._session_mgr, self._message_store,
+                        self._conversation, voice_config=self._config)
         api.register(app)
 
         logger.info("Foundation modules initialized")

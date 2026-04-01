@@ -1,6 +1,6 @@
 """REST API routes for TinkerClaw (v1).
 
-Provides HTTP endpoints for sessions, messages, devices, and config.
+Provides HTTP endpoints for sessions, messages, devices, config, and transcription.
 Registered on the aiohttp app by the server module.
 
 refs #21
@@ -8,6 +8,7 @@ refs #21
 
 import json
 import logging
+import time
 from typing import Any
 
 from aiohttp import web
@@ -16,6 +17,8 @@ from dragon_voice.db import Database
 from dragon_voice.sessions import SessionManager
 from dragon_voice.messages import MessageStore
 from dragon_voice.conversation import ConversationEngine
+from dragon_voice.config import VoiceConfig
+from dragon_voice.stt import create_stt, STTBackend
 
 logger = logging.getLogger(__name__)
 
@@ -47,11 +50,14 @@ class APIRoutes:
         session_mgr: SessionManager,
         message_store: MessageStore,
         conversation: ConversationEngine | None = None,
+        voice_config: VoiceConfig | None = None,
     ) -> None:
         self._db = db
         self._session_mgr = session_mgr
         self._messages = message_store
         self._conversation = conversation
+        self._voice_config = voice_config
+        self._stt: STTBackend | None = None  # lazy-initialized on first transcribe
 
     def register(self, app: web.Application) -> None:
         """Register all API routes on the aiohttp app."""
@@ -73,6 +79,9 @@ class APIRoutes:
         app.router.add_get("/api/v1/config", self.list_config)
         app.router.add_get("/api/v1/config/{key}", self.get_config)
         app.router.add_put("/api/v1/config/{key}", self.set_config)
+
+        # Transcription
+        app.router.add_post("/api/v1/transcribe", self.transcribe_audio)
 
         logger.info("API v1 routes registered")
 
@@ -251,3 +260,70 @@ class APIRoutes:
 
         await self._db.set_config(key, value_json, scope, scope_id)
         return web.json_response({"key": key, "value": body["value"], "scope": scope})
+
+    # ── Transcription ─────────────────────────────────────────────────
+
+    async def _ensure_stt(self) -> STTBackend | None:
+        """Lazy-initialize STT backend for transcription API."""
+        if self._stt:
+            return self._stt
+        if not self._voice_config:
+            return None
+        self._stt = create_stt(self._voice_config.stt)
+        await self._stt.initialize()
+        logger.info("STT backend initialized for transcription API: %s", self._stt.name)
+        return self._stt
+
+    async def transcribe_audio(self, request: web.Request) -> web.Response:
+        """POST /api/v1/transcribe
+
+        Accepts raw PCM int16 mono audio (16kHz) or WAV file in the request body.
+        Returns the transcript.
+
+        Headers:
+            Content-Type: application/octet-stream (raw PCM) or audio/wav
+            X-Sample-Rate: 16000 (optional, default 16000)
+
+        Body: raw audio bytes
+
+        Response: {"text": "transcribed text", "duration_s": 5.2, "stt_ms": 1234}
+        """
+        stt = await self._ensure_stt()
+        if not stt:
+            return _json_error("STT backend not available", 503)
+
+        content_type = request.content_type or "application/octet-stream"
+        sample_rate = int(request.headers.get("X-Sample-Rate", "16000"))
+
+        # Read audio data
+        audio_bytes = await request.read()
+        if not audio_bytes or len(audio_bytes) < 100:
+            return _json_error("No audio data in request body")
+
+        # If WAV, strip the 44-byte header to get raw PCM
+        if content_type == "audio/wav" or (len(audio_bytes) > 4 and audio_bytes[:4] == b"RIFF"):
+            # Find "data" chunk
+            data_pos = audio_bytes.find(b"data")
+            if data_pos >= 0 and data_pos + 8 <= len(audio_bytes):
+                audio_bytes = audio_bytes[data_pos + 8:]  # skip "data" + 4-byte size
+            else:
+                audio_bytes = audio_bytes[44:]  # fallback: assume standard 44-byte header
+
+        duration_s = len(audio_bytes) / (sample_rate * 2)  # int16 = 2 bytes/sample
+        logger.info("Transcribe request: %.1fs audio (%d bytes, %dHz)",
+                    duration_s, len(audio_bytes), sample_rate)
+
+        try:
+            t0 = time.monotonic()
+            transcript = await stt.transcribe(audio_bytes, sample_rate)
+            stt_ms = (time.monotonic() - t0) * 1000
+
+            logger.info("Transcribed (%.0fms): %s", stt_ms, transcript[:80])
+            return web.json_response({
+                "text": transcript.strip(),
+                "duration_s": round(duration_s, 1),
+                "stt_ms": round(stt_ms),
+            })
+        except Exception as e:
+            logger.exception("Transcription failed")
+            return _json_error(f"Transcription failed: {e}", 500)

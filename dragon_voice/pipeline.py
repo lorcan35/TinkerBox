@@ -234,6 +234,7 @@ class VoicePipeline:
                 await self._on_event({
                     "type": "stt_partial",
                     "text": transcript.strip(),
+                    "stt_ms": round(stt_ms),
                 })
                 logger.info(
                     "Dictation segment (%.0fms, %d bytes): %s",
@@ -288,6 +289,7 @@ class VoicePipeline:
         """Run the full STT -> LLM -> TTS pipeline on a chunk of audio."""
         self._processing = True
         self._cancelled = False
+        pipeline_start = time.monotonic()
 
         try:
             # Debug: save incoming audio as WAV for inspection
@@ -315,7 +317,7 @@ class VoicePipeline:
                 return
 
             logger.info("STT (%.0fms): %s", stt_ms, transcript)
-            await self._on_event({"type": "stt", "text": transcript})
+            await self._on_event({"type": "stt", "text": transcript, "stt_ms": round(stt_ms)})
 
             if self._cancelled:
                 return
@@ -391,6 +393,7 @@ class VoicePipeline:
 
             llm_ms = (time.monotonic() - t0) * 1000
             logger.info("LLM (%.0fms): %s", llm_ms, full_response[:80])
+            await self._on_event({"type": "llm_done", "llm_ms": round(llm_ms)})
 
             # Trim in-memory history on legacy path only
             if not self._conversation_engine and hasattr(self._llm, "trim_history"):
@@ -407,6 +410,8 @@ class VoicePipeline:
             except Exception:
                 pass
         finally:
+            total_ms = (time.monotonic() - pipeline_start) * 1000
+            logger.info("Pipeline total: %.0fms", total_ms)
             self._processing = False
 
     async def _synthesize_and_send(self, text: str) -> None:
@@ -456,7 +461,7 @@ class VoicePipeline:
                     chunk = audio_bytes[i : i + chunk_size]
                     await self._on_audio(chunk)
 
-            await self._on_event({"type": "tts_end"})
+            await self._on_event({"type": "tts_end", "tts_ms": round(tts_ms)})
 
         except Exception:
             logger.exception("TTS synthesis/send failed for: %.40s...", text)

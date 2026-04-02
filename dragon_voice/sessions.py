@@ -40,8 +40,27 @@ class SessionManager:
 
     async def start(self) -> None:
         """Start the background cleanup task."""
+        # Clean up stale sessions left over from a previous run
+        await self._cleanup_stale_on_startup()
+
         self._cleanup_task = asyncio.create_task(self._cleanup_loop())
         logger.info("SessionManager started (timeout=%ds)", self._timeout_s)
+
+    async def _cleanup_stale_on_startup(self) -> None:
+        """End sessions left active/paused from a previous server run.
+
+        Any session with status 'active' or 'paused' whose last_active_at
+        is older than 30 minutes is presumed orphaned and set to 'ended'.
+        """
+        stale = await self._db.get_stale_sessions(self._timeout_s)
+        for session in stale:
+            await self._db.update_session_status(session["id"], "ended")
+        if stale:
+            logger.info(
+                "Startup cleanup: ended %d stale session(s)", len(stale)
+            )
+        else:
+            logger.debug("Startup cleanup: no stale sessions found")
 
     async def stop(self) -> None:
         """Stop the background cleanup task."""

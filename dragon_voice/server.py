@@ -222,6 +222,14 @@ class VoiceServer:
                     if hasattr(new_config.audio, k):
                         setattr(new_config.audio, k, v)
 
+            # Validate before applying
+            validation_errors = new_config.validate()
+            if validation_errors:
+                return web.json_response(
+                    {"error": "Config validation failed", "details": validation_errors},
+                    status=400,
+                )
+
             old_config = self._config
             self._config = new_config
 

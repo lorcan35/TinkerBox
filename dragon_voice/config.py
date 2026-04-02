@@ -85,6 +85,48 @@ class VoiceConfig:
     llm: LLMConfig = field(default_factory=LLMConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
 
+    def validate(self) -> list[str]:
+        """Validate configuration values.
+
+        Returns a list of error strings. An empty list means the config is valid.
+        """
+        errors: list[str] = []
+
+        valid_stt = ("moonshine", "whisper_cpp", "vosk")
+        if self.stt.backend not in valid_stt:
+            errors.append(
+                f"stt.backend must be one of {valid_stt}, got '{self.stt.backend}'"
+            )
+
+        valid_llm = ("ollama", "openrouter", "lmstudio", "npu_genie")
+        if self.llm.backend not in valid_llm:
+            errors.append(
+                f"llm.backend must be one of {valid_llm}, got '{self.llm.backend}'"
+            )
+
+        valid_tts = ("piper", "kokoro", "edge_tts")
+        if self.tts.backend not in valid_tts:
+            errors.append(
+                f"tts.backend must be one of {valid_tts}, got '{self.tts.backend}'"
+            )
+
+        if self.llm.backend == "openrouter" and not self.llm.openrouter_api_key:
+            errors.append(
+                "llm.openrouter_api_key must not be empty when using openrouter backend"
+            )
+
+        if not (1 <= self.llm.max_tokens <= 4096):
+            errors.append(
+                f"llm.max_tokens must be between 1 and 4096, got {self.llm.max_tokens}"
+            )
+
+        if not (0 <= self.llm.temperature <= 2):
+            errors.append(
+                f"llm.temperature must be between 0 and 2, got {self.llm.temperature}"
+            )
+
+        return errors
+
 
 # Mapping of env vars to config paths — allows overriding any setting
 # Format: DRAGON_VOICE_{SECTION}_{KEY} e.g. DRAGON_VOICE_STT_BACKEND

@@ -29,7 +29,7 @@ class OllamaBackend(LLMBackend):
     async def initialize(self) -> None:
         """Verify Ollama is reachable and the model is available."""
         self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=None, sock_read=None)
+            timeout=aiohttp.ClientTimeout(total=180, sock_read=60)
         )
 
         logger.info(

@@ -425,7 +425,9 @@ class VoicePipeline:
             await self._on_event({"type": "tts_start"})
 
             t0 = time.monotonic()
-            audio_bytes = await self._tts.synthesize(text)
+            audio_bytes = await asyncio.wait_for(
+                self._tts.synthesize(text), timeout=30
+            )
             tts_ms = (time.monotonic() - t0) * 1000
 
             if audio_bytes:

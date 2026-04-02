@@ -142,7 +142,12 @@ class NPUGenieBackend(LLMBackend):
                     proc.kill()
                     break
 
-        await proc.wait()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            logger.error("NPU Genie subprocess timed out after 120s — killing")
+            proc.kill()
+            await proc.wait()
 
         if proc.returncode != 0:
             stderr = await proc.stderr.read()

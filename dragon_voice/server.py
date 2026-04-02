@@ -368,6 +368,12 @@ class VoiceServer:
                             else:
                                 await pipeline.start_processing()
 
+                    elif cmd_type == "clear":
+                        pipeline = conn_state.get("pipeline")
+                        if pipeline:
+                            pipeline.clear_history()
+                            logger.info("Connection %s: conversation history cleared", ws_id)
+
                     elif cmd_type == "cancel":
                         pipeline = conn_state.get("pipeline")
                         if pipeline:

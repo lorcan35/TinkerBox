@@ -58,7 +58,7 @@ class VoiceServer:
 
     def create_app(self) -> web.Application:
         """Create and configure the aiohttp application."""
-        app = web.Application()
+        app = web.Application(client_max_size=32 * 1024 * 1024)  # 32MB for audio uploads
 
         # HTTP routes (legacy)
         app.router.add_get("/", self._handle_status)

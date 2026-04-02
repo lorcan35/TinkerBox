@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import sqlite3
 import time
 import uuid
@@ -11,7 +12,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-NOTES_DIR = Path("/home/radxa/tinkerclaw/notes")
+NOTES_DIR = Path(os.environ.get("TINKERCLAW_NOTES_DIR", "/home/radxa/tinkerclaw/notes"))
 DB_PATH = NOTES_DIR / "notes.db"
 
 

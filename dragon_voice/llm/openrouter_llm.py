@@ -64,23 +64,12 @@ class OpenRouterBackend(LLMBackend):
         except aiohttp.ClientError as e:
             logger.warning("Cannot reach OpenRouter: %s", e)
 
-    async def generate_stream(
-        self, prompt: str, system_prompt: str = ""
+    async def _stream_messages(
+        self, messages: list[dict]
     ) -> AsyncIterator[str]:
-        """Stream tokens from OpenRouter using SSE.
-
-        Uses the OpenAI-compatible /chat/completions endpoint.
-        """
+        """Internal: stream tokens from OpenRouter given a full message list."""
         if self._session is None or self._session.closed:
             await self.initialize()
-
-        sys_prompt = system_prompt or self._config.system_prompt
-
-        messages = []
-        if sys_prompt:
-            messages.append({"role": "system", "content": sys_prompt})
-        messages.extend(self._conversation)
-        messages.append({"role": "user", "content": prompt})
 
         payload = {
             "model": self._model,
@@ -89,8 +78,6 @@ class OpenRouterBackend(LLMBackend):
             "max_tokens": self._config.max_tokens,
             "temperature": self._config.temperature,
         }
-
-        full_response = []
 
         try:
             async with self._session.post(
@@ -127,19 +114,49 @@ class OpenRouterBackend(LLMBackend):
                     delta = choices[0].get("delta", {})
                     token = delta.get("content", "")
                     if token:
-                        full_response.append(token)
                         yield token
 
         except aiohttp.ClientError as e:
             logger.error("OpenRouter request failed: %s", e)
             yield f"[Connection error: {e}]"
-            return
 
-        # Update conversation history
+    async def generate_stream(
+        self, prompt: str, system_prompt: str = ""
+    ) -> AsyncIterator[str]:
+        """Stream tokens from OpenRouter using SSE.
+
+        Uses the OpenAI-compatible /chat/completions endpoint.
+        Maintains in-memory conversation history for the legacy (non-session) path.
+        """
+        sys_prompt = system_prompt or self._config.system_prompt
+
+        messages = []
+        if sys_prompt:
+            messages.append({"role": "system", "content": sys_prompt})
+        messages.extend(self._conversation)
+        messages.append({"role": "user", "content": prompt})
+
+        full_response = []
+        async for token in self._stream_messages(messages):
+            full_response.append(token)
+            yield token
+
+        # Update in-memory conversation history (legacy path only)
         self._conversation.append({"role": "user", "content": prompt})
         self._conversation.append(
             {"role": "assistant", "content": "".join(full_response)}
         )
+
+    async def generate_stream_with_messages(
+        self, messages: list[dict]
+    ) -> AsyncIterator[str]:
+        """Stream tokens using a full OpenAI-format message list.
+
+        Used by ConversationEngine which manages its own DB-backed context.
+        Does NOT touch self._conversation — session isolation is handled by the caller.
+        """
+        async for token in self._stream_messages(messages):
+            yield token
 
     def clear_history(self) -> None:
         """Clear conversation history."""

@@ -32,7 +32,7 @@ llm:
   ollama_url: "http://localhost:11434"
   ollama_model: "llama3.2:latest"
   # openrouter
-  openrouter_api_key: "${env:OPENROUTER_API_KEY}"  # set in ~/.bashrc
+  openrouter_api_key: ""  # reads from OPENROUTER_API_KEY env var if empty
   openrouter_model: "anthropic/claude-3.5-haiku"
   openrouter_url: "https://openrouter.ai/api/v1"
   # lmstudio

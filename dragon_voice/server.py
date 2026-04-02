@@ -104,6 +104,20 @@ class VoiceServer:
                         self._conversation, voice_config=self._config)
         api.register(app)
 
+        # Notes API routes
+        try:
+            from dragon_voice.notes.db import NotesDB
+            from dragon_voice.notes.service import NotesService
+            from dragon_voice.notes.api import setup_routes as setup_notes_routes
+
+            notes_db = NotesDB()
+            notes_db.initialize()
+            notes_svc = NotesService(self._config, notes_db)
+            setup_notes_routes(app, notes_svc)
+            logger.info("Notes API routes registered")
+        except Exception as e:
+            logger.warning("Notes API not available: %s", e)
+
         logger.info("Foundation modules initialized")
 
     async def _on_shutdown(self, app: web.Application) -> None:

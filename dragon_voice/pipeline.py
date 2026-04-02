@@ -313,7 +313,9 @@ class VoicePipeline:
             stt_ms = (time.monotonic() - t0) * 1000
 
             if not transcript.strip():
-                logger.info("STT returned empty transcript, skipping (audio=%d bytes)", len(audio_data))
+                logger.info("STT returned empty transcript (audio=%d bytes)", len(audio_data))
+                await self._on_event({"type": "stt", "text": "", "stt_ms": round(stt_ms)})
+                await self._on_event({"type": "error", "message": "No speech detected"})
                 return
 
             logger.info("STT (%.0fms): %s", stt_ms, transcript)

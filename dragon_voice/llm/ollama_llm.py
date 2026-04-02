@@ -4,6 +4,7 @@ Connects to a local Ollama server via its REST API. Supports streaming
 token generation and conversation history management.
 """
 
+import asyncio
 import json
 import logging
 from typing import AsyncIterator
@@ -105,10 +106,12 @@ class OllamaBackend(LLMBackend):
         full_response = []
 
         try:
-            async with self._session.post(
+            resp_ctx = self._session.post(
                 f"{self._base_url}/api/chat",
                 json=payload,
-            ) as resp:
+            )
+            resp = await asyncio.wait_for(resp_ctx.__aenter__(), timeout=120)
+            try:
                 if resp.status != 200:
                     error_text = await resp.text()
                     logger.error("Ollama error %d: %s", resp.status, error_text[:200])
@@ -131,7 +134,13 @@ class OllamaBackend(LLMBackend):
                     if token:
                         full_response.append(token)
                         yield token
+            finally:
+                await resp_ctx.__aexit__(None, None, None)
 
+        except asyncio.TimeoutError:
+            logger.error("Ollama generation timed out after 120s")
+            yield "[Ollama timeout after 120s]"
+            return
         except aiohttp.ClientError as e:
             logger.error("Ollama request failed: %s", e)
             yield f"[Connection error: {e}]"
@@ -163,10 +172,12 @@ class OllamaBackend(LLMBackend):
         }
 
         try:
-            async with self._session.post(
+            resp_ctx = self._session.post(
                 f"{self._base_url}/api/chat",
                 json=payload,
-            ) as resp:
+            )
+            resp = await asyncio.wait_for(resp_ctx.__aenter__(), timeout=120)
+            try:
                 if resp.status != 200:
                     error_text = await resp.text()
                     logger.error("Ollama error %d: %s", resp.status, error_text[:200])
@@ -188,7 +199,12 @@ class OllamaBackend(LLMBackend):
                     token = chunk.get("message", {}).get("content", "")
                     if token:
                         yield token
+            finally:
+                await resp_ctx.__aexit__(None, None, None)
 
+        except asyncio.TimeoutError:
+            logger.error("Ollama generation timed out after 120s")
+            yield "[Ollama timeout after 120s]"
         except aiohttp.ClientError as e:
             logger.error("Ollama request failed: %s", e)
             yield f"[Connection error: {e}]"

@@ -84,6 +84,8 @@ class VoicePipeline:
         # Pipeline state
         self._processing = False
         self._cancelled = False
+        self._tts_started = False
+        self._tts_total_ms = 0.0
         self._process_task: Optional[asyncio.Task] = None
 
         # Dictation mode state
@@ -289,6 +291,8 @@ class VoicePipeline:
         """Run the full STT -> LLM -> TTS pipeline on a chunk of audio."""
         self._processing = True
         self._cancelled = False
+        self._tts_started = False
+        self._tts_total_ms = 0.0
         pipeline_start = time.monotonic()
 
         try:
@@ -397,6 +401,14 @@ class VoicePipeline:
             logger.info("LLM (%.0fms): %s", llm_ms, full_response[:80])
             await self._on_event({"type": "llm_done", "llm_ms": round(llm_ms)})
 
+            # Send tts_end once after all sentences are done
+            if self._tts_started and not self._cancelled:
+                await self._on_event({
+                    "type": "tts_end",
+                    "tts_ms": round(self._tts_total_ms),
+                })
+                self._tts_started = False
+
             # Trim in-memory history on legacy path only
             if not self._conversation_engine and hasattr(self._llm, "trim_history"):
                 self._llm.trim_history(self._max_history)
@@ -417,12 +429,20 @@ class VoicePipeline:
             self._processing = False
 
     async def _synthesize_and_send(self, text: str) -> None:
-        """Synthesize a sentence, resample to 16kHz, and stream back to client."""
+        """Synthesize a sentence, resample to 16kHz, and stream paced to client.
+
+        Sends tts_start only once per utterance (first call). Paces audio
+        chunks to ~80% of real-time to prevent Tab5 ring buffer overflow.
+        tts_end is NOT sent here — caller sends it after all sentences.
+        """
         if self._cancelled:
             return
 
         try:
-            await self._on_event({"type": "tts_start"})
+            # Send tts_start only on first sentence
+            if not self._tts_started:
+                await self._on_event({"type": "tts_start"})
+                self._tts_started = True
 
             t0 = time.monotonic()
             audio_bytes = await asyncio.wait_for(
@@ -457,15 +477,22 @@ class VoicePipeline:
                     target_rate,
                     text,
                 )
-                # Send audio in chunks to avoid overwhelming the WebSocket
+                # Send audio in chunks, paced to ~80% real-time so Tab5
+                # ring buffer doesn't overflow from burst sends.
+                # 16kHz 16-bit mono = 32000 bytes/sec.
+                # 4096 bytes = 128ms of audio → sleep ~100ms between chunks.
                 chunk_size = 4096
+                pace_sleep = (chunk_size / 2) / target_rate * 0.8  # ~0.1s
                 for i in range(0, len(audio_bytes), chunk_size):
                     if self._cancelled:
                         return
                     chunk = audio_bytes[i : i + chunk_size]
                     await self._on_audio(chunk)
+                    # Pace: sleep between chunks (skip first few for pre-buffer)
+                    if i > chunk_size * 3:
+                        await asyncio.sleep(pace_sleep)
 
-            await self._on_event({"type": "tts_end", "tts_ms": round(tts_ms)})
+            self._tts_total_ms += tts_ms
 
         except Exception:
             logger.exception("TTS synthesis/send failed for: %.40s...", text)

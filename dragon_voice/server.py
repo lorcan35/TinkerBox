@@ -403,7 +403,7 @@ class VoiceServer:
 
                     elif cmd_type == "ping":
                         # ESP-IDF sends application-level pings (LEARNINGS.md #11)
-                        pass
+                        await ws.send_json({"type": "pong"})
 
                     elif cmd_type == "config_ack":
                         logger.debug("Connection %s: config_ack %s", ws_id, cmd.get("applied"))
@@ -542,8 +542,47 @@ class VoiceServer:
 
             response_text = "".join(full_response)
 
-            # TODO: if response_mode == "always_speak", synthesize TTS here
-            # For now, text input gets text-only response (match_input mode)
+            if not ws.closed:
+                await ws.send_json({"type": "llm_done", "llm_ms": 0})
+
+            # Synthesize TTS for the text response (using the connection's pipeline)
+            pipeline = conn_state.get("pipeline")
+            if pipeline and pipeline._tts and response_text.strip() and not ws.closed:
+                try:
+                    await ws.send_json({"type": "tts_start"})
+                    t0 = time.monotonic()
+                    audio_bytes = await asyncio.wait_for(
+                        pipeline._tts.synthesize(response_text), timeout=30
+                    )
+                    tts_ms = (time.monotonic() - t0) * 1000
+
+                    if audio_bytes:
+                        tts_rate = pipeline._tts.sample_rate
+                        target_rate = self._config.audio.input_sample_rate
+                        if tts_rate != target_rate:
+                            import numpy as np
+                            audio_i16 = np.frombuffer(audio_bytes, dtype=np.int16)
+                            ratio = target_rate / tts_rate
+                            new_len = int(len(audio_i16) * ratio)
+                            indices = np.arange(new_len) / ratio
+                            idx_floor = np.clip(indices.astype(np.int32), 0, len(audio_i16) - 2)
+                            frac = indices - idx_floor
+                            audio_bytes = (audio_i16[idx_floor] * (1 - frac)
+                                         + audio_i16[idx_floor + 1] * frac).astype(np.int16).tobytes()
+
+                        chunk_size = 4096
+                        pace_sleep = (chunk_size / 2) / target_rate * 0.8
+                        for i in range(0, len(audio_bytes), chunk_size):
+                            chunk = audio_bytes[i:i + chunk_size]
+                            if not ws.closed:
+                                await ws.send_bytes(chunk)
+                            if i > chunk_size * 3:
+                                await asyncio.sleep(pace_sleep)
+
+                    if not ws.closed:
+                        await ws.send_json({"type": "tts_end", "tts_ms": round(tts_ms)})
+                except Exception:
+                    logger.exception("TTS for text input failed")
 
             logger.info("Text response on session %s: %s", session_id, response_text[:80])
 

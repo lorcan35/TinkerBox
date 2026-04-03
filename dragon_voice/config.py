@@ -32,6 +32,9 @@ class STTConfig:
     moonshine_model_path: str = ""
     whisper_model_path: str = ""
     vosk_model_path: str = ""
+    # OpenRouter cloud STT (key auto-populated from llm.openrouter_api_key)
+    openrouter_api_key: str = ""
+    openrouter_url: str = "https://openrouter.ai/api/v1"
 
 
 @dataclass
@@ -43,6 +46,10 @@ class TTSConfig:
     kokoro_voice: str = "af_heart"
     edge_voice: str = "en-US-AriaNeural"
     sample_rate: int = 22050
+    # OpenRouter cloud TTS (key auto-populated from llm.openrouter_api_key)
+    openrouter_api_key: str = ""
+    openrouter_url: str = "https://openrouter.ai/api/v1"
+    openrouter_voice: str = "alloy"
 
 
 @dataclass
@@ -92,7 +99,7 @@ class VoiceConfig:
         """
         errors: list[str] = []
 
-        valid_stt = ("moonshine", "whisper_cpp", "vosk")
+        valid_stt = ("moonshine", "whisper_cpp", "vosk", "openrouter")
         if self.stt.backend not in valid_stt:
             errors.append(
                 f"stt.backend must be one of {valid_stt}, got '{self.stt.backend}'"
@@ -104,7 +111,7 @@ class VoiceConfig:
                 f"llm.backend must be one of {valid_llm}, got '{self.llm.backend}'"
             )
 
-        valid_tts = ("piper", "kokoro", "edge_tts")
+        valid_tts = ("piper", "kokoro", "edge_tts", "openrouter")
         if self.tts.backend not in valid_tts:
             errors.append(
                 f"tts.backend must be one of {valid_tts}, got '{self.tts.backend}'"
@@ -208,13 +215,23 @@ def load_config(path: Optional[str] = None) -> VoiceConfig:
     raw = _apply_env_overrides(raw)
 
     # Build typed config
-    return VoiceConfig(
+    config = VoiceConfig(
         server=_dict_to_dataclass(ServerConfig, raw["server"]),
         stt=_dict_to_dataclass(STTConfig, raw["stt"]),
         tts=_dict_to_dataclass(TTSConfig, raw["tts"]),
         llm=_dict_to_dataclass(LLMConfig, raw["llm"]),
         audio=_dict_to_dataclass(AudioConfig, raw["audio"]),
     )
+
+    # Auto-propagate OpenRouter API key to STT/TTS when using cloud backends
+    if config.stt.backend == "openrouter" and not config.stt.openrouter_api_key:
+        config.stt.openrouter_api_key = config.llm.openrouter_api_key
+        config.stt.openrouter_url = config.llm.openrouter_url
+    if config.tts.backend == "openrouter" and not config.tts.openrouter_api_key:
+        config.tts.openrouter_api_key = config.llm.openrouter_api_key
+        config.tts.openrouter_url = config.llm.openrouter_url
+
+    return config
 
 
 def config_to_dict(config: VoiceConfig, redact_secrets: bool = False) -> dict:

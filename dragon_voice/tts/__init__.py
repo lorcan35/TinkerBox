@@ -7,6 +7,7 @@ _BACKENDS = {
     "piper": "dragon_voice.tts.piper_tts.PiperBackend",
     "kokoro": "dragon_voice.tts.kokoro_tts.KokoroBackend",
     "edge_tts": "dragon_voice.tts.edge_tts_backend.EdgeTTSBackend",
+    "openrouter": "dragon_voice.tts.openrouter_tts.OpenRouterTTSBackend",
 }
 
 

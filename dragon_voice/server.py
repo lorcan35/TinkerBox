@@ -425,6 +425,38 @@ class VoiceServer:
                         # ESP-IDF sends application-level pings (LEARNINGS.md #11)
                         await ws.send_json({"type": "pong"})
 
+                    elif cmd_type == "config_update":
+                        # Tab5 requests cloud mode toggle
+                        cloud_mode = cmd.get("cloud_mode")
+                        if cloud_mode is not None:
+                            stt_be = "openrouter" if cloud_mode else "moonshine"
+                            tts_be = "openrouter" if cloud_mode else "piper"
+                            logger.info("Connection %s: cloud_mode=%s → stt=%s tts=%s",
+                                        ws_id, cloud_mode, stt_be, tts_be)
+                            # Update config and hot-swap backends
+                            self._config.stt.backend = stt_be
+                            self._config.tts.backend = tts_be
+                            # Propagate API key for cloud backends
+                            if cloud_mode:
+                                self._config.stt.openrouter_api_key = self._config.llm.openrouter_api_key
+                                self._config.stt.openrouter_url = self._config.llm.openrouter_url
+                                self._config.tts.openrouter_api_key = self._config.llm.openrouter_api_key
+                                self._config.tts.openrouter_url = self._config.llm.openrouter_url
+                            # Swap backends on active pipeline
+                            pipeline = conn_state.get("pipeline")
+                            if pipeline:
+                                await pipeline.swap_backends(self._config)
+                            # Confirm to Tab5
+                            if not ws.closed:
+                                await ws.send_json({
+                                    "type": "config_update",
+                                    "config": {
+                                        "stt": stt_be, "tts": tts_be,
+                                        "llm": self._config.llm.backend,
+                                        "cloud_mode": bool(cloud_mode),
+                                    },
+                                })
+
                     elif cmd_type == "config_ack":
                         logger.debug("Connection %s: config_ack %s", ws_id, cmd.get("applied"))
 

@@ -7,6 +7,7 @@ _BACKENDS = {
     "whisper_cpp": "dragon_voice.stt.whisper_cpp.WhisperCppBackend",
     "moonshine": "dragon_voice.stt.moonshine_stt.MoonshineBackend",
     "vosk": "dragon_voice.stt.vosk_stt.VoskBackend",
+    "openrouter": "dragon_voice.stt.openrouter_stt.OpenRouterSTTBackend",
 }
 
 

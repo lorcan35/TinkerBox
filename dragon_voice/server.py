@@ -386,6 +386,26 @@ class VoiceServer:
                         pipeline = conn_state.get("pipeline")
                         if pipeline:
                             pipeline.clear_history()
+                        # End current session and create a fresh one (clears DB context)
+                        old_sid = conn_state.get("session_id")
+                        device_id = conn_state.get("device_id")
+                        if old_sid and self._session_mgr:
+                            await self._session_mgr.end_session(old_sid)
+                            session, _ = await self._session_mgr.create_session(
+                                device_id=device_id, type="conversation"
+                            )
+                            conn_state["session_id"] = session["id"]
+                            logger.info("Connection %s: history cleared, new session %s",
+                                        ws_id, session["id"])
+                            if not ws.closed:
+                                await ws.send_json({
+                                    "type": "session_start",
+                                    "session_id": session["id"],
+                                    "device_id": device_id,
+                                    "resumed": False,
+                                    "message_count": 0,
+                                })
+                        else:
                             logger.info("Connection %s: conversation history cleared", ws_id)
 
                     elif cmd_type == "cancel":
@@ -489,6 +509,7 @@ class VoiceServer:
         conn_state["session_id"] = session_id
         conn_state["device_id"] = device_id
         conn_state["registered"] = True
+        conn_state["response_mode"] = "always_speak"  # voice device gets TTS
 
         # Send session_start response (per protocol.md)
         await ws.send_json({
@@ -545,9 +566,12 @@ class VoiceServer:
             if not ws.closed:
                 await ws.send_json({"type": "llm_done", "llm_ms": 0})
 
-            # Synthesize TTS for the text response (using the connection's pipeline)
+            # Synthesize TTS for the text response (only if response_mode != match_input)
+            # match_input = text in, text out. always_speak = always TTS.
             pipeline = conn_state.get("pipeline")
-            if pipeline and pipeline._tts and response_text.strip() and not ws.closed:
+            response_mode = conn_state.get("response_mode", "always_speak")
+            if (pipeline and pipeline._tts and response_text.strip()
+                    and not ws.closed and response_mode != "match_input"):
                 try:
                     await ws.send_json({"type": "tts_start"})
                     t0 = time.monotonic()
@@ -583,6 +607,9 @@ class VoiceServer:
                         await ws.send_json({"type": "tts_end", "tts_ms": round(tts_ms)})
                 except Exception:
                     logger.exception("TTS for text input failed")
+                    # Always send tts_end so Tab5 doesn't hang in SPEAKING
+                    if not ws.closed:
+                        await ws.send_json({"type": "tts_end", "tts_ms": 0})
 
             logger.info("Text response on session %s: %s", session_id, response_text[:80])
 

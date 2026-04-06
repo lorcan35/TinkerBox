@@ -285,6 +285,54 @@ class VoicePipeline:
         self._audio_buffer.clear()
         self._dictation_mode = False
 
+        # Post-process: generate title + summary via LLM (async, non-blocking)
+        if full_text.strip() and len(full_text) > 20:
+            asyncio.ensure_future(self._post_process_dictation(full_text))
+
+    async def _post_process_dictation(self, transcript: str) -> None:
+        """Generate title + summary for completed dictation via LLM."""
+        llm = None
+        if self._conversation_engine and self._conversation_engine.llm:
+            llm = self._conversation_engine.llm
+        elif self._llm:
+            llm = self._llm
+
+        if not llm:
+            logger.warning("No LLM available for dictation post-processing")
+            return
+
+        prompt = (
+            "Given this voice transcript, provide:\n"
+            "1. A short title (max 8 words)\n"
+            "2. A 1-2 sentence summary\n\n"
+            f"Transcript: {transcript[:2000]}\n\n"
+            "Respond in this exact format:\n"
+            "TITLE: <title>\nSUMMARY: <summary>"
+        )
+
+        try:
+            response = ""
+            async for token in llm.generate_stream(prompt, "You are a concise note summarizer."):
+                response += token
+
+            title = "Untitled Note"
+            summary = transcript[:200]
+            for line in response.split("\n"):
+                line = line.strip()
+                if line.upper().startswith("TITLE:"):
+                    title = line[6:].strip().strip('"')
+                elif line.upper().startswith("SUMMARY:"):
+                    summary = line[8:].strip().strip('"')
+
+            logger.info("Dictation summary: title='%s'", title)
+            await self._on_event({
+                "type": "dictation_summary",
+                "title": title,
+                "summary": summary,
+            })
+        except Exception:
+            logger.exception("Dictation post-processing failed")
+
     # ── Ask mode (existing) ────────────────────────────────────────
 
     async def _process_utterance(self, audio_data: bytes) -> None:

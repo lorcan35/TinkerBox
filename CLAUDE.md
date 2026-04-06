@@ -91,8 +91,8 @@ sshpass -p 'radxa' ssh radxa@192.168.1.89 "echo 'radxa' | sudo -S systemctl rest
 | #19 | Notes feature | DONE (notes/ module wired into server.py, API routes registered) |
 | — | Cloud mode (OpenRouter STT+TTS) | DONE (openrouter_stt.py, openrouter_tts.py, config_update WS command) |
 | — | Dictation mode + post-processing | DONE (dictation in pipeline.py, auto-generated title/summary) |
-| #20 | Tab5 SD card storage | TODO |
-| #22 | Dashboard conversation viewer | TODO |
+| #20 | Tab5 SD card storage | DONE (SDMMC 4-bit, FAT32, coexists with WiFi SDIO, notes.js + WAV recordings) |
+| #22 | Dashboard conversation viewer | DONE (6-tab SPA: Overview, Conversations, Chat, Devices, Notes, Logs) |
 
 ### Architecture Decisions (from scaffolding research)
 - **Session != Connection.** Sessions survive disconnects. Device reconnects → resume.

@@ -4,6 +4,7 @@ Uses the OpenRouter API (OpenAI-compatible) for cloud-based LLM inference.
 Supports streaming via Server-Sent Events (SSE).
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -29,6 +30,7 @@ class OpenRouterBackend(LLMBackend):
         )
         self._session: aiohttp.ClientSession | None = None
         self._conversation: list[dict] = []
+        self._lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         """Verify API key is set and connectivity is available."""
@@ -130,22 +132,23 @@ class OpenRouterBackend(LLMBackend):
         """
         sys_prompt = system_prompt or self._config.system_prompt
 
-        messages = []
-        if sys_prompt:
-            messages.append({"role": "system", "content": sys_prompt})
-        messages.extend(self._conversation)
-        messages.append({"role": "user", "content": prompt})
+        async with self._lock:
+            messages = []
+            if sys_prompt:
+                messages.append({"role": "system", "content": sys_prompt})
+            messages.extend(self._conversation)
+            messages.append({"role": "user", "content": prompt})
 
-        full_response = []
-        async for token in self._stream_messages(messages):
-            full_response.append(token)
-            yield token
+            full_response = []
+            async for token in self._stream_messages(messages):
+                full_response.append(token)
+                yield token
 
-        # Update in-memory conversation history (legacy path only)
-        self._conversation.append({"role": "user", "content": prompt})
-        self._conversation.append(
-            {"role": "assistant", "content": "".join(full_response)}
-        )
+            # Update in-memory conversation history (legacy path only)
+            self._conversation.append({"role": "user", "content": prompt})
+            self._conversation.append(
+                {"role": "assistant", "content": "".join(full_response)}
+            )
 
     async def generate_stream_with_messages(
         self, messages: list[dict]

@@ -4,6 +4,7 @@ Connects to a local LM Studio server running an OpenAI-compatible API.
 Very similar to OpenRouter but targeting localhost with no auth required.
 """
 
+import asyncio
 import json
 import logging
 from typing import AsyncIterator
@@ -25,6 +26,7 @@ class LMStudioBackend(LLMBackend):
         self._model = config.lmstudio_model
         self._session: aiohttp.ClientSession | None = None
         self._conversation: list[dict] = []
+        self._lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         """Verify LM Studio is reachable."""
@@ -69,68 +71,69 @@ class LMStudioBackend(LLMBackend):
 
         sys_prompt = system_prompt or self._config.system_prompt
 
-        messages = []
-        if sys_prompt:
-            messages.append({"role": "system", "content": sys_prompt})
-        messages.extend(self._conversation)
-        messages.append({"role": "user", "content": prompt})
+        async with self._lock:
+            messages = []
+            if sys_prompt:
+                messages.append({"role": "system", "content": sys_prompt})
+            messages.extend(self._conversation)
+            messages.append({"role": "user", "content": prompt})
 
-        payload = {
-            "model": self._model,
-            "messages": messages,
-            "stream": True,
-            "max_tokens": self._config.max_tokens,
-            "temperature": self._config.temperature,
-        }
+            payload = {
+                "model": self._model,
+                "messages": messages,
+                "stream": True,
+                "max_tokens": self._config.max_tokens,
+                "temperature": self._config.temperature,
+            }
 
-        full_response = []
+            full_response = []
 
-        try:
-            async with self._session.post(
-                f"{self._base_url}/chat/completions",
-                json=payload,
-            ) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    logger.error(
-                        "LM Studio error %d: %s", resp.status, error_text[:300]
-                    )
-                    yield f"[LM Studio error: {resp.status}]"
-                    return
+            try:
+                async with self._session.post(
+                    f"{self._base_url}/chat/completions",
+                    json=payload,
+                ) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        logger.error(
+                            "LM Studio error %d: %s", resp.status, error_text[:300]
+                        )
+                        yield f"[LM Studio error: {resp.status}]"
+                        return
 
-                async for line in resp.content:
-                    line = line.decode("utf-8", errors="replace").strip()
-                    if not line or not line.startswith("data: "):
-                        continue
+                    async for line in resp.content:
+                        line = line.decode("utf-8", errors="replace").strip()
+                        if not line or not line.startswith("data: "):
+                            continue
 
-                    data_str = line[6:]
-                    if data_str == "[DONE]":
-                        break
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
 
-                    try:
-                        chunk = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
+                        try:
+                            chunk = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
 
-                    choices = chunk.get("choices", [])
-                    if not choices:
-                        continue
+                        choices = chunk.get("choices", [])
+                        if not choices:
+                            continue
 
-                    delta = choices[0].get("delta", {})
-                    token = delta.get("content", "")
-                    if token:
-                        full_response.append(token)
-                        yield token
+                        delta = choices[0].get("delta", {})
+                        token = delta.get("content", "")
+                        if token:
+                            full_response.append(token)
+                            yield token
 
-        except aiohttp.ClientError as e:
-            logger.error("LM Studio request failed: %s", e)
-            yield f"[Connection error: {e}]"
-            return
+            except aiohttp.ClientError as e:
+                logger.error("LM Studio request failed: %s", e)
+                yield f"[Connection error: {e}]"
+                return
 
-        self._conversation.append({"role": "user", "content": prompt})
-        self._conversation.append(
-            {"role": "assistant", "content": "".join(full_response)}
-        )
+            self._conversation.append({"role": "user", "content": prompt})
+            self._conversation.append(
+                {"role": "assistant", "content": "".join(full_response)}
+            )
 
     def clear_history(self) -> None:
         """Clear conversation history."""

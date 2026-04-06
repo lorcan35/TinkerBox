@@ -26,6 +26,7 @@ class OllamaBackend(LLMBackend):
         self._model = config.ollama_model
         self._session: aiohttp.ClientSession | None = None
         self._conversation: list[dict] = []
+        self._lock = asyncio.Lock()
 
     async def initialize(self) -> None:
         """Verify Ollama is reachable and the model is available."""
@@ -86,71 +87,72 @@ class OllamaBackend(LLMBackend):
 
         sys_prompt = system_prompt or self._config.system_prompt
 
-        # Build messages list with history
-        messages = []
-        if sys_prompt:
-            messages.append({"role": "system", "content": sys_prompt})
-        messages.extend(self._conversation)
-        messages.append({"role": "user", "content": prompt})
+        async with self._lock:
+            # Build messages list with history
+            messages = []
+            if sys_prompt:
+                messages.append({"role": "system", "content": sys_prompt})
+            messages.extend(self._conversation)
+            messages.append({"role": "user", "content": prompt})
 
-        payload = {
-            "model": self._model,
-            "messages": messages,
-            "stream": True,
-            "options": {
-                "num_predict": self._config.max_tokens,
-                "temperature": self._config.temperature,
-            },
-        }
+            payload = {
+                "model": self._model,
+                "messages": messages,
+                "stream": True,
+                "options": {
+                    "num_predict": self._config.max_tokens,
+                    "temperature": self._config.temperature,
+                },
+            }
 
-        full_response = []
+            full_response = []
 
-        try:
-            resp_ctx = self._session.post(
-                f"{self._base_url}/api/chat",
-                json=payload,
-            )
-            resp = await asyncio.wait_for(resp_ctx.__aenter__(), timeout=120)
             try:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    logger.error("Ollama error %d: %s", resp.status, error_text[:200])
-                    yield f"[Ollama error: {resp.status}]"
-                    return
+                resp_ctx = self._session.post(
+                    f"{self._base_url}/api/chat",
+                    json=payload,
+                )
+                resp = await asyncio.wait_for(resp_ctx.__aenter__(), timeout=120)
+                try:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        logger.error("Ollama error %d: %s", resp.status, error_text[:200])
+                        yield f"[Ollama error: {resp.status}]"
+                        return
 
-                async for raw_line in resp.content:
-                    line = raw_line.decode("utf-8", errors="replace").strip()
-                    if not line:
-                        continue
-                    try:
-                        chunk = json.loads(line)
-                    except json.JSONDecodeError:
-                        continue
+                    async for raw_line in resp.content:
+                        line = raw_line.decode("utf-8", errors="replace").strip()
+                        if not line:
+                            continue
+                        try:
+                            chunk = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
 
-                    if chunk.get("done"):
-                        break
+                        if chunk.get("done"):
+                            break
 
-                    token = chunk.get("message", {}).get("content", "")
-                    if token:
-                        full_response.append(token)
-                        yield token
-            finally:
-                await resp_ctx.__aexit__(None, None, None)
+                        token = chunk.get("message", {}).get("content", "")
+                        if token:
+                            full_response.append(token)
+                            yield token
+                finally:
+                    await resp_ctx.__aexit__(None, None, None)
 
-        except asyncio.TimeoutError:
-            logger.error("Ollama generation timed out after 120s")
-            yield "[Ollama timeout after 120s]"
-            return
-        except aiohttp.ClientError as e:
-            logger.error("Ollama request failed: %s", e)
-            yield f"[Connection error: {e}]"
-            return
+            except asyncio.TimeoutError:
+                logger.error("Ollama generation timed out after 120s")
+                yield "[Ollama timeout after 120s]"
+                return
+            except aiohttp.ClientError as e:
+                logger.error("Ollama request failed: %s", e)
+                yield f"[Connection error: {e}]"
+                return
 
-        # Update conversation history
-        self._conversation.append({"role": "user", "content": prompt})
-        self._conversation.append(
-            {"role": "assistant", "content": "".join(full_response)}
-        )
+            # Update conversation history
+            self._conversation.append({"role": "user", "content": prompt})
+            self._conversation.append(
+                {"role": "assistant", "content": "".join(full_response)}
+            )
 
     async def generate_stream_with_messages(
         self, messages: list[dict]

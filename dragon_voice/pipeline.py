@@ -162,7 +162,7 @@ class VoicePipeline:
                 audio_data = bytes(self._audio_buffer)
                 self._audio_buffer.clear()
                 self._process_task = asyncio.create_task(
-                    self._process_utterance(audio_data)
+                    self._process_with_timeout(audio_data)
                 )
 
     async def start_processing(self) -> None:
@@ -177,22 +177,26 @@ class VoicePipeline:
         audio_data = bytes(self._audio_buffer)
         self._audio_buffer.clear()
 
-        # Debug: save incoming audio as WAV for inspection
-        import wave, os
-        wav_path = "/tmp/tab5_mic_debug.wav"
-        try:
-            with wave.open(wav_path, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)  # 16-bit
-                wf.setframerate(self._config.audio.input_sample_rate)
-                wf.writeframes(audio_data)
-            logger.info("DEBUG: saved %d bytes mic audio to %s", len(audio_data), wav_path)
-        except Exception as e:
-            logger.warning("DEBUG: failed to save WAV: %s", e)
         self._is_speaking = False
         self._process_task = asyncio.create_task(
-            self._process_utterance(audio_data)
+            self._process_with_timeout(audio_data)
         )
+
+    async def _process_with_timeout(self, audio_data: bytes) -> None:
+        """Run _process_utterance with a 180s safety timeout."""
+        try:
+            await asyncio.wait_for(self._process_utterance(audio_data), timeout=180)
+        except asyncio.TimeoutError:
+            logger.error("Pipeline processing timed out after 180s")
+            self._processing = False
+            try:
+                await self._on_event({"type": "error", "message": "Processing timed out"})
+                # Send tts_end so Tab5 doesn't hang
+                if self._tts_started:
+                    await self._on_event({"type": "tts_end", "tts_ms": 0})
+                    self._tts_started = False
+            except Exception:
+                pass
 
     async def cancel(self) -> None:
         """Cancel ongoing processing."""
@@ -344,19 +348,6 @@ class VoicePipeline:
         pipeline_start = time.monotonic()
 
         try:
-            # Debug: save incoming audio as WAV for inspection
-            import wave
-            wav_path = "/tmp/tab5_mic_debug.wav"
-            try:
-                with wave.open(wav_path, "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)  # 16-bit
-                    wf.setframerate(self._config.audio.input_sample_rate)
-                    wf.writeframes(audio_data)
-                logger.info("DEBUG: saved %d bytes mic audio to %s", len(audio_data), wav_path)
-            except Exception as e:
-                logger.warning("DEBUG: failed to save WAV: %s", e)
-
             # --- STT ---
             t0 = time.monotonic()
             transcript = await self._stt.transcribe(

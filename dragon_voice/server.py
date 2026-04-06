@@ -44,6 +44,7 @@ class VoiceServer:
 
         # Active WebSocket sessions: ws_id -> {pipeline, session_id, device_id}
         self._active_connections: dict[str, dict] = {}
+        self._max_connections = 10
 
         # Backend names for status page
         self._stt_name = config.stt.backend
@@ -55,6 +56,7 @@ class VoiceServer:
         self._session_mgr: Optional[SessionManager] = None
         self._message_store: Optional[MessageStore] = None
         self._conversation: Optional[ConversationEngine] = None
+        self._notes_svc = None
 
     def create_app(self) -> web.Application:
         """Create and configure the aiohttp application."""
@@ -113,6 +115,8 @@ class VoiceServer:
             notes_db = NotesDB()
             notes_db.initialize()
             notes_svc = NotesService(self._config, notes_db)
+            await notes_svc.initialize()
+            self._notes_svc = notes_svc  # Store for shutdown
             setup_notes_routes(app, notes_svc)
             logger.info("Notes API routes registered")
         except Exception as e:
@@ -135,6 +139,8 @@ class VoiceServer:
         self._active_connections.clear()
 
         # Shut down foundation
+        if self._notes_svc:
+            await self._notes_svc.shutdown()
         if self._conversation:
             await self._conversation.shutdown()
         if self._session_mgr:
@@ -296,6 +302,11 @@ class VoiceServer:
                     config_update, error, event
             - Binary: PCM int16 audio at config.tts_sample_rate
         """
+        # Reject if at connection limit
+        if len(self._active_connections) >= self._max_connections:
+            logger.warning("Connection limit reached (%d), rejecting", self._max_connections)
+            return web.Response(text="Too many connections", status=503)
+
         ws = web.WebSocketResponse(
             max_msg_size=10 * 1024 * 1024,  # 10MB max message
             heartbeat=600.0,

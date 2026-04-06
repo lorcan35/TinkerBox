@@ -80,6 +80,9 @@ class APIRoutes:
         app.router.add_get("/api/v1/config/{key}", self.get_config)
         app.router.add_put("/api/v1/config/{key}", self.set_config)
 
+        # Events
+        app.router.add_get("/api/v1/events", self.list_events)
+
         # Transcription
         app.router.add_post("/api/v1/transcribe", self.transcribe_audio)
 
@@ -260,6 +263,26 @@ class APIRoutes:
 
         await self._db.set_config(key, value_json, scope, scope_id)
         return web.json_response({"key": key, "value": body["value"], "scope": scope})
+
+    # ── Events ────────────────────────────────────────────────────────
+
+    async def list_events(self, request: web.Request) -> web.Response:
+        """GET /api/v1/events?since_id=0&type=&session_id=&limit=50"""
+        since_id = int(request.query.get("since_id", "0"))
+        event_type = request.query.get("type")
+        session_id = request.query.get("session_id")
+        limit = min(int(request.query.get("limit", "50")), 200)
+
+        events = await self._db.get_events(
+            event_type=event_type,
+            session_id=session_id,
+            since_id=since_id,
+            limit=limit,
+        )
+        return web.json_response({
+            "items": events,
+            "count": len(events),
+        })
 
     # ── Transcription ─────────────────────────────────────────────────
 

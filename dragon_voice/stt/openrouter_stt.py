@@ -66,7 +66,7 @@ class OpenRouterSTTBackend(STTBackend):
             "messages": [{
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Transcribe this audio exactly. Output only the transcript, nothing else."},
+                    {"type": "text", "text": "You are a speech-to-text transcriber. Transcribe the spoken words in this audio. If there is no speech, output nothing. Output ONLY the transcript with no commentary."},
                     {"type": "input_audio", "input_audio": {"data": b64_audio, "format": "wav"}},
                 ],
             }],

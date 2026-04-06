@@ -41,7 +41,7 @@ Before writing any fix, CHECK LEARNINGS.md first. Your bug might already be docu
 |---------|------|-------------|-------------|
 | Dashboard | 3500 | tinkerclaw-dashboard | Web UI for device management |
 | Dragon CDP | 3501 | tinkerclaw | CDP browser streaming + touch relay |
-| Voice | 3502 | tinkerclaw-voice | STT/LLM/TTS voice pipeline |
+| Voice | 3502 | tinkerclaw-voice | STT/LLM/TTS voice pipeline + Notes API routes |
 | mDNS | — | tinkerclaw-mdns | Advertises _tinkerclaw._tcp |
 | Chromium | 9222 | (launched by tinkerclaw) | CDP target browser |
 | Ollama | 11434 | ollama | Local LLM inference (CPU, slow) |
@@ -49,13 +49,22 @@ Before writing any fix, CHECK LEARNINGS.md first. Your bug might already be docu
 
 ## Deploy
 ```bash
-# Sync code to Dragon
+# Sync code to Dragon (includes new STT/TTS backends + notes module)
 sshpass -p 'radxa' scp -r dragon_voice/ radxa@192.168.1.89:/home/radxa/
 sshpass -p 'radxa' scp dashboard.py radxa@192.168.1.89:/home/radxa/
+sshpass -p 'radxa' scp schema.sql radxa@192.168.1.89:/home/radxa/
 
 # Restart services
 sshpass -p 'radxa' ssh radxa@192.168.1.89 "echo 'radxa' | sudo -S systemctl restart tinkerclaw-voice"
 ```
+
+## Cloud Mode
+- **What:** Tab5 sends `{"type":"config_update","cloud_mode":true}` over WebSocket. Dragon hot-swaps STT and TTS backends to `openrouter` (no restart needed).
+- **Backends:** Both STT and TTS use `openai/gpt-audio-mini` via OpenRouter's chat completions API. STT sends base64 WAV, TTS streams pcm16 via SSE at 24kHz.
+- **Config propagation:** API key auto-propagated from `llm.openrouter_api_key` to `stt.openrouter_api_key` and `tts.openrouter_api_key` at config load time. No duplicate key config needed.
+- **Toggle off:** Reverts to local backends (Moonshine STT + Piper TTS). Dragon sends `config_update` ACK with applied backend names and `cloud_mode` state.
+- **Config fields:** `STTConfig.openrouter_api_key`, `STTConfig.openrouter_url`, `TTSConfig.openrouter_api_key`, `TTSConfig.openrouter_url`, `TTSConfig.openrouter_voice` (default "alloy").
+- **Valid backends:** STT: `moonshine`, `whisper_cpp`, `vosk`, `openrouter`. TTS: `piper`, `kokoro`, `edge_tts`, `openrouter`.
 
 ## Key Technical Notes
 - **NPU inference (preferred):** Llama 3.2 1B on Genie/HTP achieves ~8 tok/s. Use `npu_genie` backend. See `docs/npu-setup.md`.
@@ -63,12 +72,14 @@ sshpass -p 'radxa' ssh radxa@192.168.1.89 "echo 'radxa' | sudo -S systemctl rest
 - **Python packages:** Use `pip install --break-system-packages` on Dragon (PEP 668)
 - **User is radxa, NOT rock:** All service files, paths, and caches must use /home/radxa/
 - **PYTHONPATH:** dragon_voice runs as `python3 -m dragon_voice` with PYTHONPATH=/home/radxa
-- **Audio rates:** Piper TTS outputs 22050Hz, resampled to 16kHz before sending to Tab5. Tab5 upsamples 16k→48k.
+- **Audio rates:** Piper TTS outputs 22050Hz, resampled to 16kHz before sending to Tab5. Tab5 upsamples 16k→48k. OpenRouter TTS outputs 24kHz (resampled to 16kHz before sending).
 - **moonshine-voice API:** v0.0.51+ changed download API. Check cache before downloading.
+- **Cloud mode backends:** OpenRouter STT and TTS both use `openai/gpt-audio-mini` model via OpenRouter's chat completions API. STT sends base64-encoded WAV audio. TTS streams pcm16 via SSE. API key auto-propagated from `llm.openrouter_api_key` in config.
+- **Dictation post-processing:** After dictation ends, `pipeline._post_process_dictation()` sends the full transcript to LLM for title + summary generation, then sends `dictation_summary` message to Tab5.
 
-## Current Sprint: Phase 0 — The Foundation (March 2026)
+## Current Sprint: Phase 1 — Voice Features (April 2026)
 
-**Build order:** Sessions → Conversation Engine → Unified Voice+Text → REST API → Notes → SD Card → Dashboard Viewer
+**Phase 0 (Foundation) is complete.** Phase 1 adds cloud mode, dictation, and wires up notes.
 
 ### Issues
 | # | Title | Status |
@@ -77,9 +88,11 @@ sshpass -p 'radxa' ssh radxa@192.168.1.89 "echo 'radxa' | sudo -S systemctl rest
 | #17 | Multi-turn conversation engine | DONE (conversation.py, messages.py) |
 | #18 | Unified voice + text input | DONE (server.py handles both voice and text) |
 | #21 | REST API framework | DONE (api.py, /api/v1/ routes) |
-| #19 | Notes feature | BLOCKED on #16, #17 (schema ready, notes/ module stubbed) |
-| #20 | Tab5 SD card storage | BLOCKED on #19 |
-| #22 | Dashboard conversation viewer | BLOCKED on #21 |
+| #19 | Notes feature | DONE (notes/ module wired into server.py, API routes registered) |
+| — | Cloud mode (OpenRouter STT+TTS) | DONE (openrouter_stt.py, openrouter_tts.py, config_update WS command) |
+| — | Dictation mode + post-processing | DONE (dictation in pipeline.py, auto-generated title/summary) |
+| #20 | Tab5 SD card storage | TODO |
+| #22 | Dashboard conversation viewer | TODO |
 
 ### Architecture Decisions (from scaffolding research)
 - **Session != Connection.** Sessions survive disconnects. Device reconnects → resume.
@@ -111,19 +124,32 @@ udp_streamer.py       — UDP JPEG streaming for low-latency display
 dragon_voice/         — Voice pipeline package (port 3502)
   __init__.py         — Package init
   __main__.py         — Entry point: python3 -m dragon_voice
-  server.py           — aiohttp WebSocket server + HTTP endpoints
-  pipeline.py         — STT→LLM→TTS orchestration with VAD
+  server.py           — aiohttp WebSocket server + HTTP endpoints + config_update handler
+  pipeline.py         — STT→LLM→TTS orchestration with VAD + dictation + post-processing
   conversation.py     — Multi-turn ConversationEngine (DB-backed context)
   sessions.py         — SessionManager (create/resume/pause/end lifecycle)
   messages.py         — MessageStore (append-only, LLM context builder)
   db.py               — Async SQLite layer (aiosqlite, WAL mode)
   api.py              — REST API v1 routes (/api/v1/*)
-  config.py           — Config dataclasses with YAML + env var loading
+  config.py           — Config dataclasses with YAML + env var loading (incl. OpenRouter STT/TTS fields)
   config.yaml         — Default configuration
-  stt/                — STT backends (moonshine, whisper_cpp, vosk)
-  tts/                — TTS backends (piper, kokoro, edge_tts)
+  stt/                — STT backends (moonshine, whisper_cpp, vosk, openrouter)
+    base.py           — STTBackend abstract base class
+    moonshine_stt.py  — Moonshine local STT
+    whisper_cpp.py    — whisper.cpp local STT
+    vosk_stt.py       — Vosk local STT
+    openrouter_stt.py — Cloud STT via OpenRouter gpt-audio-mini (base64 WAV → text)
+  tts/                — TTS backends (piper, kokoro, edge_tts, openrouter)
+    base.py           — TTSBackend abstract base class
+    piper_tts.py      — Piper local TTS (22050Hz)
+    kokoro_tts.py     — Kokoro local TTS
+    edge_tts_backend.py — Edge TTS (Microsoft cloud)
+    openrouter_tts.py — Cloud TTS via OpenRouter gpt-audio-mini (SSE pcm16 @ 24kHz)
   llm/                — LLM backends (ollama, openrouter, lmstudio, npu_genie)
-  notes/              — Notes module (db, service, api) — stubbed, not yet wired
+  notes/              — Notes module (wired into server.py, API routes registered)
+    db.py             — NotesDB (SQLite persistence)
+    service.py        — NotesService (business logic)
+    api.py            — Notes REST API routes (setup_routes → aiohttp app)
 tests/                — E2E tests (run on Dragon)
   test_foundation.py  — Foundation module tests
   test_multiturn_live.py — Multi-turn conversation tests

@@ -271,3 +271,84 @@ sequentially across the whole file (don't restart per section).
 - **Root Cause:** QCS6490 Hexagon DSP presents as HTP v68. Genie context binaries (`.serialized.bin`) are compiled for a specific HTP instruction set architecture and are NOT cross-compatible between versions. All available 3B quantized models target v73+ (Snapdragon 8 Gen 2 and newer). Sources checked: HuggingFace Volko76 (v73 only), Radxa ModelScope (1B only for v68), Qualcomm AI Hub (QCS6490 not a supported target for 3B export).
 - **Fix:** Stay with Llama 3.2 1B on NPU (~8 tok/s). The blocker is HTP architecture, not RAM.
 - **Prevention:** When evaluating Qualcomm SoCs for LLM inference, check the HTP version (v68/v73/v75/v79), not just RAM. The HTP arch determines which pre-quantized models are available. v73+ (Snapdragon 8 Gen 2+) is the minimum for 3B+ models.
+
+---
+
+## Session Bugs (2026-04-06)
+
+### 34. OpenRouter API key ${env:...} not expanded
+- **Date:** 2026-04-06
+- **Symptom:** OpenRouter API calls failed with authentication errors. The API key was literally `${env:OPENROUTER_API_KEY}` instead of the actual key value.
+- **Root Cause:** The YAML config used a literal string (single-quoted or block scalar) for the API key field, which bypassed the environment variable expansion/fallback logic in `config.py`. The `${env:...}` syntax was treated as a plain string, not a variable reference.
+- **Fix:** Changed the API key config value to an empty string, which triggers the env var fallback path in the config loader to read `OPENROUTER_API_KEY` from the environment.
+- **Prevention:** Test env var expansion for every secret in config.yaml. Never use YAML literal strings (`'...'` or `|`) for values that need variable substitution. Add a startup check that validates API keys are non-empty and don't contain literal `${` characters.
+
+### 35. LLM memory leak across sessions (OpenRouterBackend._conversation)
+- **Date:** 2026-04-06
+- **Symptom:** Memory usage grew steadily over time. After many voice sessions, Dragon became sluggish and eventually ran out of memory.
+- **Root Cause:** `OpenRouterBackend._conversation` list accumulated messages across all sessions and was never cleared. When `ConversationEngine` created a new session, the LLM backend still held the entire history from all previous sessions in memory.
+- **Fix:** Added a `generate_stream_with_messages()` override to the OpenRouter backend that accepts an explicit message list per call, bypassing the stale `_conversation` accumulator. The conversation context is now built fresh from the database by `ConversationEngine` on each request.
+- **Prevention:** LLM backends must not maintain their own conversation state. Context should be built per-request from the authoritative source (database). Audit all backend classes for internal message accumulation.
+
+### 36. Clear command only clears in-memory LLM history, not DB
+- **Date:** 2026-04-06
+- **Symptom:** After using the "clear" command, old messages reappeared when the session was resumed or the service restarted. The conversation was not actually cleared.
+- **Root Cause:** The clear command only reset the in-memory `_conversation` list in the LLM backend. It did not end the `ConversationEngine` session or clear messages from the SQLite database. On next request, the engine reloaded the full history from DB.
+- **Fix:** Clear command now ends the current session (marking it `ended` in DB) and creates a new session. This gives a clean slate — the old messages still exist in the database for history, but the new session starts with no context.
+- **Prevention:** Any "reset" or "clear" operation must go through `SessionManager` lifecycle methods (end + create), not bypass them by clearing in-memory state. Test clear by restarting the service and verifying the old context does not return.
+
+### 37. Text TTS failure leaves Tab5 stuck in PROCESSING
+- **Date:** 2026-04-06
+- **Symptom:** After a TTS error during text-to-speech, Tab5 remained stuck in PROCESSING state indefinitely. No further voice interactions were possible without rebooting.
+- **Root Cause:** When the TTS backend raised an exception, the error handler did not send a `tts_end` message to Tab5. Tab5 was waiting for `tts_end` to transition back to READY state, but it never arrived.
+- **Fix:** Added `tts_end` message send in the exception handler, ensuring Tab5 always receives the end-of-TTS signal regardless of whether TTS succeeded or failed.
+- **Prevention:** Every code path that can start a TTS stream (sending `tts_start`) must guarantee a corresponding `tts_end` is sent, even on failure. Use try/finally to ensure this. Add a watchdog on Tab5 that auto-recovers if `tts_end` is not received within a reasonable timeout.
+
+### 38. Cloud TTS wrong format (gpt-audio-mini)
+- **Date:** 2026-04-06
+- **Symptom:** Cloud TTS via gpt-audio-mini returned errors or garbled audio. Tab5 received data it could not play.
+- **Root Cause:** The cloud TTS request was using `stream=false` and requesting `wav` format. The gpt-audio-mini model requires `stream=true` and `format=pcm16` to produce correct streaming audio output.
+- **Fix:** Changed the cloud TTS request parameters to `stream=true` and `format=pcm16`.
+- **Prevention:** Always check the specific API documentation for each TTS model. Do not assume request parameters are interchangeable between local (Piper) and cloud (gpt-audio-mini) backends. Add backend-specific parameter validation.
+
+### 39. Cloud STT bad prompt causing transcription errors
+- **Date:** 2026-04-06
+- **Symptom:** Cloud STT returned inaccurate or nonsensical transcriptions, especially for short utterances.
+- **Root Cause:** The STT prompt was a generic string like "transcribe" which confused the model. Cloud STT models use the prompt as context/guidance for what to expect in the audio.
+- **Fix:** Improved the STT prompt to provide better context about the expected audio content (conversational speech, voice assistant interaction).
+- **Prevention:** STT prompts should describe the expected audio context, not be generic commands. Test transcription quality with realistic utterances whenever changing the prompt.
+
+### 40. TTS pacing — multiple tts_start/tts_end per utterance
+- **Date:** 2026-04-06
+- **Symptom:** TTS audio had gaps and clicks. Parts of sentences were cut off or replayed. Tab5 speaker produced choppy output.
+- **Root Cause:** The server sent separate `tts_start`/`tts_end` pairs for each sentence or chunk within a single response. Each `tts_start` caused Tab5 to reset its audio buffer, dropping any audio that was still playing from the previous chunk.
+- **Fix:** Changed to a single `tts_start` at the beginning of the response and a single `tts_end` at the end. Audio chunks are streamed between them with 80% real-time pacing (slight delay between chunks to prevent buffer underrun without causing noticeable latency).
+- **Prevention:** TTS framing must be one `tts_start` / `tts_end` pair per complete response, never per sentence. Pacing should be configurable. Document the expected framing protocol in `docs/protocol.md`.
+
+### 41. Dragon error transitions Tab5 to IDLE instead of READY
+- **Date:** 2026-04-06
+- **Symptom:** After a transient Dragon error (e.g., LLM timeout), Tab5 showed "Disconnected" status and would not accept new voice input, even though the WebSocket was still connected.
+- **Root Cause:** The error handler on Tab5 transitioned the state machine to IDLE (disconnected state) regardless of whether the WebSocket was still alive. Transient errors (LLM timeout, TTS failure) are not connection failures.
+- **Fix:** Added a `ws_connected` check in the error handler. If the WebSocket is still connected, transition to READY (ready for new input) instead of IDLE (disconnected).
+- **Prevention:** Distinguish between connection errors (transition to IDLE) and processing errors (transition to READY). Never use IDLE for transient failures when the transport is still alive.
+
+### 42. Response timeout never fires (keepalive resets activity timer)
+- **Date:** 2026-04-06
+- **Symptom:** When the LLM hung or Dragon stopped responding, Tab5 waited indefinitely instead of timing out and recovering.
+- **Root Cause:** The keepalive ping was sent every 15 seconds. The response timeout was 20 seconds. Each keepalive ping reset the activity timer, so the 20-second timeout could never be reached — it was reset to 0 every 15 seconds by the keepalive.
+- **Fix:** Separated the keepalive timer (connection liveness, sends pings) from the response activity timer (tracks time since last meaningful response data). Keepalive pings no longer reset the activity timer.
+- **Prevention:** Keepalive and response timeout are orthogonal concerns. Keepalive checks transport liveness. Response timeout checks application progress. Never let one reset the other. This same bug was also found and fixed on Tab5 (see TinkerTab LEARNINGS #41).
+
+### 43. Ollama generation has no timeout
+- **Date:** 2026-04-06
+- **Symptom:** Occasionally the voice pipeline hung forever waiting for Ollama to respond. No error, no timeout — just infinite wait.
+- **Root Cause:** The Ollama HTTP client call had no timeout configured. If Ollama entered a bad state (deadlock, OOM, etc.), the `await` would never resolve.
+- **Fix:** Added a 120-second timeout to the Ollama generation call. If exceeded, the call raises a timeout exception which is caught by the pipeline error handler and reported to Tab5 as an error.
+- **Prevention:** Every external service call (HTTP, subprocess, WebSocket) must have an explicit timeout. Default to 120s for LLM generation, 30s for STT/TTS, 10s for health checks. Never use `await` without a timeout on external I/O.
+
+### 44. Ping handler was a no-op (Tab5 heartbeat ignored)
+- **Date:** 2026-04-06
+- **Symptom:** Tab5 heartbeat pings were received by Dragon but produced no response. During network instability, Tab5 could not determine if Dragon was still alive.
+- **Root Cause:** The WebSocket message handler recognized `{"type":"ping"}` messages but did nothing with them — no pong response was sent. The handler was a silent no-op.
+- **Fix:** Added a pong response: when Dragon receives `{"type":"ping"}`, it immediately sends `{"type":"pong"}` back to Tab5.
+- **Prevention:** Every request-type message in the protocol must have a defined response. Add ping/pong to `docs/protocol.md` as a required message pair. Test heartbeat round-trip in integration tests.

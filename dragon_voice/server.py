@@ -389,7 +389,24 @@ class VoiceServer:
                             buf_size = len(pipeline._audio_buffer) + len(pipeline._segment_buffer)
                             logger.info("Connection %s: stop (mode=%s, buffer=%d bytes)", ws_id, mode, buf_size)
                             if mode == "dictate":
-                                await pipeline.finish_dictation()
+                                transcript = await pipeline.finish_dictation()
+                                # Auto-save dictation to Dragon notes DB
+                                if transcript and len(transcript.strip()) > 10 and self._notes_svc:
+                                    try:
+                                        note = await self._notes_svc.create_from_text(
+                                            transcript.strip(), title=""
+                                        )
+                                        logger.info("Auto-created note %s from dictation (%d chars)",
+                                                    note.id, len(transcript))
+                                        if not ws.closed:
+                                            await ws.send_json({
+                                                "type": "note_created",
+                                                "note_id": note.id,
+                                                "title": note.title,
+                                                "transcript": transcript[:200],
+                                            })
+                                    except Exception as e:
+                                        logger.error("Failed to auto-create dictation note: %s", e)
                             else:
                                 await pipeline.start_processing()
 

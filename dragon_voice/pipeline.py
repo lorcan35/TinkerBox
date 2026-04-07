@@ -249,11 +249,12 @@ class VoicePipeline:
         except Exception:
             logger.exception("Dictation segment transcription failed")
 
-    async def finish_dictation(self) -> None:
+    async def finish_dictation(self) -> str:
         """Finalize dictation: transcribe remaining audio, send full transcript.
 
         Called on {"type":"stop"} when in dictation mode.
         Skips LLM and TTS — only sends STT results.
+        Returns the full transcript text for the caller to persist.
         """
         # Transcribe any remaining audio in the segment buffer
         if len(self._segment_buffer) >= 1600:
@@ -292,6 +293,8 @@ class VoicePipeline:
         # Post-process: generate title + summary via LLM (async, non-blocking)
         if full_text.strip() and len(full_text) > 20:
             asyncio.ensure_future(self._post_process_dictation(full_text))
+
+        return full_text
 
     async def _post_process_dictation(self, transcript: str) -> None:
         """Generate title + summary for completed dictation via LLM."""

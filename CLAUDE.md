@@ -61,13 +61,27 @@ sshpass -p 'radxa' scp schema.sql radxa@192.168.1.89:/home/radxa/
 sshpass -p 'radxa' ssh radxa@192.168.1.89 "echo 'radxa' | sudo -S systemctl restart tinkerclaw-voice"
 ```
 
-## Cloud Mode
-- **What:** Tab5 sends `{"type":"config_update","cloud_mode":true}` over WebSocket. Dragon hot-swaps STT and TTS backends to `openrouter` (no restart needed).
-- **Backends:** Both STT and TTS use `openai/gpt-audio-mini` via OpenRouter's chat completions API. STT sends base64 WAV, TTS streams pcm16 via SSE at 24kHz.
-- **Config propagation:** API key auto-propagated from `llm.openrouter_api_key` to `stt.openrouter_api_key` and `tts.openrouter_api_key` at config load time. No duplicate key config needed.
-- **Toggle off:** Reverts to local backends (Moonshine STT + Piper TTS). Dragon sends `config_update` ACK with applied backend names and `cloud_mode` state.
-- **Config fields:** `STTConfig.openrouter_api_key`, `STTConfig.openrouter_url`, `TTSConfig.openrouter_api_key`, `TTSConfig.openrouter_url`, `TTSConfig.openrouter_voice` (default "alloy").
-- **Valid backends:** STT: `moonshine`, `whisper_cpp`, `vosk`, `openrouter`. TTS: `piper`, `kokoro`, `edge_tts`, `openrouter`.
+## Three-Tier Voice Mode
+Tab5 sends `{"type":"config_update","voice_mode":0|1|2,"llm_model":"..."}`. Dragon hot-swaps backends:
+
+| Mode | voice_mode | STT | LLM | TTS |
+|------|-----------|-----|-----|-----|
+| **Local** | 0 | Moonshine | Local (npu_genie/ollama) | Piper (22050Hz) |
+| **Hybrid** | 1 | OpenRouter gpt-audio-mini | Local (unchanged) | OpenRouter gpt-audio-mini (24kHz) |
+| **Full Cloud** | 2 | OpenRouter gpt-audio-mini | OpenRouter (user-selected model) | OpenRouter gpt-audio-mini (24kHz) |
+
+- **LLM Model Selection:** `llm_model` field selects cloud model: `anthropic/claude-3-haiku`, `anthropic/claude-sonnet-4-20250514`, `openai/gpt-4o-mini`. Stored in `LLMConfig.openrouter_model`.
+- **API Key:** Auto-propagated from `llm.openrouter_api_key` to `stt.openrouter_api_key` and `tts.openrouter_api_key`. Validated before swap — rejects with error if empty.
+- **Auto-Fallback:** If cloud STT/TTS fails (timeout, API error), pipeline auto-falls back to local (Moonshine/Piper) for that request AND sends `config_update` with `error` field to Tab5 → auto-reverts to Local mode.
+- **Backward compat:** Old `cloud_mode` boolean still accepted (maps to voice_mode 0 or 2).
+- **Config fields:** `LLMConfig.local_backend` (remembers original for fallback), `LLMConfig.openrouter_model` (user-selectable).
+- **Valid backends:** STT: `moonshine`, `whisper_cpp`, `vosk`, `openrouter`. TTS: `piper`, `kokoro`, `edge_tts`, `openrouter`. LLM: `ollama`, `npu_genie`, `openrouter`, `lmstudio`.
+
+## OTA Firmware Endpoints
+Dragon serves firmware updates for Tab5 via two endpoints:
+- **GET /api/ota/check?current=VERSION** — compares against `/home/radxa/ota/version.json`, returns `{"update":bool,"version":"...","url":"...","sha256":"..."}`
+- **GET /api/ota/firmware.bin** — streams `/home/radxa/ota/tinkertab.bin` (8KB chunks)
+- **Deploy:** Copy `tinkertab.bin` to `/home/radxa/ota/`, update `version.json` with new version string.
 
 ## Key Technical Notes
 - **NPU inference (preferred):** Llama 3.2 1B on Genie/HTP achieves ~8 tok/s. Use `npu_genie` backend. See `docs/npu-setup.md`.

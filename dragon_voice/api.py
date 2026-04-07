@@ -86,7 +86,11 @@ class APIRoutes:
         # Transcription
         app.router.add_post("/api/v1/transcribe", self.transcribe_audio)
 
-        logger.info("API v1 routes registered")
+        # OTA firmware updates
+        app.router.add_get("/api/ota/check", self.ota_check)
+        app.router.add_get("/api/ota/firmware.bin", self.ota_firmware)
+
+        logger.info("API v1 routes registered (incl. OTA)")
 
     # ── Sessions ───────────────────────────────────────────────────────
 
@@ -350,3 +354,76 @@ class APIRoutes:
         except Exception as e:
             logger.exception("Transcription failed")
             return _json_error(f"Transcription failed: {e}", 500)
+
+    # ------------------------------------------------------------------ OTA
+
+    # OTA firmware directory: /home/radxa/ota/ (create manually, place .bin files here)
+    OTA_DIR = "/home/radxa/ota"
+    OTA_VERSION_FILE = "/home/radxa/ota/version.json"
+
+    async def ota_check(self, request: web.Request) -> web.Response:
+        """Check if firmware update is available.
+
+        Query params: current=<version>
+        Returns: {"update": true/false, "version": "...", "url": "...", "sha256": "..."}
+
+        Place firmware in /home/radxa/ota/tinkertab.bin and create
+        /home/radxa/ota/version.json with {"version": "0.6.1", "sha256": "..."}.
+        """
+        import os
+        current = request.query.get("current", "0.0.0")
+        logger.info("OTA check from device (current: %s)", current)
+
+        if not os.path.exists(self.OTA_VERSION_FILE):
+            return web.json_response({"update": False, "current": current})
+
+        try:
+            with open(self.OTA_VERSION_FILE) as f:
+                info = json.load(f)
+        except Exception:
+            return web.json_response({"update": False, "current": current})
+
+        available_ver = info.get("version", "0.0.0")
+        sha256 = info.get("sha256", "")
+
+        # Simple version compare (works for semver like "0.6.0" < "0.6.1")
+        if available_ver <= current:
+            logger.info("No update: device=%s, available=%s", current, available_ver)
+            return web.json_response({"update": False, "current": current,
+                                       "available": available_ver})
+
+        # Build firmware URL — use request host so it works on LAN and ngrok
+        host = request.host  # e.g. "192.168.1.89:3502"
+        scheme = request.scheme  # "http" or "https"
+        firmware_url = f"{scheme}://{host}/api/ota/firmware.bin"
+
+        logger.info("Update available: %s → %s (url: %s)", current, available_ver, firmware_url)
+        return web.json_response({
+            "update": True,
+            "version": available_ver,
+            "url": firmware_url,
+            "sha256": sha256,
+        })
+
+    async def ota_firmware(self, request: web.Request) -> web.StreamResponse:
+        """Serve the firmware binary file for OTA download."""
+        import os
+        firmware_path = os.path.join(self.OTA_DIR, "tinkertab.bin")
+
+        if not os.path.exists(firmware_path):
+            return web.Response(text="No firmware available", status=404)
+
+        file_size = os.path.getsize(firmware_path)
+        logger.info("Serving OTA firmware: %s (%d bytes)", firmware_path, file_size)
+
+        resp = web.StreamResponse()
+        resp.content_type = "application/octet-stream"
+        resp.content_length = file_size
+        resp.headers["Content-Disposition"] = "attachment; filename=tinkertab.bin"
+        await resp.prepare(request)
+
+        with open(firmware_path, "rb") as f:
+            while chunk := f.read(8192):
+                await resp.write(chunk)
+
+        return resp

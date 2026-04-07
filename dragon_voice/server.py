@@ -683,19 +683,30 @@ class VoiceServer:
         """Handle WebSocket disconnect: pause session, mark device offline."""
         session_id = conn_state.get("session_id")
         device_id = conn_state.get("device_id")
+        ws_id = conn_state.get("ws_id")
         pipeline = conn_state.get("pipeline")
 
         # Pause session (not end — it can be resumed)
         if session_id and self._session_mgr:
             await self._session_mgr.pause_session(session_id)
 
-        # Mark device offline
+        # Mark device offline ONLY if no other active connection for same device.
+        # Prevents race: old connection disconnect runs after new boot's register,
+        # which would incorrectly mark the device offline.
         if device_id and self._db:
-            await self._db.set_device_online(device_id, False)
-            await self._db.add_event(
-                "device.disconnected", device_id=device_id,
-                data={"session_id": session_id},
+            other_active = any(
+                c.get("device_id") == device_id and c.get("registered")
+                for cid, c in self._active_connections.items()
+                if cid != ws_id
             )
+            if not other_active:
+                await self._db.set_device_online(device_id, False)
+                await self._db.add_event(
+                    "device.disconnected", device_id=device_id,
+                    data={"session_id": session_id},
+                )
+            else:
+                logger.info("Device %s still has active connection — keeping online", device_id)
 
         # Shut down pipeline
         if pipeline:

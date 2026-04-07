@@ -35,6 +35,8 @@ Before writing any fix, CHECK LEARNINGS.md first. Your bug might already be docu
 - **Password:** radxa
 - **SSH:** `sshpass -p 'radxa' ssh radxa@192.168.1.89`
 - **OS:** Debian (Radxa Zero 3W, ARM64)
+- **Connection:** Ethernet only (WiFi disabled). Static IP on enp1s0.
+- **Services stripped:** gdm3, snapd, ollama, nanobot masked. Only tinkerclaw-voice, tinkerclaw-dashboard, tinkerclaw-ngrok run.
 
 ## Service Map
 | Service | Port | SystemD Unit | Description |
@@ -46,6 +48,7 @@ Before writing any fix, CHECK LEARNINGS.md first. Your bug might already be docu
 | Chromium | 9222 | (launched by tinkerclaw) | CDP target browser |
 | Ollama | 11434 | ollama | Local LLM inference (CPU, slow) |
 | NPU Genie | — | (via voice pipeline) | Llama 3.2 1B on QCS6490 HTP (~8 tok/s) |
+| ngrok | 443 (ext) | tinkerclaw-ngrok | tinkerbox.ngrok.dev → voice server |
 
 ## Deploy
 ```bash

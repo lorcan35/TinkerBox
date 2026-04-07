@@ -351,11 +351,33 @@ class VoicePipeline:
         pipeline_start = time.monotonic()
 
         try:
-            # --- STT ---
+            # --- STT (with cloud fallback) ---
             t0 = time.monotonic()
-            transcript = await self._stt.transcribe(
-                audio_data, self._config.audio.input_sample_rate
-            )
+            try:
+                transcript = await asyncio.wait_for(
+                    self._stt.transcribe(audio_data, self._config.audio.input_sample_rate),
+                    timeout=15,
+                )
+            except (Exception, asyncio.TimeoutError) as stt_err:
+                if self._config.stt.backend == "openrouter":
+                    logger.error("Cloud STT failed: %s — falling back to local", stt_err)
+                    from dragon_voice.stt import create_stt
+                    from dragon_voice.config import STTConfig
+                    fallback = create_stt(STTConfig(backend="moonshine"))
+                    await fallback.initialize()
+                    transcript = await fallback.transcribe(
+                        audio_data, self._config.audio.input_sample_rate
+                    )
+                    await fallback.shutdown()
+                    # Notify Tab5: auto-disable cloud mode
+                    await self._on_event({
+                        "type": "config_update",
+                        "error": "Cloud STT unavailable, reverted to local",
+                        "voice_mode": 0,
+                        "config": {"voice_mode": 0, "cloud_mode": False},
+                    })
+                else:
+                    raise
             stt_ms = (time.monotonic() - t0) * 1000
 
             if not transcript.strip():
@@ -487,9 +509,27 @@ class VoicePipeline:
                 self._tts_started = True
 
             t0 = time.monotonic()
-            audio_bytes = await asyncio.wait_for(
-                self._tts.synthesize(text), timeout=30
-            )
+            try:
+                audio_bytes = await asyncio.wait_for(
+                    self._tts.synthesize(text), timeout=30
+                )
+            except (Exception, asyncio.TimeoutError) as tts_err:
+                if self._config.tts.backend == "openrouter":
+                    logger.error("Cloud TTS failed: %s — falling back to local", tts_err)
+                    from dragon_voice.tts import create_tts
+                    from dragon_voice.config import TTSConfig
+                    fallback = create_tts(TTSConfig(backend="piper"))
+                    await fallback.initialize()
+                    audio_bytes = await fallback.synthesize(text)
+                    await fallback.shutdown()
+                    await self._on_event({
+                        "type": "config_update",
+                        "error": "Cloud TTS unavailable, reverted to local",
+                        "voice_mode": 0,
+                        "config": {"voice_mode": 0, "cloud_mode": False},
+                    })
+                else:
+                    raise
             tts_ms = (time.monotonic() - t0) * 1000
 
             if audio_bytes:

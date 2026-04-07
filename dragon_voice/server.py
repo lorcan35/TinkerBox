@@ -454,34 +454,86 @@ class VoiceServer:
                         await ws.send_json({"type": "pong"})
 
                     elif cmd_type == "config_update":
-                        # Tab5 requests cloud mode toggle
+                        # Three-tier voice mode: 0=local, 1=hybrid, 2=cloud
+                        voice_mode = cmd.get("voice_mode")
+                        llm_model = cmd.get("llm_model")
+                        # Backward compat: old binary cloud_mode toggle
                         cloud_mode = cmd.get("cloud_mode")
-                        if cloud_mode is not None:
-                            stt_be = "openrouter" if cloud_mode else "moonshine"
-                            tts_be = "openrouter" if cloud_mode else "piper"
-                            logger.info("Connection %s: cloud_mode=%s → stt=%s tts=%s",
-                                        ws_id, cloud_mode, stt_be, tts_be)
-                            # Update config and hot-swap backends
+                        if cloud_mode is not None and voice_mode is None:
+                            voice_mode = 2 if cloud_mode else 0
+
+                        if voice_mode is not None:
+                            # STT+TTS: local for mode 0, cloud for mode 1+2
+                            if voice_mode == 0:
+                                stt_be, tts_be = "moonshine", "piper"
+                            else:
+                                stt_be, tts_be = "openrouter", "openrouter"
+
+                            # LLM: cloud only for mode 2, local for 0+1
+                            if voice_mode == 2:
+                                llm_be = "openrouter"
+                                if llm_model:
+                                    self._config.llm.openrouter_model = llm_model
+                            else:
+                                llm_be = self._config.llm.local_backend or "openrouter"
+
+                            logger.info("Connection %s: voice_mode=%d → stt=%s tts=%s llm=%s model=%s",
+                                        ws_id, voice_mode, stt_be, tts_be, llm_be,
+                                        self._config.llm.openrouter_model if voice_mode == 2 else "(local)")
+
+                            # Validate API key for cloud modes
+                            if voice_mode >= 1 and not self._config.llm.openrouter_api_key:
+                                logger.error("Cloud mode requested but no API key configured")
+                                if not ws.closed:
+                                    await ws.send_json({
+                                        "type": "config_update",
+                                        "error": "No OpenRouter API key configured",
+                                        "voice_mode": 0,
+                                    })
+                                continue
+
+                            # Apply config
                             self._config.stt.backend = stt_be
                             self._config.tts.backend = tts_be
-                            # Propagate API key for cloud backends
-                            if cloud_mode:
+                            self._config.llm.backend = llm_be
+
+                            # Propagate API keys for cloud backends
+                            if voice_mode >= 1:
                                 self._config.stt.openrouter_api_key = self._config.llm.openrouter_api_key
                                 self._config.stt.openrouter_url = self._config.llm.openrouter_url
                                 self._config.tts.openrouter_api_key = self._config.llm.openrouter_api_key
                                 self._config.tts.openrouter_url = self._config.llm.openrouter_url
-                            # Swap backends on active pipeline
+
+                            # Hot-swap backends
                             pipeline = conn_state.get("pipeline")
                             if pipeline:
-                                await pipeline.swap_backends(self._config)
+                                try:
+                                    await pipeline.swap_backends(self._config)
+                                except Exception as e:
+                                    logger.exception("Backend swap failed")
+                                    if not ws.closed:
+                                        await ws.send_json({
+                                            "type": "config_update",
+                                            "error": f"Backend swap failed: {e}",
+                                            "voice_mode": 0,
+                                        })
+                                    continue
+
+                            # Update displayed names
+                            self._stt_name = stt_be
+                            self._tts_name = tts_be
+                            self._llm_name = llm_be
+
                             # Confirm to Tab5
                             if not ws.closed:
                                 await ws.send_json({
                                     "type": "config_update",
                                     "config": {
                                         "stt": stt_be, "tts": tts_be,
-                                        "llm": self._config.llm.backend,
-                                        "cloud_mode": bool(cloud_mode),
+                                        "llm": llm_be,
+                                        "llm_model": self._config.llm.openrouter_model if voice_mode == 2 else "",
+                                        "voice_mode": voice_mode,
+                                        "cloud_mode": voice_mode >= 1,
                                     },
                                 })
 

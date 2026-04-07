@@ -55,10 +55,11 @@ class TTSConfig:
 @dataclass
 class LLMConfig:
     backend: str = "ollama"
+    local_backend: str = ""  # Stores the original local backend for fallback (set at load time)
     ollama_url: str = "http://localhost:11434"
     ollama_model: str = "gemma3:4b"
     openrouter_api_key: str = ""
-    openrouter_model: str = "google/gemma-3-4b-it"
+    openrouter_model: str = "anthropic/claude-3-haiku"  # Default cloud model (user-selectable)
     openrouter_url: str = "https://openrouter.ai/api/v1"
     lmstudio_url: str = "http://localhost:1234/v1"
     lmstudio_model: str = "default"
@@ -222,6 +223,10 @@ def load_config(path: Optional[str] = None) -> VoiceConfig:
         llm=_dict_to_dataclass(LLMConfig, raw["llm"]),
         audio=_dict_to_dataclass(AudioConfig, raw["audio"]),
     )
+
+    # Remember original local LLM backend for fallback from cloud mode
+    if not config.llm.local_backend:
+        config.llm.local_backend = config.llm.backend
 
     # Auto-propagate OpenRouter API key to STT/TTS when using cloud backends
     if config.stt.backend == "openrouter" and not config.stt.openrouter_api_key:

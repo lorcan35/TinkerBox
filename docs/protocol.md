@@ -25,7 +25,10 @@ This document defines the WebSocket protocol between **Tab5** (ESP32-P4 thin cli
 9. [Audio Format](#9-audio-format)
 10. [State Machine](#10-state-machine)
 11. [Dictation Post-Processing](#11-dictation-post-processing)
-12. [Message Reference](#12-message-reference)
+12. [Tool Execution Events](#12-tool-execution-events)
+13. [OTA Protocol](#13-ota-protocol)
+14. [config_update Backward Compatibility](#14-config_update-backward-compatibility)
+15. [Message Reference](#15-message-reference)
 
 ---
 
@@ -969,7 +972,142 @@ Dragon sends the transcript (truncated to 2000 chars) to the LLM with a summariz
 
 ---
 
-## 12. Message Reference
+## 12. Tool Execution Events
+
+When the LLM decides to call a tool during response generation, Dragon sends real-time events to the connected client so the UI can show tool activity. These messages are interleaved with `llm` token messages during the response stream.
+
+### 12.1 tool_call (Dragon -> Tab5)
+
+```json
+{
+  "type": "tool_call",
+  "tool": "web_search",
+  "args": {"query": "weather in Dublin today"}
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | `"tool_call"` |
+| `tool` | string | Name of the tool being invoked (e.g. `web_search`, `remember`, `recall`, `datetime`). |
+| `args` | object | Arguments passed to the tool, as parsed from the LLM output. |
+
+**When sent:** After the LLM outputs tool-call markers and Dragon parses them, before tool execution begins.
+
+**Tab5 behavior on receive:** Display a tool activity indicator (e.g. "Searching...") in the UI. Remain in `PROCESSING` state.
+
+### 12.2 tool_result (Dragon -> Tab5)
+
+```json
+{
+  "type": "tool_result",
+  "tool": "web_search",
+  "result": {"snippets": ["Dublin: 14°C, partly cloudy..."]},
+  "execution_ms": 234
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | `"tool_result"` |
+| `tool` | string | Name of the tool that was executed. |
+| `result` | object | The tool's return value. Structure varies by tool. |
+| `execution_ms` | int | Wall-clock time for tool execution in milliseconds. |
+
+**When sent:** After tool execution completes, before the LLM continues generating with the tool result injected into context.
+
+**Tab5 behavior on receive:** Update the tool activity indicator with the result. Remain in `PROCESSING` state. The LLM will continue generating `llm` tokens after this.
+
+**Note:** Up to 3 tool calls may occur per turn (Dragon enforces a max to prevent infinite loops). Each tool call produces a `tool_call` + `tool_result` pair.
+
+### 12.3 Complete Tool-Calling Example Flow
+
+Full message sequence for a tool-calling conversation (text input asking for the time):
+
+```
+Tab5 → Dragon: {"type":"text","content":"What time is it?"}
+Dragon internal: LLM generates <tool>datetime</tool><args>{"query":"time"}</args>
+Dragon → Tab5: {"type":"tool_call","tool":"datetime","args":{"query":"time"}}
+Dragon internal: Tool executes, returns result
+Dragon → Tab5: {"type":"tool_result","tool":"datetime","result":{"datetime":"2026-04-07T14:30:00","timezone":"UTC"},"execution_ms":1}
+Dragon internal: LLM re-queries with tool result injected into context
+Dragon → Tab5: {"type":"llm","text":"It"}
+Dragon → Tab5: {"type":"llm","text":"'s"}
+Dragon → Tab5: {"type":"llm","text":" 2"}
+Dragon → Tab5: {"type":"llm","text":":30"}
+Dragon → Tab5: {"type":"llm","text":" PM"}
+Dragon → Tab5: {"type":"llm","text":"."}
+Dragon → Tab5: {"type":"llm_done","llm_ms":5000}
+Dragon → Tab5: {"type":"tts_start"}
+Dragon → Tab5: [binary TTS audio chunks]
+Dragon → Tab5: {"type":"tts_end","tts_ms":400}
+```
+
+**Key points:**
+- `tool_call` and `tool_result` are interleaved between `text` input and the final `llm` token stream
+- The LLM generates tokens TWICE: once to produce the tool markers, then again with the tool result to produce the final answer
+- Tab5 stays in `PROCESSING` state throughout the tool execution phase
+- Multiple tool calls can chain (up to 3 per turn) — each produces its own `tool_call` + `tool_result` pair before the final LLM response
+
+---
+
+## 13. OTA Protocol
+
+Dragon serves firmware updates for Tab5 via HTTP endpoints on port 3502.
+
+### 13.1 Check for Updates
+
+```
+Tab5 → Dragon: GET /api/ota/check?current=0.6.0
+Dragon → Tab5: {"update":true,"version":"0.6.1","url":"http://192.168.1.89:3502/api/ota/firmware.bin","sha256":"abc123..."}
+```
+
+If no update is available:
+```
+Dragon → Tab5: {"update":false,"version":"0.6.0"}
+```
+
+### 13.2 Download and Apply
+
+```
+Tab5: Downloads firmware via esp_https_ota from the URL in the check response
+Tab5: Writes firmware to inactive OTA partition (ota_0 or ota_1)
+Tab5: Verifies SHA256 hash matches
+Tab5: Reboots into new firmware
+Tab5: New firmware boots in PENDING_VERIFY state
+Tab5: If stable, calls tab5_ota_mark_valid() → firmware committed
+Tab5: If crash before mark_valid, bootloader auto-reverts to previous partition
+```
+
+### 13.3 Server-Side Files
+
+Dragon serves from `/home/radxa/ota/`:
+- `version.json` — `{"version":"0.6.1","sha256":"abc123..."}` — compared against `?current=` param
+- `tinkertab.bin` — firmware binary, streamed in 8KB chunks
+
+---
+
+## 14. config_update Backward Compatibility
+
+Both old and new config_update formats are supported by Dragon:
+
+### Old Format (boolean)
+```json
+{"type": "config_update", "cloud_mode": true}
+```
+Maps to: `voice_mode=2` (Full Cloud) if `true`, `voice_mode=0` (Local) if `false`.
+
+### New Format (three-tier)
+```json
+{"type": "config_update", "voice_mode": 0, "llm_model": "anthropic/claude-3-haiku"}
+```
+Direct integer mode (0=Local, 1=Hybrid, 2=Full Cloud) with explicit model selection.
+
+**Note:** The old boolean format cannot express Hybrid mode (voice_mode=1). New clients should always use the integer format. Dragon accepts both for backward compatibility with older Tab5 firmware versions.
+
+---
+
+## 15. Message Reference
 
 ### All Messages: Tab5 -> Dragon
 
@@ -1002,4 +1140,6 @@ Dragon sends the transcript (truncated to 2000 chars) to the LLM with a summariz
 | `error` | `{"type":"error","code":"...","message":"..."}` | On any error | Log, stop playback, transition READY/IDLE |
 | `pong` | `{"type":"pong"}` | In response to ping | None |
 | `config_update` | `{"type":"config_update","config":{"cloud_mode":true,"stt":"...","tts":"...","llm":"..."}}` | After config change | Persist cloud_mode to NVS |
+| `tool_call` | `{"type":"tool_call","tool":"web_search","args":{"query":"..."}}` | During LLM tool execution | Display tool activity indicator |
+| `tool_result` | `{"type":"tool_result","tool":"web_search","result":{...},"execution_ms":234}` | After tool execution completes | Display tool result, update UI |
 | `dictation_summary` | `{"type":"dictation_summary","title":"...","summary":"..."}` | After dictation post-processing | Store title/summary, update UI |

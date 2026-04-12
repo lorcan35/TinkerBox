@@ -142,6 +142,31 @@ class Database:
         )
         await self.conn.commit()
 
+    async def update_device(self, device_id: str, **kwargs) -> None:
+        """Update device fields. Allowed: name, config."""
+        allowed = {"name", "config"}
+        updates = {k: v for k, v in kwargs.items() if k in allowed}
+        if not updates:
+            return
+        now = time.time()
+        sets = []
+        params = []
+        for k, v in updates.items():
+            sets.append(f"{k} = ?")
+            params.append(json.dumps(v) if k == "config" else v)
+        sets.append("updated_at = ?")
+        params.append(now)
+        params.append(device_id)
+        await self.conn.execute(
+            f"UPDATE devices SET {', '.join(sets)} WHERE id = ?", params
+        )
+        await self.conn.commit()
+
+    async def delete_device(self, device_id: str) -> None:
+        """Delete a device. Sessions with this device get device_id=NULL (FK ON DELETE SET NULL)."""
+        await self.conn.execute("DELETE FROM devices WHERE id = ?", (device_id,))
+        await self.conn.commit()
+
     # ── Sessions ───────────────────────────────────────────────────────
 
     async def create_session(
@@ -231,6 +256,26 @@ class Database:
         )
         await self.conn.commit()
 
+    async def update_session(self, session_id: str, **kwargs) -> None:
+        """Update session fields. Allowed: title, system_prompt, metadata, config."""
+        allowed = {"title", "system_prompt", "metadata", "config"}
+        updates = {k: v for k, v in kwargs.items() if k in allowed}
+        if not updates:
+            return
+        now = time.time()
+        sets = []
+        params = []
+        for k, v in updates.items():
+            sets.append(f"{k} = ?")
+            params.append(json.dumps(v) if k in ("metadata", "config") else v)
+        sets.append("last_active_at = ?")
+        params.append(now)
+        params.append(session_id)
+        await self.conn.execute(
+            f"UPDATE sessions SET {', '.join(sets)} WHERE id = ?", params
+        )
+        await self.conn.commit()
+
     async def get_stale_sessions(self, timeout_seconds: float = 1800) -> list[dict]:
         """Find active/paused sessions inactive beyond the timeout."""
         cutoff = time.time() - timeout_seconds
@@ -305,6 +350,23 @@ class Database:
         )
         row = await cursor.fetchone()
         return row[0] if row else 0
+
+    async def get_message(self, message_id: str) -> Optional[dict]:
+        """Fetch a single message by ID."""
+        cursor = await self.conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def delete_messages(self, session_id: str) -> int:
+        """Delete all messages for a session. Returns count deleted."""
+        count = await self.count_messages(session_id)
+        await self.conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+        # Reset denormalized count
+        await self.conn.execute(
+            "UPDATE sessions SET message_count = 0 WHERE id = ?", (session_id,)
+        )
+        await self.conn.commit()
+        return count
 
     # ── Notes ──────────────────────────────────────────────────────────
 
@@ -387,6 +449,7 @@ class Database:
         self,
         event_type: Optional[str] = None,
         session_id: Optional[str] = None,
+        device_id: Optional[str] = None,
         since_id: int = 0,
         limit: int = 100,
     ) -> list[dict]:
@@ -400,6 +463,9 @@ class Database:
         if session_id:
             conditions.append("session_id = ?")
             params.append(session_id)
+        if device_id:
+            conditions.append("device_id = ?")
+            params.append(device_id)
 
         where = f"WHERE {' AND '.join(conditions)}"
         cursor = await self.conn.execute(
@@ -470,3 +536,13 @@ class Database:
         )
         rows = await cursor.fetchall()
         return {row["key"]: row["value"] for row in rows}
+
+    async def delete_config(self, key: str, scope: str = "global",
+                            scope_id: Optional[str] = None) -> bool:
+        """Delete a config key. Returns True if a row was deleted."""
+        cursor = await self.conn.execute(
+            "DELETE FROM config WHERE key = ? AND scope = ? AND scope_id IS ?",
+            (key, scope, scope_id),
+        )
+        await self.conn.commit()
+        return cursor.rowcount > 0

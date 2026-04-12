@@ -131,6 +131,7 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(type, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_events_device ON events(device_id, created_at DESC);
 
 
 -- ── Config Store ───────────────────────────────────────────────────
@@ -146,3 +147,51 @@ CREATE TABLE IF NOT EXISTS config (
     updated_at    REAL NOT NULL,
     PRIMARY KEY (key, scope, scope_id)
 );
+
+
+-- ── Memory Facts ──────────────────────────────────────────────────
+-- User facts and preferences, stored with embeddings for semantic search.
+-- Populated via 'remember' tool or auto-extracted from conversations.
+
+CREATE TABLE IF NOT EXISTS memory_facts (
+    id            TEXT PRIMARY KEY,
+    content       TEXT NOT NULL,
+    source        TEXT NOT NULL DEFAULT 'conversation',  -- 'conversation', 'manual', 'tool'
+    session_id    TEXT,
+    embedding     BLOB,                                   -- packed float32 vector
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_facts_created ON memory_facts(created_at DESC);
+
+
+-- ── Memory Documents ──────────────────────────────────────────────
+-- Ingested documents (text, URLs). Split into chunks for RAG.
+
+CREATE TABLE IF NOT EXISTS memory_documents (
+    id            TEXT PRIMARY KEY,
+    title         TEXT NOT NULL DEFAULT '',
+    content       TEXT NOT NULL DEFAULT '',               -- first 500 chars as preview
+    chunk_count   INTEGER NOT NULL DEFAULT 0,
+    source        TEXT NOT NULL DEFAULT 'upload',         -- 'upload', 'url', 'text'
+    metadata      TEXT NOT NULL DEFAULT '{}',             -- JSON: page count, author, etc.
+    created_at    REAL NOT NULL,
+    updated_at    REAL NOT NULL
+);
+
+
+-- ── Memory Chunks ─────────────────────────────────────────────────
+-- Document chunks with embeddings for vector search.
+
+CREATE TABLE IF NOT EXISTS memory_chunks (
+    id            TEXT PRIMARY KEY,
+    document_id   TEXT NOT NULL,
+    chunk_index   INTEGER NOT NULL,
+    content       TEXT NOT NULL,
+    embedding     BLOB,                                   -- packed float32 vector
+    created_at    REAL NOT NULL,
+    FOREIGN KEY (document_id) REFERENCES memory_documents(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_chunks_doc ON memory_chunks(document_id, chunk_index);

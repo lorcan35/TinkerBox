@@ -17,6 +17,34 @@ logger = logging.getLogger(__name__)
 # Default config path: config.yaml next to this file
 _DEFAULT_CONFIG_PATH = Path(__file__).parent / "config.yaml"
 
+# ── Mode-aware system prompts ──────────────────────────────────────
+# Local mode: small models (qwen3:1.7b) need tight constraints
+SYSTEM_PROMPT_LOCAL = (
+    "You are Tinker, a helpful AI assistant running locally. "
+    "Reply in 1-2 sentences maximum. Be concise and direct. "
+    "Never simulate user responses. Stop immediately after answering."
+)
+
+# Hybrid mode: cloud STT/TTS but local LLM — same constraints as local
+SYSTEM_PROMPT_HYBRID = (
+    "You are Tinker, a helpful AI assistant. "
+    "Reply in 1-3 sentences. Be concise but helpful. "
+    "Never simulate user responses. Stop immediately after answering."
+)
+
+# Cloud mode: full cloud LLM (Haiku/Sonnet/GPT-4o) — allow richer responses
+SYSTEM_PROMPT_CLOUD = (
+    "You are Tinker, a knowledgeable AI assistant. "
+    "You can give detailed, helpful responses. Keep answers focused and practical. "
+    "Use natural conversational tone. If the question is simple, keep the answer short. "
+    "For complex topics, explain clearly in a few sentences."
+)
+
+# Mode-aware max tokens
+MAX_TOKENS_LOCAL = 128   # Small model, keep fast
+MAX_TOKENS_HYBRID = 256  # Local LLM with cloud STT/TTS
+MAX_TOKENS_CLOUD = 512   # Cloud LLM can handle more
+
 
 @dataclass
 class ServerConfig:
@@ -84,6 +112,23 @@ class AudioConfig:
 
 
 @dataclass
+class ToolsConfig:
+    enabled: bool = True
+    max_tool_calls: int = 3
+    web_search_engine: str = "duckduckgo"
+    searxng_url: str = ""  # Set to http://your-searxng:8888 to use SearXNG
+
+
+@dataclass
+class MemoryConfig:
+    enabled: bool = True
+    embed_model: str = "nomic-embed-text"
+    auto_extract_facts: bool = True
+    max_context_facts: int = 3
+    max_context_chunks: int = 3
+
+
+@dataclass
 class VoiceConfig:
     """Top-level configuration container."""
 
@@ -92,6 +137,8 @@ class VoiceConfig:
     tts: TTSConfig = field(default_factory=TTSConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     audio: AudioConfig = field(default_factory=AudioConfig)
+    tools: ToolsConfig = field(default_factory=ToolsConfig)
+    memory: MemoryConfig = field(default_factory=MemoryConfig)
 
     def validate(self) -> list[str]:
         """Validate configuration values.
@@ -209,7 +256,7 @@ def load_config(path: Optional[str] = None) -> VoiceConfig:
         )
 
     # Ensure all sections exist
-    for section in ("server", "stt", "tts", "llm", "audio"):
+    for section in ("server", "stt", "tts", "llm", "audio", "tools", "memory"):
         raw.setdefault(section, {})
 
     # Apply environment variable overrides
@@ -222,6 +269,8 @@ def load_config(path: Optional[str] = None) -> VoiceConfig:
         tts=_dict_to_dataclass(TTSConfig, raw["tts"]),
         llm=_dict_to_dataclass(LLMConfig, raw["llm"]),
         audio=_dict_to_dataclass(AudioConfig, raw["audio"]),
+        tools=_dict_to_dataclass(ToolsConfig, raw["tools"]),
+        memory=_dict_to_dataclass(MemoryConfig, raw["memory"]),
     )
 
     # Remember original local LLM backend for fallback from cloud mode

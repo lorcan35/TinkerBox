@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 # Default system prompt if none is set on the session
 DEFAULT_SYSTEM_PROMPT = (
-    "You are Glyph, a helpful AI assistant on a portable device called "
+    "You are Tinker, a helpful AI assistant on a portable device called "
     "TinkerClaw. Keep responses concise and conversational — they will "
     "be spoken aloud."
 )
@@ -127,9 +127,9 @@ class MessageStore:
         context: list[dict] = [{"role": "system", "content": system_prompt}]
 
         for msg in messages:
-            # Only include user and assistant messages in LLM context
-            # (skip system/tool messages for now — they're stored but not sent to LLM)
-            if msg["role"] in ("user", "assistant"):
+            # Include user, assistant, and tool messages in LLM context
+            # (tool results are needed for the LLM to see what tools returned)
+            if msg["role"] in ("user", "assistant", "tool"):
                 context.append({
                     "role": msg["role"],
                     "content": msg["content"],

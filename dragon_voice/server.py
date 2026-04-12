@@ -16,8 +16,12 @@ from typing import Optional
 
 from aiohttp import web, WSMsgType
 
-from dragon_voice.api import APIRoutes
-from dragon_voice.config import VoiceConfig, config_to_dict, load_config
+from dragon_voice.api import setup_all_routes
+from dragon_voice.config import (
+    VoiceConfig, config_to_dict, load_config,
+    SYSTEM_PROMPT_LOCAL, SYSTEM_PROMPT_HYBRID, SYSTEM_PROMPT_CLOUD,
+    MAX_TOKENS_LOCAL, MAX_TOKENS_HYBRID, MAX_TOKENS_CLOUD,
+)
 from dragon_voice.conversation import ConversationEngine
 from dragon_voice.db import Database
 from dragon_voice.messages import MessageStore
@@ -60,7 +64,10 @@ class VoiceServer:
 
     def create_app(self) -> web.Application:
         """Create and configure the aiohttp application."""
-        app = web.Application(client_max_size=32 * 1024 * 1024)  # 32MB for audio uploads
+        app = web.Application(
+            client_max_size=32 * 1024 * 1024,  # 32MB for audio uploads
+            middlewares=[self._cors_middleware],
+        )
 
         # HTTP routes (legacy)
         app.router.add_get("/", self._handle_status)
@@ -77,6 +84,21 @@ class VoiceServer:
 
         self._app = app
         return app
+
+    @web.middleware
+    async def _cors_middleware(self, request: web.Request, handler):
+        """Add CORS headers to all API responses."""
+        # Handle preflight OPTIONS requests
+        if request.method == "OPTIONS":
+            return web.Response(headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, X-Sample-Rate, Accept",
+                "Access-Control-Max-Age": "3600",
+            })
+        response = await handler(request)
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        return response
 
     # --------------------------------------------------------------- Lifecycle
 
@@ -95,16 +117,72 @@ class VoiceServer:
         # Message store
         self._message_store = MessageStore(self._db)
 
+        # Memory service (agentic: facts + documents + RAG)
+        self._memory_service = None
+        self._tool_registry = None
+        try:
+            from dragon_voice.memory import MemoryService
+            from dragon_voice.tools import ToolRegistry
+            from dragon_voice.tools.web_search import WebSearchTool
+            from dragon_voice.tools.datetime_tool import DateTimeTool
+
+            self._memory_service = MemoryService(
+                self._db,
+                ollama_url=self._config.llm.ollama_url,
+            )
+            await self._memory_service.initialize()
+
+            self._tool_registry = ToolRegistry()
+            self._tool_registry.register(WebSearchTool(
+                searxng_url=getattr(self._config.tools, "searxng_url", "")
+            ))
+            self._tool_registry.register(DateTimeTool())
+
+            # Memory tools need memory_service
+            from dragon_voice.tools.memory_tools import StoreFactTool, RecallFactsTool
+            self._tool_registry.register(StoreFactTool(self._memory_service))
+            self._tool_registry.register(RecallFactsTool(self._memory_service))
+
+            # Tier 1 tools
+            from dragon_voice.tools.timer_tool import TimerTool
+            from dragon_voice.tools.weather_tool import WeatherTool
+            from dragon_voice.tools.calculator_tool import CalculatorTool
+            from dragon_voice.tools.unit_converter_tool import UnitConverterTool
+            from dragon_voice.tools.note_tool import NoteTool
+            from dragon_voice.tools.system_tool import SystemInfoTool
+
+            self._tool_registry.register(TimerTool())
+            self._tool_registry.register(WeatherTool())
+            self._tool_registry.register(CalculatorTool())
+            self._tool_registry.register(UnitConverterTool())
+            self._tool_registry.register(SystemInfoTool())
+
+            logger.info("Agentic modules initialized (tools: %d, memory: ok)",
+                        len(self._tool_registry.list_tools()))
+        except Exception as e:
+            logger.warning("Agentic modules not available: %s", e)
+
         # Conversation engine (shared LLM backend for text/API input)
         self._conversation = ConversationEngine(
-            self._db, self._message_store, self._config.llm
+            self._db, self._message_store, self._config.llm,
+            tool_registry=self._tool_registry,
+            memory_service=self._memory_service,
         )
         await self._conversation.initialize()
 
-        # REST API routes
-        api = APIRoutes(self._db, self._session_mgr, self._message_store,
-                        self._conversation, voice_config=self._config)
-        api.register(app)
+        # REST API routes (modular package)
+        setup_all_routes(
+            app,
+            db=self._db,
+            session_mgr=self._session_mgr,
+            message_store=self._message_store,
+            conversation=self._conversation,
+            voice_config=self._config,
+            start_time=self._start_time,
+            get_active_connections=lambda: len(self._active_connections),
+            tool_registry=self._tool_registry,
+            memory_service=self._memory_service,
+        )
 
         # Notes API routes
         try:
@@ -119,8 +197,29 @@ class VoiceServer:
             self._notes_svc = notes_svc  # Store for shutdown
             setup_notes_routes(app, notes_svc)
             logger.info("Notes API routes registered")
+
+            # Register note tool now that NotesService is available
+            if self._tool_registry and self._notes_svc:
+                from dragon_voice.tools.note_tool import NoteTool
+                self._tool_registry.register(NoteTool(self._notes_svc))
+                logger.info("Note tool registered (notes service available)")
         except Exception as e:
             logger.warning("Notes API not available: %s", e)
+
+        # MCP servers (from config)
+        try:
+            from dragon_voice.mcp.bridge import bridge_mcp_server
+            mcp_servers = getattr(self._config, 'mcp_servers', [])
+            for mcp in mcp_servers:
+                count = await bridge_mcp_server(
+                    self._tool_registry,
+                    name=mcp.get('name', 'mcp'),
+                    url=mcp.get('url'),
+                    token=mcp.get('token'),
+                )
+                logger.info("MCP %s: %d tools bridged", mcp.get('name'), count)
+        except Exception as e:
+            logger.warning("MCP bridge not available: %s", e)
 
         logger.info("Foundation modules initialized")
 
@@ -141,6 +240,10 @@ class VoiceServer:
         # Shut down foundation
         if self._notes_svc:
             await self._notes_svc.shutdown()
+        if self._memory_service:
+            logger.info("Shutting down memory service")
+            # MemoryService doesn't have explicit shutdown but clear reference
+            self._memory_service = None
         if self._conversation:
             await self._conversation.shutdown()
         if self._session_mgr:
@@ -477,9 +580,21 @@ class VoiceServer:
                             else:
                                 llm_be = self._config.llm.local_backend or "openrouter"
 
-                            logger.info("Connection %s: voice_mode=%d → stt=%s tts=%s llm=%s model=%s",
+                            # Apply mode-aware system prompt and max_tokens
+                            if voice_mode == 0:
+                                self._config.llm.system_prompt = SYSTEM_PROMPT_LOCAL
+                                self._config.llm.max_tokens = MAX_TOKENS_LOCAL
+                            elif voice_mode == 1:
+                                self._config.llm.system_prompt = SYSTEM_PROMPT_HYBRID
+                                self._config.llm.max_tokens = MAX_TOKENS_HYBRID
+                            else:
+                                self._config.llm.system_prompt = SYSTEM_PROMPT_CLOUD
+                                self._config.llm.max_tokens = MAX_TOKENS_CLOUD
+
+                            logger.info("Connection %s: voice_mode=%d → stt=%s tts=%s llm=%s model=%s tokens=%d",
                                         ws_id, voice_mode, stt_be, tts_be, llm_be,
-                                        self._config.llm.openrouter_model if voice_mode == 2 else "(local)")
+                                        self._config.llm.openrouter_model if voice_mode == 2 else "(local)",
+                                        self._config.llm.max_tokens)
 
                             # Validate API key for cloud modes
                             if voice_mode >= 1 and not self._config.llm.openrouter_api_key:
@@ -491,6 +606,16 @@ class VoiceServer:
                                         "voice_mode": 0,
                                     })
                                 continue
+
+                            # Update session system prompt in DB for conversation engine
+                            sid = conn_state.get("session_id")
+                            if sid and self._db:
+                                try:
+                                    await self._db.update_session(
+                                        sid, system_prompt=self._config.llm.system_prompt
+                                    )
+                                except Exception:
+                                    logger.warning("Failed to update session system_prompt")
 
                             # Apply config
                             self._config.stt.backend = stt_be
@@ -504,7 +629,7 @@ class VoiceServer:
                                 self._config.tts.openrouter_api_key = self._config.llm.openrouter_api_key
                                 self._config.tts.openrouter_url = self._config.llm.openrouter_url
 
-                            # Hot-swap backends
+                            # Hot-swap backends on pipeline AND conversation engine
                             pipeline = conn_state.get("pipeline")
                             if pipeline:
                                 try:
@@ -518,6 +643,19 @@ class VoiceServer:
                                             "voice_mode": 0,
                                         })
                                     continue
+
+                            # Also swap ConversationEngine LLM (used by _handle_text)
+                            if self._conversation:
+                                try:
+                                    from dragon_voice.llm import create_llm
+                                    if self._conversation._llm:
+                                        await self._conversation._llm.shutdown()
+                                    new_llm = create_llm(self._config.llm)
+                                    await new_llm.initialize()
+                                    self._conversation._llm = new_llm
+                                    logger.info("ConversationEngine LLM swapped to %s", new_llm.name)
+                                except Exception as e:
+                                    logger.exception("ConversationEngine LLM swap failed: %s", e)
 
                             # Update displayed names
                             self._stt_name = stt_be
@@ -602,7 +740,63 @@ class VoiceServer:
         )
         session_id = session["id"]
 
-        # Create voice pipeline with conversation engine for multi-turn
+        # Update connection state FIRST (before slow pipeline init)
+        conn_state["session_id"] = session_id
+        conn_state["device_id"] = device_id
+        conn_state["registered"] = True
+        conn_state["response_mode"] = "always_speak"  # voice device gets TTS
+
+        # Store tool event callbacks per-connection (NOT on shared conversation engine)
+        if self._tool_registry:
+            async def _on_tool_call(call):
+                if not ws.closed:
+                    await ws.send_json({"type": "tool_call", "tool": call["tool"], "args": call["args"]})
+
+            async def _on_tool_result(result):
+                if not ws.closed:
+                    await ws.send_json({"type": "tool_result", **result})
+
+            conn_state["on_tool_call"] = _on_tool_call
+            conn_state["on_tool_result"] = _on_tool_result
+
+        # Send session_start IMMEDIATELY — before slow pipeline init
+        # Tab5 will timeout if we don't respond quickly
+        try:
+            await ws.send_json({
+                "type": "session_start",
+                "session_id": session_id,
+                "device_id": device_id,
+                "resumed": resumed,
+                "message_count": session.get("message_count", 0),
+                "config": {
+                    "stt": self._config.stt.backend,
+                    "tts": self._config.tts.backend,
+                    "llm": self._config.llm.backend,
+                    "tts_sample_rate": self._config.audio.input_sample_rate,
+                    "response_mode": "match_input",
+                    "system_prompt": self._config.llm.system_prompt,
+                },
+            })
+        except Exception as e:
+            logger.warning("Failed to send session_start to %s: %s (client may have disconnected)", ws_id, e)
+            return
+
+        logger.info(
+            "Device %s registered on session %s (resumed=%s, ws_id=%s)",
+            device_id, session_id, resumed, ws_id,
+        )
+
+        # Reset config to local defaults before pipeline init.
+        # Tab5 will immediately send config_update with its actual mode,
+        # so this avoids initializing cloud backends only to swap them out.
+        self._config.stt.backend = "moonshine"
+        self._config.tts.backend = "piper"
+        self._config.llm.backend = self._config.llm.local_backend or "ollama"
+        self._config.llm.system_prompt = SYSTEM_PROMPT_LOCAL
+        self._config.llm.max_tokens = MAX_TOKENS_LOCAL
+
+        # NOW initialize the voice pipeline (slow: Moonshine load ~2s)
+        # This happens AFTER session_start is sent so Tab5 doesn't timeout
         pipeline = VoicePipeline(
             self._config, on_audio, on_event,
             conversation_engine=self._conversation,
@@ -612,38 +806,13 @@ class VoiceServer:
             await pipeline.initialize()
         except Exception as e:
             logger.exception("Failed to initialize pipeline for %s", ws_id)
-            await ws.send_json({"type": "error", "code": "internal",
-                                "message": f"Pipeline init failed: {e}"})
+            if not ws.closed:
+                await ws.send_json({"type": "error", "code": "internal",
+                                    "message": f"Pipeline init failed: {e}"})
             return
 
-        # Update connection state
         conn_state["pipeline"] = pipeline
-        conn_state["session_id"] = session_id
-        conn_state["device_id"] = device_id
-        conn_state["registered"] = True
-        conn_state["response_mode"] = "always_speak"  # voice device gets TTS
-
-        # Send session_start response (per protocol.md)
-        await ws.send_json({
-            "type": "session_start",
-            "session_id": session_id,
-            "device_id": device_id,
-            "resumed": resumed,
-            "message_count": session.get("message_count", 0),
-            "config": {
-                "stt": pipeline.stt_name,
-                "tts": pipeline.tts_name,
-                "llm": pipeline.llm_name,
-                "tts_sample_rate": pipeline.tts_sample_rate,
-                "response_mode": "match_input",
-                "system_prompt": self._config.llm.system_prompt,
-            },
-        })
-
-        logger.info(
-            "Device %s registered on session %s (resumed=%s, ws_id=%s)",
-            device_id, session_id, resumed, ws_id,
-        )
+        logger.info("Pipeline ready for %s", ws_id)
 
     async def _handle_text(
         self, ws: web.WebSocketResponse, conn_state: dict, cmd: dict
@@ -668,6 +837,8 @@ class VoiceServer:
                 session_id=session_id,
                 text=content,
                 input_mode="text",
+                on_tool_call=conn_state.get("on_tool_call"),
+                on_tool_result=conn_state.get("on_tool_result"),
             ):
                 full_response.append(token)
                 if not ws.closed:

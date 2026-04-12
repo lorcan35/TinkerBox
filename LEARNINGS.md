@@ -352,3 +352,42 @@ sequentially across the whole file (don't restart per section).
 - **Root Cause:** The WebSocket message handler recognized `{"type":"ping"}` messages but did nothing with them — no pong response was sent. The handler was a silent no-op.
 - **Fix:** Added a pong response: when Dragon receives `{"type":"ping"}`, it immediately sends `{"type":"pong"}` back to Tab5.
 - **Prevention:** Every request-type message in the protocol must have a defined response. Add ping/pong to `docs/protocol.md` as a required message pair. Test heartbeat round-trip in integration tests.
+
+---
+
+## Agentic Pipeline Bugs (2026-04-07)
+
+### 45. Shared conversation callbacks race condition
+- **Date:** 2026-04-07
+- **Symptom:** When multiple WebSocket clients were connected simultaneously, tool event callbacks (tool_call, tool_result) were delivered to the wrong client or lost entirely. Only the most recently connected client received tool events.
+- **Root Cause:** `ConversationEngine` was a shared singleton, but the `on_tool_call` and `on_tool_result` callbacks were set as instance attributes per-connection. Each new WebSocket connection overwrote the previous callbacks — last-writer-wins. Earlier connections lost their callback references.
+- **Fix:** Removed callback storage from ConversationEngine. Instead, pass `on_tool_call` and `on_tool_result` as parameters to `process_text_stream()` on every call. Each connection provides its own callbacks at call time — no shared mutable state.
+- **Prevention:** Never store per-connection state on shared/singleton objects. Pass connection-scoped callbacks as function parameters, not as object attributes. Review all shared engine classes for per-connection state leaks.
+
+### 46. Double-store bug in tool-calling
+- **Date:** 2026-04-07
+- **Symptom:** When the LLM made a tool call, the assistant message appeared twice in the conversation history. The database had duplicate entries for the same response.
+- **Root Cause:** During tool execution, the assistant response (containing the tool call markers) was stored in the database immediately. Then, after the tool result was injected and the LLM continued, the final response was stored again at the end of the pipeline. The initial partial response was never cleaned up.
+- **Fix:** Only store the final complete response at the end of `process_text_stream()`. Removed the intermediate store that happened during tool call parsing. Tool call/result messages are stored separately as their own message types.
+- **Prevention:** Assistant responses should be stored exactly once — at the end of the full generation cycle (including all tool calls). Never store intermediate/partial responses. Add a unique constraint or dedup check if multiple store paths exist.
+
+### 47. numpy module-level import crash
+- **Date:** 2026-04-07
+- **Symptom:** Voice server failed to start with `ModuleNotFoundError: No module named 'numpy'`. The entire service was down.
+- **Root Cause:** `synthesize.py` (the TTS synthesis API route) imported `numpy` at module level (`import numpy as np` at the top of the file). When `numpy` was not installed on Dragon (common on minimal ARM64 installs), the import failed at module load time, preventing the entire `api/` package from initializing.
+- **Fix:** Moved the `numpy` import inside the function that actually uses it (lazy import). The module loads successfully even without numpy — the specific route that needs numpy will raise an error only if called.
+- **Prevention:** Never import optional/heavy dependencies at module level in server code. Use lazy imports inside the functions that need them. This ensures the server starts even if an optional dependency is missing — only the specific feature that requires it will fail gracefully.
+
+### 48. Old api.py dead code
+- **Date:** 2026-04-07
+- **Symptom:** Confusion during debugging — edits to `dragon_voice/api.py` had no effect because the server was actually loading routes from `dragon_voice/api/__init__.py` (the package).
+- **Root Cause:** After refactoring the monolithic `api.py` file into the `api/` package (with `__init__.py`, `sessions.py`, `messages.py`, etc.), the old `api.py` file was left behind. Python's module resolution found the `api/` package first, but the leftover file caused confusion when reading or searching the codebase.
+- **Fix:** Deleted the old `dragon_voice/api.py` file. Only the `api/` package directory remains.
+- **Prevention:** When refactoring a module into a package, always delete the original file in the same commit. Verify with `git status` that no orphaned files remain. Add a CI check that flags .py files at the same path as a package directory.
+
+### 49. config.yaml overwritten on deploy
+- **Date:** 2026-04-07
+- **Symptom:** After deploying code to Dragon via `scp -r dragon_voice/`, Dragon's local config was overwritten. Custom settings (API keys, backend selections, local paths) were replaced with development defaults.
+- **Root Cause:** The `scp -r dragon_voice/` command copies the entire directory including `config.yaml`. The source repo's `config.yaml` had `backend: openrouter` as the default LLM backend, which overwrote Dragon's local config that had `backend: ollama` (the correct default for the ARM64 hardware).
+- **Fix:** Changed the default `backend` in the source `config.yaml` to `ollama` so that even if the file is overwritten during deploy, Dragon gets a safe default that works without cloud API keys.
+- **Prevention:** Default config values in the repo should always be the safest/most-compatible option (local backends, no API keys required). Consider adding `config.yaml` to a deploy exclude list, or use a `config.local.yaml` overlay pattern where local overrides are never touched by deploy.

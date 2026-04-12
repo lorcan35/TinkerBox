@@ -27,10 +27,10 @@ tts:
   sample_rate: 22050
 
 llm:
-  backend: "openrouter"  # ollama, openrouter, lmstudio, npu_genie
+  backend: "ollama"  # ollama, openrouter, lmstudio, npu_genie
   # ollama
   ollama_url: "http://localhost:11434"
-  ollama_model: "llama3.2:latest"
+  ollama_model: "qwen3:1.7b"
   # openrouter
   openrouter_api_key: ""  # reads from OPENROUTER_API_KEY env var if empty
   openrouter_model: "anthropic/claude-3.5-haiku"
@@ -49,3 +49,10 @@ audio:
   output_sample_rate: 22050
   vad_enabled: true
   vad_silence_ms: 600
+
+# Tools configuration
+tools:
+  enabled: true
+  max_tool_calls: 3
+  web_search_engine: "duckduckgo"
+  searxng_url: ""  # Set to http://localhost:8888 to use SearXNG

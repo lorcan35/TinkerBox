@@ -94,9 +94,38 @@ Dragon serves firmware updates for Tab5 via two endpoints:
 - **Cloud mode backends:** OpenRouter STT and TTS both use `openai/gpt-audio-mini` model via OpenRouter's chat completions API. STT sends base64-encoded WAV audio. TTS streams pcm16 via SSE. API key auto-propagated from `llm.openrouter_api_key` in config.
 - **Dictation post-processing:** After dictation ends, `pipeline._post_process_dictation()` sends the full transcript to LLM for title + summary generation, then sends `dictation_summary` message to Tab5.
 
-## Current Sprint: Phase 1 — Voice Features (April 2026)
+## Dashboard (port 3500)
 
-**Phase 0 (Foundation) is complete.** Phase 1 adds cloud mode, dictation, and wires up notes.
+The web dashboard is a 9-tab single-page application served by `dashboard.py` on port 3500. It aggregates data from the voice server (3502) and provides a management UI for all Dragon capabilities.
+
+**Proxy architecture:** The dashboard proxies ALL API calls through `/api/proxy/` to the voice server (port 3502). The dashboard itself is a thin frontend — all data lives in the voice server's SQLite database. This means the dashboard has no direct DB access and can be restarted independently without affecting active sessions.
+
+| Tab | Description |
+|-----|-------------|
+| **Overview** | System status, active connections, backend config, CPU/RAM bars (percent-filled visual bars for CPU and RAM usage) |
+| **Conversations** | Browse all sessions, view message history, filter by device/status |
+| **Chat** | Live SSE-streaming chat interface. Supports stateless mode (direct LLM completion, no session context) for quick queries |
+| **Devices** | Registered devices, online/offline status, capabilities, config |
+| **Notes** | Notes CRUD, search, audio-to-note, dictation summaries |
+| **Logs** | Event log with type/session/device filters |
+| **Memory** | Stored facts, semantic search with score bars (visual similarity score for each result), add/delete facts |
+| **Documents** | Ingested documents, chunk browser, semantic search across chunks |
+| **Tools** | Available tools listing, direct tool execution with dynamic parameter forms generated from each tool's JSON schema definition |
+
+## Local LLM Benchmarks (Dragon Q6A, ARM64 CPU via Ollama)
+
+| Model | tok/s | Tool Calling | RAM |
+|-------|-------|-------------|-----|
+| qwen3:0.6b | 11.8 | Untested | 0.5GB |
+| qwen3:1.7b | 7.1 | Good (current default) | 1.4GB |
+| qwen3:4b | 3.0 | Excellent (97.5%) | 2.5GB |
+| gemma3:4b | 3.4 | OK format, bad answers | 3.3GB |
+
+**Current default:** `qwen3:1.7b` — best balance of speed and tool-calling accuracy for the Dragon's ARM64 CPU. Tool calling quality tested across 12 scenarios (web search, memory store/recall, datetime, multi-tool chains).
+
+## Current Sprint: Complete (April 2026)
+
+**Phase 0 (Foundation) and Phase 1 (Voice Features) are both complete.** The agentic sprint (tool-calling, memory, documents) is also done. Dragon is a fully functional API-first voice assistant server with agentic capabilities.
 
 ### Issues
 | # | Title | Status |
@@ -104,12 +133,19 @@ Dragon serves firmware updates for Tab5 via two endpoints:
 | #16 | Session management infrastructure | DONE (sessions.py, db.py) |
 | #17 | Multi-turn conversation engine | DONE (conversation.py, messages.py) |
 | #18 | Unified voice + text input | DONE (server.py handles both voice and text) |
-| #21 | REST API framework | DONE (api.py, /api/v1/ routes) |
+| #21 | REST API framework | DONE (api/ package, 50 endpoints) |
 | #19 | Notes feature | DONE (notes/ module wired into server.py, API routes registered) |
 | — | Cloud mode (OpenRouter STT+TTS) | DONE (openrouter_stt.py, openrouter_tts.py, config_update WS command) |
 | — | Dictation mode + post-processing | DONE (dictation in pipeline.py, auto-generated title/summary) |
 | #20 | Tab5 SD card storage | DONE (SDMMC 4-bit, FAT32, coexists with WiFi SDIO, notes.js + WAV recordings) |
-| #22 | Dashboard conversation viewer | DONE (6-tab SPA: Overview, Conversations, Chat, Devices, Notes, Logs) |
+| #22 | Dashboard conversation viewer | DONE (9-tab SPA: Overview, Conversations, Chat, Devices, Notes, Logs, Memory, Documents, Tools) |
+| — | Agentic pipeline (tool-calling) | DONE (ToolRegistry, XML parsing, web_search, remember, recall, datetime) |
+| — | Memory + RAG | DONE (MemoryService, facts CRUD, document ingestion, semantic search) |
+| — | E2E test suite | DONE (29 tests: 14 single-step, 8 multi-step, 7 complex chained) |
+| — | Settings crash fix (WDT) | DONE (f_getfree cached at boot, esp_task_wdt_reset fed between settings sections) |
+| — | Tolerant tool parser | DONE (handles stray `>`, missing `</args>`, small model XML quirks) |
+| — | Response timeout (local mode) | DONE (disabled/5 min for local mode, 35s for cloud mode) |
+| — | Default local LLM | DONE (qwen3:1.7b set as default, 7.1 tok/s, good tool calling) |
 
 ### Architecture Decisions (from scaffolding research)
 - **Session != Connection.** Sessions survive disconnects. Device reconnects → resume.
@@ -132,47 +168,157 @@ See `schema.sql` — 6 tables: devices, sessions, messages, notes, events, confi
 - Paginate through old sessions via REST API
 - Dashboard shows live conversation via WebSocket events
 
-## File Structure
+## API-First Architecture (50 REST endpoints + 1 WebSocket)
+
+Dragon is an API-first server. Every capability is accessible via REST so any hardware client can use it.
+
+### REST API Endpoints (/api/v1/*)
+
+| Category | Method | Path | Purpose |
+|----------|--------|------|---------|
+| **Sessions** | GET | `/api/v1/sessions` | List sessions (filter by device, status) |
+| | POST | `/api/v1/sessions` | Create session |
+| | GET | `/api/v1/sessions/{id}` | Get session |
+| | POST | `/api/v1/sessions/{id}/end` | End session |
+| | POST | `/api/v1/sessions/{id}/resume` | Resume paused session |
+| | POST | `/api/v1/sessions/{id}/pause` | Pause active session |
+| | PATCH | `/api/v1/sessions/{id}` | Update title/system_prompt/metadata |
+| | GET | `/api/v1/sessions/{id}/context` | Get formatted LLM context |
+| **Messages** | GET | `/api/v1/sessions/{id}/messages` | List messages (paginated) |
+| | POST | `/api/v1/sessions/{id}/chat` | SSE streaming LLM chat |
+| | GET | `/api/v1/messages/{id}` | Get single message |
+| | DELETE | `/api/v1/sessions/{id}/messages` | Purge session messages |
+| **Devices** | GET | `/api/v1/devices` | List devices |
+| | GET | `/api/v1/devices/{id}` | Get device |
+| | PATCH | `/api/v1/devices/{id}` | Update device name/config |
+| | DELETE | `/api/v1/devices/{id}` | Remove device |
+| **Config** | GET | `/api/v1/config` | List config by scope |
+| | GET | `/api/v1/config/{key}` | Get config (with scope resolution) |
+| | PUT | `/api/v1/config/{key}` | Set config value |
+| | DELETE | `/api/v1/config/{key}` | Delete config key |
+| **Events** | GET | `/api/v1/events` | List events (filter by type/session/device) |
+| **Media** | POST | `/api/v1/transcribe` | STT: audio bytes → text |
+| | POST | `/api/v1/synthesize` | TTS: text → audio bytes |
+| | POST | `/api/v1/completions` | Direct LLM (stateless, no session) |
+| **System** | GET | `/api/v1/system` | System metrics (CPU, RAM, connections) |
+| | GET | `/api/v1/backends` | List available STT/TTS/LLM backends |
+| **Tools** | GET | `/api/v1/tools` | List available tools |
+| | POST | `/api/v1/tools/{name}/execute` | Execute a tool directly |
+| **Memory** | GET | `/api/v1/memory` | List stored facts |
+| | POST | `/api/v1/memory` | Store a fact |
+| | DELETE | `/api/v1/memory/{id}` | Delete a fact |
+| | POST | `/api/v1/memory/search` | Semantic search facts |
+| **Documents** | POST | `/api/v1/documents` | Ingest document (chunk + embed) |
+| | GET | `/api/v1/documents` | List documents |
+| | DELETE | `/api/v1/documents/{id}` | Delete document + chunks |
+| | POST | `/api/v1/documents/search` | Semantic search across chunks |
+| **Notes** | POST | `/api/notes` | Create note |
+| | GET | `/api/notes` | List notes |
+| | GET | `/api/notes/{id}` | Get note |
+| | PUT | `/api/notes/{id}` | Update note |
+| | DELETE | `/api/notes/{id}` | Delete note |
+| | POST | `/api/notes/search` | Semantic search notes |
+| | POST | `/api/notes/from-audio` | Create note from audio |
+| **OTA** | GET | `/api/ota/check` | Check firmware updates |
+| | GET | `/api/ota/firmware.bin` | Download firmware |
+
+### Agentic Pipeline
+
+Dragon is an agent, not just a voice parrot. The LLM can call tools:
+- **Tool-calling:** LLM outputs `<tool>name</tool><args>{...}</args>` → parsed → executed → result injected → LLM continues
+- **Built-in tools:** `web_search` (DuckDuckGo), `remember` (store fact), `recall` (search memory), `datetime`
+- **Memory-augmented context:** Before every LLM call, relevant facts + document chunks injected into system prompt
+- **WebSocket events:** `tool_call` and `tool_result` events sent to connected clients during tool execution
+- **Max 3 tool calls per turn** to prevent infinite loops
+
+### Memory Service
+Facts are stored with Ollama embeddings (`nomic-embed-text`, 768-dim vectors) for semantic search. Store facts via the `remember` tool (LLM-initiated) or `POST /api/v1/memory` (REST API). All stored facts are auto-recalled before every LLM call — relevant facts are injected into the system prompt via cosine similarity search against the user's query embedding.
+
+### Document Service
+Text documents are chunked (512 tokens per chunk, 50 token overlap between chunks), embedded with `nomic-embed-text`, and stored in SQLite with `sqlite-vec` for vector search. Search via `POST /api/v1/documents/search` returns ranked chunks by cosine similarity. Documents provide long-term knowledge that augments the LLM's context alongside memory facts.
+
+### Tools
+4 built-in tools:
+- **web_search** — DuckDuckGo search (no API key required)
+- **remember** — store a fact in the memory service
+- **recall** — semantic search over stored facts
+- **datetime** — current date/time
+
+The LLM uses XML markers to invoke tools: `<tool>name</tool><args>{"key":"value"}</args>`. The tool parser is tolerant of small model quirks — it handles stray `>` after `</args>`, missing closing tags, and other formatting issues common with smaller local models (e.g. qwen3:1.7b).
+
+### Embedding Model
+All embeddings (memory facts, document chunks, search queries) use **Ollama nomic-embed-text** (768-dimensional vectors). Runs locally on Dragon via Ollama on port 11434. No cloud API required.
+
+### File Structure
 ```
-schema.sql            — Foundation database schema (6 tables)
+schema.sql            — Database schema (9 tables: 6 foundation + 3 memory)
 dragon_server.py      — CDP streaming + touch WebSocket (port 3501)
 dashboard.py          — Web dashboard (port 3500, aggregates 3501+3502)
 udp_streamer.py       — UDP JPEG streaming for low-latency display
 dragon_voice/         — Voice pipeline package (port 3502)
   __init__.py         — Package init
   __main__.py         — Entry point: python3 -m dragon_voice
-  server.py           — aiohttp WebSocket server + HTTP endpoints + config_update handler
+  server.py           — aiohttp WebSocket server + HTTP + CORS middleware + agentic wiring
   pipeline.py         — STT→LLM→TTS orchestration with VAD + dictation + post-processing
-  conversation.py     — Multi-turn ConversationEngine (DB-backed context)
+  conversation.py     — Multi-turn ConversationEngine with tool-calling + memory-augmented context
   sessions.py         — SessionManager (create/resume/pause/end lifecycle)
-  messages.py         — MessageStore (append-only, LLM context builder)
-  db.py               — Async SQLite layer (aiosqlite, WAL mode)
-  api.py              — REST API v1 routes (/api/v1/*)
-  config.py           — Config dataclasses with YAML + env var loading (incl. OpenRouter STT/TTS fields)
+  messages.py         — MessageStore (append-only, LLM context builder, includes tool messages)
+  db.py               — Async SQLite layer (aiosqlite, WAL mode, full CRUD)
+  memory.py           — MemoryService: facts + documents + RAG with Ollama embeddings
+  config.py           — Config dataclasses (incl. ToolsConfig, MemoryConfig)
   config.yaml         — Default configuration
+  api/                — Modular REST API package (50 endpoints)
+    __init__.py       — setup_all_routes() entry point
+    utils.py          — Shared helpers (json_error, pagination)
+    sessions.py       — Session CRUD + lifecycle routes
+    messages.py       — Message listing + SSE chat routes
+    devices.py        — Device CRUD routes
+    config_routes.py  — Config CRUD + delete routes
+    events.py         — Events listing with device_id filter
+    synthesize.py     — TTS synthesis + STT transcription + OTA routes
+    completions.py    — Direct LLM completion (stateless)
+    system.py         — System metrics + backend listing
+    tools.py          — Tool listing + execution routes
+    memory_routes.py  — Memory facts CRUD + search routes
+    documents.py      — Document ingest + listing + search routes
+  tools/              — Tool-calling infrastructure
+    __init__.py       — Exports ToolRegistry, Tool
+    base.py           — Tool abstract base class
+    registry.py       — ToolRegistry: register, parse XML markers, execute
+    web_search.py     — DuckDuckGo web search (no API key)
+    memory_tools.py   — remember + recall tools (interface to MemoryService)
+    datetime_tool.py  — Current date/time tool
   stt/                — STT backends (moonshine, whisper_cpp, vosk, openrouter)
-    base.py           — STTBackend abstract base class
-    moonshine_stt.py  — Moonshine local STT
-    whisper_cpp.py    — whisper.cpp local STT
-    vosk_stt.py       — Vosk local STT
-    openrouter_stt.py — Cloud STT via OpenRouter gpt-audio-mini (base64 WAV → text)
   tts/                — TTS backends (piper, kokoro, edge_tts, openrouter)
-    base.py           — TTSBackend abstract base class
-    piper_tts.py      — Piper local TTS (22050Hz)
-    kokoro_tts.py     — Kokoro local TTS
-    edge_tts_backend.py — Edge TTS (Microsoft cloud)
-    openrouter_tts.py — Cloud TTS via OpenRouter gpt-audio-mini (SSE pcm16 @ 24kHz)
   llm/                — LLM backends (ollama, openrouter, lmstudio, npu_genie)
-  notes/              — Notes module (wired into server.py, API routes registered)
-    db.py             — NotesDB (SQLite persistence)
-    service.py        — NotesService (business logic)
-    api.py            — Notes REST API routes (setup_routes → aiohttp app)
-tests/                — E2E tests (run on Dragon)
-  test_foundation.py  — Foundation module tests
-  test_multiturn_live.py — Multi-turn conversation tests
-  test_resume_live.py — Session resume tests
+  notes/              — Notes module (CRUD + search + audio ingestion)
+tests/                — E2E test suite
+  test_api_e2e.py     — 29 tests (14 single-step, 8 multi-step, 7 complex chained)
 docs/
   protocol.md         — WebSocket protocol spec (Tab5 ↔ Dragon)
   npu-setup.md        — Qualcomm NPU / QAIRT SDK setup guide
 LEARNINGS.md          — Institutional knowledge (MANDATORY reading)
+```
+
+## Testing
+
+### E2E API Tests (`tests/test_api_e2e.py`)
+- **29 total tests** — all passing
+  - **14 single-step tests:** Basic CRUD operations (create session, list devices, store fact, etc.)
+  - **8 multi-step tests:** Sequences requiring state (create session → send messages → retrieve history, etc.)
+  - **7 complex chained tests:** Full workflows across multiple subsystems (session + chat + memory + tools, etc.)
+
+### Device Tests (on-device against live Dragon)
+- **25/26 API endpoint tests** passing (full REST surface coverage)
+- **10/10 compound story tests** (multi-step workflows: session lifecycle, chat + memory, etc.)
+- **8/8 complex chain tests** (cross-subsystem: session → chat → tools → memory → documents)
+
+### Tool Calling Quality
+- **12 scenarios tested locally** against qwen3:1.7b (default) and qwen3:4b
+- Covers: web search, memory store/recall, datetime, multi-tool chains, edge cases
+
+Run tests against a live Dragon instance:
+```bash
+# From workstation (Dragon must be running on 192.168.1.89:3502)
+python3 tests/test_api_e2e.py
 ```

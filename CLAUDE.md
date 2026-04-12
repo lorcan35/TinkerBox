@@ -30,10 +30,10 @@ Before writing any fix, CHECK LEARNINGS.md first. Your bug might already be docu
 4. **Push and merge** — Push to origin, merge to main
 
 ## Dragon Access
-- **Host:** 192.168.1.89 (static IP on LAN)
+- **Host:** 192.168.1.91 (static IP on LAN)
 - **User:** radxa
 - **Password:** radxa
-- **SSH:** `sshpass -p 'radxa' ssh radxa@192.168.1.89`
+- **SSH:** `sshpass -p 'radxa' ssh radxa@192.168.1.91`
 - **OS:** Debian (Radxa Zero 3W, ARM64)
 - **Connection:** Ethernet only (WiFi disabled). Static IP on enp1s0.
 - **Services stripped:** gdm3, snapd, ollama, nanobot masked. Only tinkerclaw-voice, tinkerclaw-dashboard, tinkerclaw-ngrok run.
@@ -53,12 +53,12 @@ Before writing any fix, CHECK LEARNINGS.md first. Your bug might already be docu
 ## Deploy
 ```bash
 # Sync code to Dragon (includes new STT/TTS backends + notes module)
-sshpass -p 'radxa' scp -r dragon_voice/ radxa@192.168.1.89:/home/radxa/
-sshpass -p 'radxa' scp dashboard.py radxa@192.168.1.89:/home/radxa/
-sshpass -p 'radxa' scp schema.sql radxa@192.168.1.89:/home/radxa/
+sshpass -p 'radxa' scp -r dragon_voice/ radxa@192.168.1.91:/home/radxa/
+sshpass -p 'radxa' scp dashboard.py radxa@192.168.1.91:/home/radxa/
+sshpass -p 'radxa' scp schema.sql radxa@192.168.1.91:/home/radxa/
 
 # Restart services
-sshpass -p 'radxa' ssh radxa@192.168.1.89 "echo 'radxa' | sudo -S systemctl restart tinkerclaw-voice"
+sshpass -p 'radxa' ssh radxa@192.168.1.91 "echo 'radxa' | sudo -S systemctl restart tinkerclaw-voice"
 ```
 
 ## Three-Tier Voice Mode
@@ -319,6 +319,6 @@ LEARNINGS.md          — Institutional knowledge (MANDATORY reading)
 
 Run tests against a live Dragon instance:
 ```bash
-# From workstation (Dragon must be running on 192.168.1.89:3502)
+# From workstation (Dragon must be running on 192.168.1.91:3502)
 python3 tests/test_api_e2e.py
 ```

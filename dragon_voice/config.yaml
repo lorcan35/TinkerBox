@@ -27,6 +27,7 @@ tts:
   sample_rate: 22050
 
 llm:
+  local_backend: "ollama"  # Stores original local backend for cloud-to-local fallback
   backend: "ollama"  # ollama, openrouter, lmstudio, npu_genie
   # ollama
   ollama_url: "http://localhost:11434"

@@ -77,8 +77,8 @@ intelligence lives here.
 - **CDP Browser Streaming** -- Screencast a Chromium instance to the Tab5 via
   MJPEG, with touch events relayed back through Chrome DevTools Protocol.
 
-- **Web Dashboard** -- Aggregated status page with pipeline config, device list,
-  and connection monitoring (port 3500).
+- **Web Dashboard** -- 11-tab management UI with pipeline config, device list,
+  connection monitoring, OTA management, and E2E debug suite (port 3500).
 
 ---
 
@@ -124,6 +124,7 @@ Tab5 (ESP32-P4)                         Dragon Q6A (this repo)
 | mDNS | -- | `tinkerclaw-mdns` | Advertises `_tinkerclaw._tcp` for Tab5 auto-discovery |
 | Chromium | 9222 | (launched by `tinkerbox-dragon`) | CDP target browser for screen streaming |
 | Ollama | 11434 | `ollama` | Local LLM inference (CPU fallback, ~0.24 tok/s) |
+| SearXNG | 8888 | `searxng` | Self-hosted metasearch engine (web_search tool backend) |
 | NPU Genie | -- | (via voice pipeline) | Llama 3.2 1B on QCS6490 Hexagon DSP (~8 tok/s) |
 
 ### Voice Pipeline Flow
@@ -252,11 +253,11 @@ sudo ./install-services.sh
 
 ```bash
 # Sync code to the Dragon
-sshpass -p 'radxa' scp -r dragon_voice/ radxa@192.168.1.89:/home/radxa/
-sshpass -p 'radxa' scp dashboard.py dragon_server.py schema.sql radxa@192.168.1.89:/home/radxa/
+sshpass -p 'radxa' scp -r dragon_voice/ radxa@192.168.1.91:/home/radxa/
+sshpass -p 'radxa' scp dashboard.py dragon_server.py schema.sql radxa@192.168.1.91:/home/radxa/
 
 # Restart the voice service
-sshpass -p 'radxa' ssh radxa@192.168.1.89 \
+sshpass -p 'radxa' ssh radxa@192.168.1.91 \
   "echo 'radxa' | sudo -S systemctl restart tinkerbox-voice"
 ```
 
@@ -741,24 +742,24 @@ sudo systemctl enable --now tinkerclaw-telegram.service
 
 ```bash
 # Default credentials
-ssh radxa@192.168.1.89   # password: radxa
+ssh radxa@192.168.1.91   # password: radxa
 
 # Or with sshpass for scripting
-sshpass -p 'radxa' ssh radxa@192.168.1.89
+sshpass -p 'radxa' ssh radxa@192.168.1.91
 ```
 
 ### Deploy Script (from workstation)
 
 ```bash
 # Sync voice pipeline code
-sshpass -p 'radxa' scp -r dragon_voice/ radxa@192.168.1.89:/home/radxa/
+sshpass -p 'radxa' scp -r dragon_voice/ radxa@192.168.1.91:/home/radxa/
 
 # Sync top-level files
 sshpass -p 'radxa' scp dashboard.py dragon_server.py schema.sql \
-  radxa@192.168.1.89:/home/radxa/
+  radxa@192.168.1.91:/home/radxa/
 
 # Restart the voice service
-sshpass -p 'radxa' ssh radxa@192.168.1.89 \
+sshpass -p 'radxa' ssh radxa@192.168.1.91 \
   "echo 'radxa' | sudo -S systemctl restart tinkerbox-voice"
 ```
 

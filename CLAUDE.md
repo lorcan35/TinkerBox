@@ -46,9 +46,10 @@ Before writing any fix, CHECK LEARNINGS.md first. Your bug might already be docu
 | Voice | 3502 | tinkerclaw-voice | STT/LLM/TTS voice pipeline + Notes API routes |
 | mDNS | — | tinkerclaw-mdns | Advertises _tinkerclaw._tcp |
 | Chromium | 9222 | (launched by tinkerclaw) | CDP target browser |
+| SearXNG | 8888 | searxng | Self-hosted metasearch engine (web_search tool backend) |
 | Ollama | 11434 | ollama | Local LLM inference (CPU, slow) |
 | NPU Genie | — | (via voice pipeline) | Llama 3.2 1B on QCS6490 HTP (~8 tok/s) |
-| ngrok | 443 (ext) | tinkerclaw-ngrok | tinkerbox.ngrok.dev → voice server |
+| ngrok | 443 (ext) | tinkerclaw-ngrok | tinkerbox.ngrok.dev → 192.168.1.91:3500 (dashboard, not voice) |
 
 ## Deploy
 ```bash
@@ -60,6 +61,11 @@ sshpass -p 'radxa' scp schema.sql radxa@192.168.1.91:/home/radxa/
 # Restart services
 sshpass -p 'radxa' ssh radxa@192.168.1.91 "echo 'radxa' | sudo -S systemctl restart tinkerclaw-voice"
 ```
+
+### Post-Deploy Checklist
+- **Clear `__pycache__`:** After `scp` deploy, stale `.pyc` files can cause import errors. Run `find /home/radxa/dragon_voice -name '__pycache__' -exec rm -rf {} +` on Dragon before restarting.
+- **Restore secrets in `config.yaml`:** `scp` overwrites the Dragon's `config.yaml` with the workstation copy, which has empty API keys. After deploy, restore `openrouter_api_key` and `searxng_url` in `dragon_voice/config.yaml` on Dragon.
+- **ngrok on workstation** points to `192.168.1.91:3500` (dashboard), not the voice server. The dashboard serves `/dashboard` as a proxy route on the voice server for ngrok access.
 
 ## Three-Tier Voice Mode
 Tab5 sends `{"type":"config_update","voice_mode":0|1|2,"llm_model":"..."}`. Dragon hot-swaps backends:
@@ -76,6 +82,9 @@ Tab5 sends `{"type":"config_update","voice_mode":0|1|2,"llm_model":"..."}`. Drag
 - **Backward compat:** Old `cloud_mode` boolean still accepted (maps to voice_mode 0 or 2).
 - **Config fields:** `LLMConfig.local_backend` (remembers original for fallback), `LLMConfig.openrouter_model` (user-selectable).
 - **Valid backends:** STT: `moonshine`, `whisper_cpp`, `vosk`, `openrouter`. TTS: `piper`, `kokoro`, `edge_tts`, `openrouter`. LLM: `ollama`, `npu_genie`, `openrouter`, `lmstudio`.
+- **Mode-aware system prompts:** Each voice mode sets a different system prompt length — Local (concise, 128 tokens), Hybrid (medium, 256 tokens), Cloud (rich, 512 tokens). This keeps local model context tight while giving cloud models room for nuanced instructions.
+- **Session system_prompt updated on mode switch:** When voice_mode changes, the session's `system_prompt` is updated in the DB immediately so the conversation engine picks it up on the next turn.
+- **Pipeline init resets to local defaults on reconnect:** When a device reconnects, the pipeline is re-initialized with local defaults (voice_mode 0) regardless of the previous session's mode. The client must re-send `config_update` to restore cloud mode.
 
 ## OTA Firmware Endpoints
 Dragon serves firmware updates for Tab5 via two endpoints:
@@ -96,9 +105,11 @@ Dragon serves firmware updates for Tab5 via two endpoints:
 
 ## Dashboard (port 3500)
 
-The web dashboard is a 9-tab single-page application served by `dashboard.py` on port 3500. It aggregates data from the voice server (3502) and provides a management UI for all Dragon capabilities.
+The web dashboard is an 11-tab single-page application served by `dashboard.py` on port 3500. It aggregates data from the voice server (3502) and provides a management UI for all Dragon capabilities.
 
 **Proxy architecture:** The dashboard proxies ALL API calls through `/api/proxy/` to the voice server (port 3502). The dashboard itself is a thin frontend — all data lives in the voice server's SQLite database. This means the dashboard has no direct DB access and can be restarted independently without affecting active sessions.
+
+**ngrok access:** The voice server exposes `/dashboard` as a proxy route, so the dashboard is accessible via ngrok without a separate tunnel.
 
 | Tab | Description |
 |-----|-------------|
@@ -111,6 +122,8 @@ The web dashboard is a 9-tab single-page application served by `dashboard.py` on
 | **Memory** | Stored facts, semantic search with score bars (visual similarity score for each result), add/delete facts |
 | **Documents** | Ingested documents, chunk browser, semantic search across chunks |
 | **Tools** | Available tools listing, direct tool execution with dynamic parameter forms generated from each tool's JSON schema definition |
+| **OTA** | Firmware update management — upload .bin files, set version metadata, check update status for connected Tab5 devices |
+| **Debug** | 55-test E2E test suite runner + Tab5 remote control panel for sending commands and inspecting device state |
 
 ## Local LLM Benchmarks (Dragon Q6A, ARM64 CPU via Ollama)
 
@@ -138,10 +151,10 @@ The web dashboard is a 9-tab single-page application served by `dashboard.py` on
 | — | Cloud mode (OpenRouter STT+TTS) | DONE (openrouter_stt.py, openrouter_tts.py, config_update WS command) |
 | — | Dictation mode + post-processing | DONE (dictation in pipeline.py, auto-generated title/summary) |
 | #20 | Tab5 SD card storage | DONE (SDMMC 4-bit, FAT32, coexists with WiFi SDIO, notes.js + WAV recordings) |
-| #22 | Dashboard conversation viewer | DONE (9-tab SPA: Overview, Conversations, Chat, Devices, Notes, Logs, Memory, Documents, Tools) |
+| #22 | Dashboard conversation viewer | DONE (11-tab SPA: Overview, Conversations, Chat, Devices, Notes, Logs, Memory, Documents, Tools, OTA, Debug) |
 | — | Agentic pipeline (tool-calling) | DONE (ToolRegistry, XML parsing, web_search, remember, recall, datetime) |
 | — | Memory + RAG | DONE (MemoryService, facts CRUD, document ingestion, semantic search) |
-| — | E2E test suite | DONE (29 tests: 14 single-step, 8 multi-step, 7 complex chained) |
+| — | E2E test suite | DONE (55 tests via Debug tab + 29 API tests) |
 | — | Settings crash fix (WDT) | DONE (f_getfree cached at boot, esp_task_wdt_reset fed between settings sections) |
 | — | Tolerant tool parser | DONE (handles stray `>`, missing `</args>`, small model XML quirks) |
 | — | Response timeout (local mode) | DONE (disabled/5 min for local mode, 35s for cloud mode) |
@@ -226,7 +239,8 @@ Dragon is an API-first server. Every capability is accessible via REST so any ha
 
 Dragon is an agent, not just a voice parrot. The LLM can call tools:
 - **Tool-calling:** LLM outputs `<tool>name</tool><args>{...}</args>` → parsed → executed → result injected → LLM continues
-- **Built-in tools:** `web_search` (DuckDuckGo), `remember` (store fact), `recall` (search memory), `datetime`
+- **Built-in tools:** `web_search` (SearXNG, self-hosted on port 8888, returns up to 44 results), `remember` (store fact), `recall` (search memory), `datetime`, plus additional tools (10 total)
+- **Compact tool format:** For local models with limited context, tool definitions are sent in a compact XML format to minimize token usage
 - **Memory-augmented context:** Before every LLM call, relevant facts + document chunks injected into system prompt
 - **WebSocket events:** `tool_call` and `tool_result` events sent to connected clients during tool execution
 - **Max 3 tool calls per turn** to prevent infinite loops
@@ -238,13 +252,14 @@ Facts are stored with Ollama embeddings (`nomic-embed-text`, 768-dim vectors) fo
 Text documents are chunked (512 tokens per chunk, 50 token overlap between chunks), embedded with `nomic-embed-text`, and stored in SQLite with `sqlite-vec` for vector search. Search via `POST /api/v1/documents/search` returns ranked chunks by cosine similarity. Documents provide long-term knowledge that augments the LLM's context alongside memory facts.
 
 ### Tools
-4 built-in tools:
-- **web_search** — DuckDuckGo search (no API key required)
+10 built-in tools:
+- **web_search** — SearXNG metasearch (self-hosted on port 8888, up to 44 results, DDG fallback if SearXNG is down)
 - **remember** — store a fact in the memory service
 - **recall** — semantic search over stored facts
 - **datetime** — current date/time
+- Plus 6 additional tools registered via the ToolRegistry
 
-The LLM uses XML markers to invoke tools: `<tool>name</tool><args>{"key":"value"}</args>`. The tool parser is tolerant of small model quirks — it handles stray `>` after `</args>`, missing closing tags, and other formatting issues common with smaller local models (e.g. qwen3:1.7b).
+The LLM uses XML markers to invoke tools: `<tool>name</tool><args>{"key":"value"}</args>`. The tool parser is tolerant of small model quirks — it handles stray `>` after `</args>`, missing closing tags, and other formatting issues common with smaller local models (e.g. qwen3:1.7b). For local models, tool definitions use a compact format to minimize context token usage.
 
 ### Embedding Model
 All embeddings (memory facts, document chunks, search queries) use **Ollama nomic-embed-text** (768-dimensional vectors). Runs locally on Dragon via Ollama on port 11434. No cloud API required.
@@ -303,10 +318,15 @@ LEARNINGS.md          — Institutional knowledge (MANDATORY reading)
 ## Testing
 
 ### E2E API Tests (`tests/test_api_e2e.py`)
-- **29 total tests** — all passing
+- **29 API tests** — all passing
   - **14 single-step tests:** Basic CRUD operations (create session, list devices, store fact, etc.)
   - **8 multi-step tests:** Sequences requiring state (create session → send messages → retrieve history, etc.)
   - **7 complex chained tests:** Full workflows across multiple subsystems (session + chat + memory + tools, etc.)
+
+### Dashboard Debug Tab E2E Suite
+- **55 tests** — runnable from the Debug tab in the dashboard
+  - Covers all REST endpoints, WebSocket flows, tool execution, memory ops, and cross-subsystem chains
+  - Includes Tab5 remote control for sending commands and inspecting device state
 
 ### Device Tests (on-device against live Dragon)
 - **25/26 API endpoint tests** passing (full REST surface coverage)

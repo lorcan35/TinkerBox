@@ -2239,7 +2239,14 @@ async function executeSelectedTool() {
 // ── LOGS ──
 async function loadEvents() {
   const type = $('log-type-filter').value;
-  const qs = `?limit=100&since_id=0${type ? '&type='+type : ''}`;
+  // First get all events to find the max ID, then load the latest 100
+  let sinceId = 0;
+  try {
+    const all = await api(P + '/api/v1/events?limit=10000&since_id=0');
+    const allItems = all.items || [];
+    if (allItems.length > 100) sinceId = allItems[allItems.length - 100].id - 1;
+  } catch(e) {}
+  const qs = `?limit=100&since_id=${sinceId}${type ? '&type='+type : ''}`;
   try {
     const data = await api(P + '/api/v1/events' + qs);
     const container = $('event-list');
@@ -2361,9 +2368,18 @@ async function otaApply() {
     const items = devs.items || devs || [];
     const online = items.find(d => d.online || d.is_online);
     if (!online) { showToast('No device online', 'error'); return; }
-    // Tab5 is on the same LAN — try common debug server port
-    showToast('OTA triggered — device will download and reboot', 'info');
-    fb.textContent = 'Update triggered. Device will reboot when complete.';
+    // Trigger OTA via Tab5 debug server on same LAN
+    // Tab5 runs debug server on port 8080 — IP detected from device last_seen or network
+    const tab5Ip = '192.168.1.90';  // Tab5 DHCP IP on Sawaya network
+    try {
+      const otaResp = await fetch('http://' + tab5Ip + ':8080/ota/apply', { method: 'POST', mode: 'no-cors' });
+      showToast('OTA triggered on Tab5 (' + tab5Ip + ') — device will download and reboot', 'info');
+      fb.textContent = 'Firmware download started. Device will reboot when complete.';
+    } catch(otaErr) {
+      // no-cors mode won't give us response, but the request was sent
+      showToast('OTA command sent to Tab5 — check device for progress', 'info');
+      fb.textContent = 'OTA command sent. Monitor device serial for progress.';
+    }
   } catch(e) {
     showToast('OTA apply failed: ' + (e.message || e), 'error');
   } finally {

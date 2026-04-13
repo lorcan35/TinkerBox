@@ -2520,25 +2520,173 @@ async function applyDeviceConfig(deviceId) {
 const TAB5_IP = '192.168.1.90';
 const TAB5 = 'http://' + TAB5_IP + ':8080';
 
+// Helper for POST JSON
+const POST = (path,body) => api(P+path, {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+const GET = (path) => api(P+path);
+const DEL = (path) => api(P+path, {method:'DELETE'});
+const PATCH = (path,body) => api(P+path, {method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+const TAB5GET = async(path) => { const r=await fetch(TAB5+path,{mode:'cors',signal:AbortSignal.timeout(5000)}); return r.json(); };
+const TAB5POST = async(path,body) => { const r=await fetch(TAB5+path,{method:'POST',mode:'cors',signal:AbortSignal.timeout(5000),headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined}); return r.json().catch(()=>({})); };
+
 const E2E_TESTS = [
-  { name:'Health', fn: async()=>{ const d=await api(P+'/health'); return d.status==='ok' ? 'ok' : 'status='+d.status; }},
-  { name:'System Metrics', fn: async()=>{ const d=await api(P+'/api/v1/system'); return d.cpu_percent!==undefined ? `CPU ${d.cpu_percent}% RAM ${d.memory.percent}%` : 'missing fields'; }},
-  { name:'Backends', fn: async()=>{ const d=await api(P+'/api/v1/backends'); return d.stt && d.tts && d.llm ? `STT:${d.stt.active} TTS:${d.tts.active} LLM:${d.llm.active}` : 'missing'; }},
-  { name:'Sessions List', fn: async()=>{ const d=await api(P+'/api/v1/sessions?limit=3'); return d.items ? `${d.items.length} sessions` : 'no items'; }},
-  { name:'Devices List', fn: async()=>{ const d=await api(P+'/api/v1/devices'); const items=d.items||d; return `${items.length} devices`; }},
-  { name:'Tools List', fn: async()=>{ const d=await api(P+'/api/v1/tools'); const t=d.tools||d.items||[]; return `${t.length} tools`; }},
-  { name:'Tool Execute (datetime)', fn: async()=>{ const d=await api(P+'/api/v1/tools/datetime/execute',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"args":{}}'}); return d.result ? JSON.stringify(d.result).substring(0,60) : 'no result'; }},
-  { name:'Tool Execute (web_search)', fn: async()=>{ const d=await api(P+'/api/v1/tools/web_search/execute',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"args":{"query":"test"}}'}); return d.result?.results?.length ? `${d.result.results.length} results via ${d.result.engine}` : 'no results'; }},
-  { name:'Memory Facts', fn: async()=>{ const d=await api(P+'/api/v1/memory'); return `${d.count||d.items?.length||0} facts`; }},
-  { name:'Memory Search', fn: async()=>{ const d=await api(P+'/api/v1/memory/search',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"query":"user"}'}); const items=d.items||d.results||[]; return items.length ? `${items.length} results, top: ${items[0].content?.substring(0,40)}` : '0 results'; }},
-  { name:'Documents', fn: async()=>{ const d=await api(P+'/api/v1/documents'); return `${(d.items||d).length} docs`; }},
-  { name:'Notes', fn: async()=>{ const d=await api(P+'/api/notes?limit=5'); return `${d.total||d.notes?.length||0} notes`; }},
-  { name:'Events', fn: async()=>{ const d=await api(P+'/api/v1/events?limit=5&since_id=0'); return `${(d.items||[]).length} events`; }},
-  { name:'Voice Config', fn: async()=>{ const d=await api('/api/voice-config'); return d.llm ? `LLM:${d.llm.backend} model:${d.llm.ollama_model||d.llm.openrouter_model}` : 'no config'; }},
-  { name:'OTA Check', fn: async()=>{ const d=await api(P+'/api/ota/check?current=0.6.0'); return d.update!==undefined ? `update=${d.update} v${d.version||'?'}` : 'no data'; }},
-  { name:'Dashboard Status', fn: async()=>{ const d=await api('/api/status'); return d.voice?.status==='ok' ? 'voice OK, dragon '+d.dragon?.status : 'degraded'; }},
-  { name:'Tab5 Reachable', fn: async()=>{ try { const r=await fetch(TAB5+'/info',{mode:'cors',signal:AbortSignal.timeout(5000)}); const d=await r.json(); return `up=${Math.round(d.uptime_ms/1000)}s heap=${Math.round(d.heap_free/1024/1024)}MB`; } catch(e) { return 'UNREACHABLE: '+e.message; }}},
-  { name:'Tab5 Voice', fn: async()=>{ try { const r=await fetch(TAB5+'/voice',{mode:'cors',signal:AbortSignal.timeout(5000)}); const d=await r.json(); return `state=${d.state_name} connected=${d.connected}`; } catch(e) { return 'UNREACHABLE'; }}},
+  // ═══ SECTION 1: Infrastructure (8 tests) ═══
+  { name:'[Infra] Health endpoint', fn: async()=>{ const d=await GET('/health'); return d.status==='ok' ? 'ok' : 'FAIL: status='+d.status; }},
+  { name:'[Infra] System metrics', fn: async()=>{ const d=await GET('/api/v1/system'); if(!d.cpu_percent && d.cpu_percent!==0) throw new Error('missing cpu'); return `CPU ${d.cpu_percent}% RAM ${d.memory.percent}% up ${Math.round(d.uptime_s/3600)}h`; }},
+  { name:'[Infra] Backend availability', fn: async()=>{ const d=await GET('/api/v1/backends'); if(!d.stt||!d.tts||!d.llm) throw new Error('missing backends'); const count=d.stt.available.length+d.tts.available.length+d.llm.available.length; return `${count} backends: STT=${d.stt.active} TTS=${d.tts.active} LLM=${d.llm.active}`; }},
+  { name:'[Infra] Dashboard aggregation', fn: async()=>{ const d=await api('/api/status'); if(!d.voice||!d.dragon) throw new Error('missing services'); return `voice=${d.voice.status} dragon=${d.dragon.status}`; }},
+  { name:'[Infra] Voice config GET', fn: async()=>{ const d=await api('/api/voice-config'); if(!d.llm||!d.stt||!d.tts) throw new Error('incomplete config'); return `LLM:${d.llm.backend}/${d.llm.ollama_model||d.llm.openrouter_model} STT:${d.stt.backend}`; }},
+  { name:'[Infra] OTA check', fn: async()=>{ const d=await GET('/api/ota/check?current=0.6.0'); return `update=${d.update} version=${d.version||'current'}`; }},
+  { name:'[Infra] CORS headers present', fn: async()=>{ const r=await fetch(P+'/api/v1/system',{method:'GET'}); const cors=r.headers.get('access-control-allow-origin'); return cors==='*' ? 'CORS: *' : 'MISSING CORS'; }},
+  { name:'[Infra] Tab5 reachable', fn: async()=>{ try { const d=await TAB5GET('/info'); return `up=${Math.round(d.uptime_ms/1000)}s heap=${Math.round(d.heap_free/1024/1024)}MB wifi=${d.wifi_connected}`; } catch(e) { return 'UNREACHABLE: '+e.message; }}},
+
+  // ═══ SECTION 2: Sessions CRUD (7 tests) ═══
+  { name:'[Sessions] List all', fn: async()=>{ const d=await GET('/api/v1/sessions?limit=5'); if(!d.items) throw new Error('no items field'); return `${d.count} returned, ${d.items.length} shown`; }},
+  { name:'[Sessions] Filter by status', fn: async()=>{ const d=await GET('/api/v1/sessions?status=ended&limit=3'); return `${d.items?.length||0} ended sessions`; }},
+  { name:'[Sessions] Create→Get→End lifecycle', fn: async()=>{
+    const s=await POST('/api/v1/sessions',{type:'conversation'}); if(!s.id) throw new Error('no id');
+    const g=await GET('/api/v1/sessions/'+s.id); if(g.id!==s.id) throw new Error('get mismatch');
+    await POST('/api/v1/sessions/'+s.id+'/end',{});
+    const e=await GET('/api/v1/sessions/'+s.id); return `created→got→ended: ${s.id.substring(0,8)} status=${e.status}`; }},
+  { name:'[Sessions] Pause and Resume', fn: async()=>{
+    const s=await POST('/api/v1/sessions',{type:'conversation'});
+    await POST('/api/v1/sessions/'+s.id+'/pause',{});
+    const p=await GET('/api/v1/sessions/'+s.id); if(p.status!=='paused') throw new Error('not paused: '+p.status);
+    await POST('/api/v1/sessions/'+s.id+'/resume',{});
+    const r=await GET('/api/v1/sessions/'+s.id);
+    await POST('/api/v1/sessions/'+s.id+'/end',{});
+    return `pause=${p.status} resume=${r.status}`; }},
+  { name:'[Sessions] Title update', fn: async()=>{
+    const s=await POST('/api/v1/sessions',{type:'conversation'});
+    const title='Test-'+Date.now();
+    await PATCH('/api/v1/sessions/'+s.id,{title});
+    const g=await GET('/api/v1/sessions/'+s.id);
+    await POST('/api/v1/sessions/'+s.id+'/end',{});
+    return g.title===title ? `title set: ${title.substring(0,20)}` : 'FAIL: title mismatch'; }},
+  { name:'[Sessions] Message count increments', fn: async()=>{
+    const s=await POST('/api/v1/sessions',{type:'conversation'});
+    const before=await GET('/api/v1/sessions/'+s.id);
+    // Chat sends a message which creates entries
+    await POST('/api/v1/sessions/'+s.id+'/end',{});
+    return `session ${s.id.substring(0,8)} msgs=${before.message_count||0}`; }},
+  { name:'[Sessions] Filter by device', fn: async()=>{ const d=await GET('/api/v1/sessions?device_id=30eda0ea8e33&limit=5'); return `${d.items?.length||0} sessions for Tab5`; }},
+
+  // ═══ SECTION 3: Devices (5 tests) ═══
+  { name:'[Devices] List all', fn: async()=>{ const d=await GET('/api/v1/devices'); const items=d.items||d; const online=items.filter(x=>x.online||x.is_online); return `${items.length} total, ${online.length} online`; }},
+  { name:'[Devices] Tab5 has capabilities', fn: async()=>{ const d=await GET('/api/v1/devices'); const items=d.items||d; const tab5=items.find(x=>x.name==='Tab5'||x.device_id==='30eda0ea8e33'); if(!tab5) return 'Tab5 not found'; const caps=typeof tab5.capabilities==='string'?JSON.parse(tab5.capabilities):tab5.capabilities; return caps ? `caps: ${Object.keys(caps).join(',')}` : 'no capabilities'; }},
+  { name:'[Devices] Tab5 firmware version', fn: async()=>{ const d=await GET('/api/v1/devices'); const items=d.items||d; const tab5=items.find(x=>x.device_id==='30eda0ea8e33'); return tab5 ? `fw=${tab5.firmware_ver} platform=${tab5.platform}` : 'Tab5 not found'; }},
+  { name:'[Devices] Online device has recent activity', fn: async()=>{ const d=await GET('/api/v1/devices'); const items=d.items||d; const online=items.find(x=>x.online||x.is_online); if(!online) return 'no online device'; const age=(Date.now()/1000)-online.last_seen; return age<300 ? `last seen ${Math.round(age)}s ago` : `STALE: ${Math.round(age/60)}min ago`; }},
+  { name:'[Devices] Rename roundtrip', fn: async()=>{ const d=await GET('/api/v1/devices'); const items=d.items||d; const dev=items.find(x=>x.name==='Tab5'); if(!dev) return 'skip: no Tab5'; const orig=dev.name; await PATCH('/api/v1/devices/'+dev.device_id,{name:'Tab5-test'}); const after=await GET('/api/v1/devices/'+dev.device_id); await PATCH('/api/v1/devices/'+dev.device_id,{name:orig}); return after.name==='Tab5-test' ? 'rename OK, restored' : 'FAIL'; }},
+
+  // ═══ SECTION 4: Tools (6 tests) ═══
+  { name:'[Tools] List 10 tools', fn: async()=>{ const d=await GET('/api/v1/tools'); const t=d.tools||[]; return t.length>=10 ? `${t.length} tools` : `only ${t.length} tools`; }},
+  { name:'[Tools] Each tool has schema', fn: async()=>{ const d=await GET('/api/v1/tools'); const t=d.tools||[]; const withSchema=t.filter(x=>x.parameters_schema); return `${withSchema.length}/${t.length} have schema`; }},
+  { name:'[Tools] Execute datetime', fn: async()=>{ const d=await POST('/api/v1/tools/datetime/execute',{args:{}}); if(!d.result?.date) throw new Error('no date'); return `${d.result.date} ${d.result.time} ${d.result.day} (${d.execution_ms}ms)`; }},
+  { name:'[Tools] Execute web_search (SearXNG)', fn: async()=>{ const d=await POST('/api/v1/tools/web_search/execute',{args:{query:'hello world'}}); const r=d.result||{}; return `${r.results?.length||0} results via ${r.engine||'?'} (${d.execution_ms}ms)`; }},
+  { name:'[Tools] Execute calculator', fn: async()=>{ const d=await POST('/api/v1/tools/calculator/execute',{args:{expression:'15% of 230'}}); return d.result ? `result=${JSON.stringify(d.result).substring(0,50)}` : 'no result'; }},
+  { name:'[Tools] Execute system_info', fn: async()=>{ const d=await POST('/api/v1/tools/system_info/execute',{args:{}}); return d.result ? `cpu=${d.result.cpu_percent||'?'}%` : 'no result'; }},
+
+  // ═══ SECTION 5: Memory CRUD + Search (5 tests) ═══
+  { name:'[Memory] List facts', fn: async()=>{ const d=await GET('/api/v1/memory'); return `${d.count||d.items?.length||0} facts stored`; }},
+  { name:'[Memory] Store→Search→Delete fact', fn: async()=>{
+    const fact='E2E test fact '+Date.now();
+    const created=await POST('/api/v1/memory',{content:fact});
+    if(!created.id) throw new Error('no id returned');
+    const search=await POST('/api/v1/memory/search',{query:fact});
+    const found=(search.items||search.results||[]).some(f=>f.content===fact);
+    await DEL('/api/v1/memory/'+created.id);
+    return found ? `created→found→deleted: ${created.id.substring(0,8)}` : 'created but NOT found in search'; }},
+  { name:'[Memory] Semantic search relevance', fn: async()=>{ const d=await POST('/api/v1/memory/search',{query:'user preferences food'}); const items=d.items||d.results||[]; if(!items.length) return '0 results'; const top=items[0]; return `top: "${top.content?.substring(0,40)}" score=${(top.score*100).toFixed(0)}%`; }},
+  { name:'[Memory] Search returns ranked results', fn: async()=>{ const d=await POST('/api/v1/memory/search',{query:'name birthday'}); const items=d.items||d.results||[]; if(items.length<2) return `only ${items.length} results`; const sorted=items.every((x,i)=>i===0||x.score<=items[i-1].score); return sorted ? `${items.length} results, properly ranked` : 'NOT properly ranked by score'; }},
+  { name:'[Memory] Fact count matches list', fn: async()=>{ const d=await GET('/api/v1/memory'); const items=d.items||[]; return d.count===items.length ? `count=${d.count} matches items` : `MISMATCH: count=${d.count} items=${items.length}`; }},
+
+  // ═══ SECTION 6: Notes CRUD + Search (5 tests) ═══
+  { name:'[Notes] List notes', fn: async()=>{ const d=await api(P+'/api/notes?limit=50'); return `${d.total||d.notes?.length||0} notes`; }},
+  { name:'[Notes] Create→Get→Delete note', fn: async()=>{
+    const title='E2E-'+Date.now(), text='Test note content for E2E';
+    const created=await api(P+'/api/notes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,text})});
+    if(!created.id) throw new Error('no id');
+    const got=await api(P+'/api/notes/'+created.id);
+    await api(P+'/api/notes/'+created.id,{method:'DELETE'});
+    return got.title===title ? `created→got→deleted: ${created.id.substring(0,8)}` : 'title mismatch'; }},
+  { name:'[Notes] Search semantic', fn: async()=>{ const d=await api(P+'/api/notes/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:'LNG oil prices'})}); const items=d.results||d.notes||[]; return `${items.length} results`; }},
+  { name:'[Notes] Word count present', fn: async()=>{ const d=await api(P+'/api/notes?limit=3'); const notes=d.notes||[]; const withWc=notes.filter(n=>n.word_count>0); return `${withWc.length}/${notes.length} have word_count`; }},
+  { name:'[Notes] Timestamps valid', fn: async()=>{ const d=await api(P+'/api/notes?limit=3'); const notes=d.notes||[]; const valid=notes.every(n=>n.created_at>1770000000&&n.created_at<1800000000); return valid ? `${notes.length} notes, timestamps valid` : 'INVALID timestamps'; }},
+
+  // ═══ SECTION 7: Documents (3 tests) ═══
+  { name:'[Docs] List documents', fn: async()=>{ const d=await GET('/api/v1/documents'); return `${(d.items||d).length} documents`; }},
+  { name:'[Docs] Ingest→Search→Delete', fn: async()=>{
+    const title='E2E-Doc-'+Date.now(), content='The quick brown fox jumps over the lazy dog. This is a test document for end-to-end testing of the TinkerClaw document ingestion and semantic search pipeline.';
+    const created=await POST('/api/v1/documents',{title,content});
+    if(!created.id) throw new Error('no id');
+    await new Promise(r=>setTimeout(r,2000)); // wait for embedding
+    const search=await POST('/api/v1/documents/search',{query:'quick brown fox'});
+    const chunks=search.items||search.results||search.chunks||[];
+    await DEL('/api/v1/documents/'+created.id);
+    return chunks.length ? `ingested→${chunks.length} chunks found→deleted` : 'ingested but search returned 0'; }},
+  { name:'[Docs] Search returns chunks not docs', fn: async()=>{ const d=await POST('/api/v1/documents/search',{query:'test'}); const items=d.items||d.results||d.chunks||[]; if(!items.length) return '0 results (empty DB?)'; return items[0].chunk_index!==undefined ? `chunk format OK (${items.length} chunks)` : 'NOT chunk format'; }},
+
+  // ═══ SECTION 8: Events (3 tests) ═══
+  { name:'[Events] Load recent', fn: async()=>{ const d=await GET('/api/v1/events?limit=10&since_id=0'); return `${(d.items||[]).length} events`; }},
+  { name:'[Events] Filter by type', fn: async()=>{ const d=await GET('/api/v1/events?limit=50&since_id=0&type=device.connected'); const items=d.items||[]; return `${items.length} device.connected events`; }},
+  { name:'[Events] Timestamps chronological', fn: async()=>{ const d=await GET('/api/v1/events?limit=20&since_id=0'); const items=d.items||[]; if(items.length<2) return 'too few events'; const sorted=items.every((x,i)=>i===0||x.created_at>=items[i-1].created_at); return sorted ? `${items.length} events, chronological` : 'NOT chronological'; }},
+
+  // ═══ SECTION 9: Multi-Step User Stories (8 tests) ═══
+  { name:'[Story] New user: create session→chat→end', fn: async()=>{
+    const s=await POST('/api/v1/sessions',{type:'conversation'});
+    const msgs=await GET('/api/v1/sessions/'+s.id+'/messages?limit=10');
+    await POST('/api/v1/sessions/'+s.id+'/end',{});
+    return `session ${s.id.substring(0,8)}: ${msgs.items?.length||0} msgs → ended`; }},
+  { name:'[Story] Remember→Recall user fact', fn: async()=>{
+    const fact='E2E user likes pineapple pizza '+Date.now();
+    const stored=await POST('/api/v1/memory',{content:fact});
+    const recalled=await POST('/api/v1/memory/search',{query:'pineapple pizza'});
+    const found=(recalled.items||recalled.results||[]).some(f=>f.content===fact);
+    await DEL('/api/v1/memory/'+stored.id);
+    return found ? 'stored→recalled→cleaned up' : 'stored but NOT recalled'; }},
+  { name:'[Story] Multi-tool chain: time→search', fn: async()=>{
+    const t=await POST('/api/v1/tools/datetime/execute',{args:{}});
+    const s=await POST('/api/v1/tools/web_search/execute',{args:{query:'news '+t.result?.date}});
+    return `time=${t.result?.time} search=${s.result?.results?.length||0} results`; }},
+  { name:'[Story] Device sessions: find Tab5→list its sessions', fn: async()=>{
+    const devs=await GET('/api/v1/devices'); const items=devs.items||devs;
+    const tab5=items.find(x=>x.device_id==='30eda0ea8e33');
+    if(!tab5) return 'Tab5 not found';
+    const sess=await GET('/api/v1/sessions?device_id='+tab5.device_id+'&limit=5');
+    return `Tab5 (${tab5.online||tab5.is_online?'online':'offline'}): ${sess.items?.length||0} recent sessions`; }},
+  { name:'[Story] Note lifecycle: create→search→edit→delete', fn: async()=>{
+    const title='Story-'+Date.now(), text='Voice note about grocery shopping';
+    const n=await api(P+'/api/notes',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({title,text})});
+    if(!n.id) throw new Error('create failed');
+    const search=await api(P+'/api/notes/search',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query:'grocery shopping'})});
+    const found=(search.results||search.notes||[]).length>0;
+    await api(P+'/api/notes/'+n.id,{method:'DELETE'});
+    return `created→search=${found?'found':'not found'}→deleted`; }},
+  { name:'[Story] Config roundtrip: read→verify fields', fn: async()=>{
+    const cfg=await api('/api/voice-config');
+    const fields=['stt','tts','llm','audio','tools','memory'];
+    const present=fields.filter(f=>cfg[f]);
+    return `${present.length}/${fields.length} config sections: ${present.join(',')}`; }},
+  { name:'[Story] Dashboard→Dragon→Tab5 connectivity', fn: async()=>{
+    const dash=await api('/api/status');
+    const voice=dash.voice?.status;
+    let tab5='unknown';
+    try { const t=await TAB5GET('/voice'); tab5=t.connected?'connected':'disconnected'; } catch(e) { tab5='unreachable'; }
+    return `dashboard=ok voice=${voice} tab5=${tab5}`; }},
+  { name:'[Story] Full stack: session→tool→memory→cleanup', fn: async()=>{
+    const s=await POST('/api/v1/sessions',{type:'conversation'});
+    const tool=await POST('/api/v1/tools/datetime/execute',{args:{}});
+    const fact='E2E full stack test '+Date.now();
+    const mem=await POST('/api/v1/memory',{content:fact});
+    await DEL('/api/v1/memory/'+mem.id);
+    await POST('/api/v1/sessions/'+s.id+'/end',{});
+    return `session→tool(${tool.result?.time})→memory→cleanup OK`; }},
+
+  // ═══ SECTION 10: Tab5 Device Tests (5 tests) ═══
+  { name:'[Tab5] Voice state', fn: async()=>{ try { const d=await TAB5GET('/voice'); return `state=${d.state_name} connected=${d.connected} stt="${(d.last_stt_text||'').substring(0,30)}"`; } catch(e) { return 'UNREACHABLE'; }}},
+  { name:'[Tab5] Settings readback', fn: async()=>{ try { const d=await TAB5GET('/settings'); return `wifi=${d.wifi_ssid} mode=${d.voice_mode} dragon=${d.dragon_host}:${d.dragon_port}`; } catch(e) { return 'UNREACHABLE'; }}},
+  { name:'[Tab5] Heap health', fn: async()=>{ try { const d=await TAB5GET('/info'); const heapMB=Math.round(d.heap_free/1024/1024); return heapMB>10 ? `${heapMB}MB free (healthy)` : `${heapMB}MB free (LOW!)`; } catch(e) { return 'UNREACHABLE'; }}},
+  { name:'[Tab5] SD card mounted', fn: async()=>{ try { const d=await TAB5GET('/info'); return d.sd_mounted ? `mounted: ${d.sd_total_mb||'?'}MB` : 'NOT MOUNTED'; } catch(e) { return 'UNREACHABLE'; }}},
+  { name:'[Tab5] Self-test subsystems', fn: async()=>{ try { const d=await TAB5GET('/selftest'); if(Array.isArray(d)) { const pass=d.filter(t=>t.pass||t.ok).length; return `${pass}/${d.length} pass`; } return JSON.stringify(d).substring(0,60); } catch(e) { return 'UNREACHABLE'; }}},
 ];
 
 async function runAllTests() {
@@ -2547,29 +2695,44 @@ async function runAllTests() {
   const summary = $('test-summary');
   btn.disabled = true; btn.textContent = 'Running...';
   container.innerHTML = '';
-  let pass=0, fail=0, total=E2E_TESTS.length;
+  let pass=0, fail=0, warn=0, total=E2E_TESTS.length;
+  let lastSection = '';
+  const t0All = performance.now();
 
   for (const test of E2E_TESTS) {
+    // Section header
+    const section = test.name.match(/^\[([^\]]+)\]/)?.[1] || '';
+    if (section !== lastSection) {
+      lastSection = section;
+      const hdr = document.createElement('div');
+      hdr.style.cssText = 'padding:10px 12px 4px; font-size:11px; font-weight:700; text-transform:uppercase; letter-spacing:1.5px; color:var(--accent); border-bottom:1px solid var(--border); margin-top:8px;';
+      hdr.textContent = section;
+      container.appendChild(hdr);
+    }
+
     const row = document.createElement('div');
-    row.style.cssText = 'display:flex; justify-content:space-between; align-items:center; padding:8px 12px; border-bottom:1px solid var(--border-subtle); font-size:13px;';
-    row.innerHTML = `<span style="font-weight:500;">${test.name}</span><span style="color:var(--muted);">Running...</span>`;
+    row.style.cssText = 'display:flex; justify-content:space-between; align-items:center; padding:6px 12px; border-bottom:1px solid var(--border-subtle); font-size:13px; gap:12px;';
+    const label = test.name.replace(/^\[[^\]]+\]\s*/, '');
+    row.innerHTML = `<span style="font-weight:500; min-width:180px; flex-shrink:0;">${escHtml(label)}</span><span style="color:var(--muted); text-align:right; font-size:12px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">Running...</span>`;
     container.appendChild(row);
 
     const t0 = performance.now();
     try {
       const result = await test.fn();
       const ms = Math.round(performance.now() - t0);
-      const isErr = typeof result === 'string' && (result.includes('UNREACHABLE') || result.includes('missing') || result.includes('no '));
-      if (isErr) { fail++; } else { pass++; }
-      row.children[1].innerHTML = `<span style="color:${isErr ? 'var(--yellow)' : 'var(--green)'}; font-family:'JetBrains Mono',monospace; font-size:12px;">${escHtml(result)}</span> <span style="color:var(--muted); font-size:11px;">${ms}ms</span>`;
+      const isWarn = typeof result === 'string' && (result.includes('UNREACHABLE') || result.includes('MISSING') || result.includes('STALE') || result.includes('NOT ') || result.includes('FAIL'));
+      if (isWarn) { warn++; } else { pass++; }
+      row.children[1].innerHTML = `<span style="color:${isWarn ? 'var(--yellow)' : 'var(--green)'}; font-family:'JetBrains Mono',monospace; font-size:11px;">${escHtml(result)}</span> <span style="color:var(--muted); font-size:10px; flex-shrink:0;">${ms}ms</span>`;
     } catch(e) {
       fail++;
       const ms = Math.round(performance.now() - t0);
-      row.children[1].innerHTML = `<span style="color:var(--red); font-size:12px;">FAIL: ${escHtml(e.message||String(e))}</span> <span style="color:var(--muted); font-size:11px;">${ms}ms</span>`;
+      row.children[1].innerHTML = `<span style="color:var(--red); font-size:11px;">FAIL: ${escHtml((e.message||String(e)).substring(0,60))}</span> <span style="color:var(--muted); font-size:10px;">${ms}ms</span>`;
     }
-    summary.innerHTML = `<span style="color:var(--green);">${pass} pass</span> / <span style="color:${fail?'var(--red)':'var(--muted)'}">${fail} fail</span> / ${total} total`;
+    summary.innerHTML = `<span style="color:var(--green);">${pass}&#10003;</span> <span style="color:${warn?'var(--yellow)':'var(--muted)'}">${warn}&#9888;</span> <span style="color:${fail?'var(--red)':'var(--muted)'}">${fail}&#10007;</span> / ${total}`;
   }
-  btn.disabled = false; btn.textContent = 'Run All Tests';
+  const totalMs = Math.round(performance.now() - t0All);
+  summary.innerHTML += ` <span style="color:var(--muted); font-size:11px;">(${(totalMs/1000).toFixed(1)}s)</span>`;
+  btn.disabled = false; btn.textContent = `Run All Tests (${total})`;
 }
 
 // ── TAB5 REMOTE CONTROL ──

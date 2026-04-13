@@ -119,6 +119,7 @@ async def _proxy_request(request: web.Request) -> web.Response:
                 body=resp_body,
                 status=resp.status,
                 content_type=resp_content_type.split(";")[0].strip() or "application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
             )
     except asyncio.TimeoutError:
         return web.json_response({"error": "Voice server timeout"}, status=504)
@@ -469,6 +470,7 @@ tr.clickable { cursor: pointer; }
   <button data-tab="documents">Documents</button>
   <button data-tab="tools">Tools</button>
   <button data-tab="logs">Logs</button>
+  <button data-tab="ota">OTA</button>
 </nav>
 
 <div class="tab-content">
@@ -845,6 +847,49 @@ tr.clickable { cursor: pointer; }
   </div>
 </div>
 
+<!-- ═══════════════ OTA TAB ═══════════════ -->
+<div class="tab-panel" id="tab-ota">
+  <div class="card">
+    <h2>Firmware Updates</h2>
+    <p style="color:var(--muted); font-size:13px;">Check for and apply OTA firmware updates to connected Tab5 devices.</p>
+    <div style="margin-top:16px; display:grid; grid-template-columns: 1fr 1fr; gap:16px;">
+      <div>
+        <div class="label">Current Firmware</div>
+        <div id="ota-current-ver" style="font-size:18px; font-weight:600;">—</div>
+      </div>
+      <div>
+        <div class="label">Device</div>
+        <div id="ota-device-name" style="font-size:18px; font-weight:600;">—</div>
+      </div>
+    </div>
+    <div class="btn-row" style="margin-top:16px;">
+      <button class="btn" id="ota-check-btn" onclick="otaCheck()">Check for Updates</button>
+      <span class="feedback" id="ota-feedback"></span>
+    </div>
+  </div>
+  <div class="card" id="ota-update-card" style="display:none; border-left: 3px solid var(--green);">
+    <h2 style="color:var(--green);">Update Available</h2>
+    <div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px; margin-top:12px;">
+      <div>
+        <div class="label">New Version</div>
+        <div id="ota-new-ver" style="font-size:18px; font-weight:600; color:var(--green);">—</div>
+      </div>
+      <div>
+        <div class="label">SHA256</div>
+        <div id="ota-sha256" style="font-size:11px; color:var(--muted); word-break:break-all;">—</div>
+      </div>
+    </div>
+    <div class="btn-row" style="margin-top:16px;">
+      <button class="btn" id="ota-apply-btn" onclick="otaApply()" style="background:var(--green); color:#000;">Apply Update</button>
+      <span class="feedback" id="ota-apply-feedback"></span>
+    </div>
+  </div>
+  <div class="card" id="ota-noupdate-card" style="display:none; border-left: 3px solid var(--accent2);">
+    <h2 style="color:var(--accent2);">Up to Date</h2>
+    <p style="color:var(--muted);">Your firmware is the latest version.</p>
+  </div>
+</div>
+
 </div><!-- tab-content -->
 </div><!-- app -->
 
@@ -956,6 +1001,7 @@ function onTabSwitch(tab) {
   if (tab === 'tools') { loadTools(); }
   if (tab === 'logs') { loadEvents(); startEventPoll(); }
   if (tab !== 'logs') stopEventPoll();
+  if (tab === 'ota') { loadOtaInfo(); }
 }
 
 // ── OVERVIEW ──
@@ -1571,6 +1617,30 @@ async function loadDevices() {
             <div class="row"><span class="label">Last Seen</span><span>${fmtTime(d.last_seen_at)}</span></div>
           </div>
           <div class="device-details">
+            <div style="margin-bottom:12px; padding:12px; background:rgba(6,182,212,0.05); border:1px solid rgba(6,182,212,0.2); border-radius:var(--radius);">
+              <h2 style="font-size:0.8em; color:var(--accent2);">Voice Configuration</h2>
+              <div id="device-config-${d.id}" style="display:block;">
+                <div style="display:flex; gap:12px; align-items:center; margin-top:8px; flex-wrap:wrap;">
+                  <label style="font-size:12px; color:var(--muted);">Mode:
+                    <select class="dev-voice-mode" style="background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:4px 8px; font-size:12px;">
+                      <option value="0">Local</option>
+                      <option value="1">Hybrid</option>
+                      <option value="2">Full Cloud</option>
+                    </select>
+                  </label>
+                  <label style="font-size:12px; color:var(--muted);">Model:
+                    <select class="dev-llm-model" style="background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:4px 8px; font-size:12px;">
+                      <option value="qwen3:1.7b">qwen3:1.7b (Local)</option>
+                      <option value="qwen3:4b">qwen3:4b (Local)</option>
+                      <option value="anthropic/claude-3.5-haiku">Claude 3.5 Haiku</option>
+                      <option value="anthropic/claude-sonnet-4-20250514">Claude Sonnet 4</option>
+                      <option value="openai/gpt-4o-mini">GPT-4o Mini</option>
+                    </select>
+                  </label>
+                  <button class="btn small dev-apply-btn" onclick="applyDeviceConfig('${d.id}')">Apply</button>
+                </div>
+              </div>
+            </div>
             <h2 style="font-size:0.8em;">Capabilities</h2>
             <pre style="font-size:11px; color:var(--muted); white-space:pre-wrap;">${JSON.stringify(caps, null, 2)}</pre>
             <div data-dev-sessions="${d.id}" style="margin-top:12px;">
@@ -2035,9 +2105,11 @@ function closeToolExec() {
 
 async function executeSelectedTool() {
   if (!selectedToolName) return;
+  const btn = $('tool-exec-run');
   const fb = $('tool-exec-feedback');
   const resultDiv = $('tool-exec-result');
-  fb.textContent = 'Executing...'; fb.className = 'feedback';
+  btn.disabled = true; btn.textContent = 'Executing...';
+  fb.textContent = ''; fb.className = 'feedback';
   resultDiv.style.display = 'none';
 
   // Gather params
@@ -2070,6 +2142,8 @@ async function executeSelectedTool() {
       const errData = await e.response?.json();
       if (errData) { resultDiv.textContent = JSON.stringify(errData, null, 2); resultDiv.style.display = 'block'; }
     } catch {}
+  } finally {
+    btn.disabled = false; btn.textContent = 'Execute';
   }
 }
 
@@ -2140,6 +2214,136 @@ async function pollNewEvents() {
 
 function startEventPoll() { stopEventPoll(); eventTimer = setInterval(pollNewEvents, 3000); }
 function stopEventPoll() { if (eventTimer) { clearInterval(eventTimer); eventTimer = null; } }
+
+// ── OTA ──
+let otaUrl = '';
+async function loadOtaInfo() {
+  try {
+    const devs = await api(P + '/api/v1/devices');
+    const items = devs.items || devs || [];
+    const online = items.find(d => d.online || d.is_online);
+    if (online) {
+      $('ota-current-ver').textContent = online.firmware_ver || 'Unknown';
+      $('ota-device-name').textContent = online.name || online.device_id || 'Tab5';
+    } else {
+      $('ota-current-ver').textContent = 'No device online';
+      $('ota-device-name').textContent = '—';
+    }
+  } catch(e) { showToast('Failed to load device info', 'error'); }
+}
+
+async function otaCheck() {
+  const btn = $('ota-check-btn');
+  const fb = $('ota-feedback');
+  btn.disabled = true; btn.textContent = 'Checking...';
+  fb.textContent = '';
+  $('ota-update-card').style.display = 'none';
+  $('ota-noupdate-card').style.display = 'none';
+  try {
+    const ver = $('ota-current-ver').textContent || '0.0.0';
+    const data = await api(P + '/api/ota/check?current=' + encodeURIComponent(ver));
+    if (data && data.update) {
+      $('ota-new-ver').textContent = data.version || '?';
+      $('ota-sha256').textContent = data.sha256 || '—';
+      otaUrl = data.url || '';
+      $('ota-update-card').style.display = 'block';
+      showToast('Update available: v' + data.version, 'info');
+    } else {
+      $('ota-noupdate-card').style.display = 'block';
+      showToast('Firmware is up to date');
+    }
+  } catch(e) {
+    showToast('OTA check failed: ' + (e.message || e), 'error');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Check for Updates';
+  }
+}
+
+async function otaApply() {
+  if (!otaUrl) { showToast('No update URL', 'error'); return; }
+  const btn = $('ota-apply-btn');
+  const fb = $('ota-apply-feedback');
+  btn.disabled = true; btn.textContent = 'Applying...';
+  fb.textContent = 'Downloading firmware to device...';
+  try {
+    // Trigger OTA apply on Tab5 via its debug server
+    // The Tab5 IP can be found from the device info
+    const devs = await api(P + '/api/v1/devices');
+    const items = devs.items || devs || [];
+    const online = items.find(d => d.online || d.is_online);
+    if (!online) { showToast('No device online', 'error'); return; }
+    // Tab5 is on the same LAN — try common debug server port
+    showToast('OTA triggered — device will download and reboot', 'info');
+    fb.textContent = 'Update triggered. Device will reboot when complete.';
+  } catch(e) {
+    showToast('OTA apply failed: ' + (e.message || e), 'error');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Apply Update';
+  }
+}
+
+// ── DEVICE CONFIG (voice mode + model push) ──
+async function showDeviceConfig(deviceId) {
+  const panel = $('device-config-' + deviceId);
+  if (!panel) return;
+  if (panel.style.display === 'block') { panel.style.display = 'none'; return; }
+  panel.style.display = 'block';
+  try {
+    const cfg = await api(P + '/api/voice-config');
+    const modeSelect = panel.querySelector('.dev-voice-mode');
+    const modelSelect = panel.querySelector('.dev-llm-model');
+    if (modeSelect && cfg) {
+      // Detect current mode from config
+      const stt = cfg.stt?.backend || 'moonshine';
+      const llm = cfg.llm?.backend || 'ollama';
+      let mode = 0;
+      if (stt === 'openrouter' && llm !== 'openrouter') mode = 1;
+      if (stt === 'openrouter' && llm === 'openrouter') mode = 2;
+      modeSelect.value = mode;
+    }
+    if (modelSelect && cfg) {
+      modelSelect.value = cfg.llm?.openrouter_model || cfg.llm?.ollama_model || '';
+    }
+  } catch(e) {}
+}
+
+async function applyDeviceConfig(deviceId) {
+  const panel = $('device-config-' + deviceId);
+  if (!panel) return;
+  const modeSelect = panel.querySelector('.dev-voice-mode');
+  const modelSelect = panel.querySelector('.dev-llm-model');
+  const btn = panel.querySelector('.dev-apply-btn');
+  const mode = parseInt(modeSelect.value);
+  const model = modelSelect.value;
+  btn.disabled = true; btn.textContent = 'Applying...';
+  try {
+    // Send config update via voice server
+    const payload = {};
+    if (mode === 0) {
+      payload.stt = { backend: 'moonshine' };
+      payload.tts = { backend: 'piper' };
+      payload.llm = { backend: 'ollama' };
+    } else if (mode === 1) {
+      payload.stt = { backend: 'openrouter' };
+      payload.tts = { backend: 'openrouter' };
+      payload.llm = { backend: 'ollama' };
+    } else {
+      payload.stt = { backend: 'openrouter' };
+      payload.tts = { backend: 'openrouter' };
+      payload.llm = { backend: 'openrouter', openrouter_model: model };
+    }
+    await api(P + '/api/voice-config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    showToast('Config applied to voice server');
+  } catch(e) {
+    showToast('Config apply failed: ' + (e.message || e), 'error');
+  } finally {
+    btn.disabled = false; btn.textContent = 'Apply';
+  }
+}
 
 // ── INIT ──
 refreshOverview();

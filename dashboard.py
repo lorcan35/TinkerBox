@@ -438,11 +438,32 @@ tr.clickable { cursor: pointer; }
 /* ── Responsive ── */
 @keyframes fadeIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: translateY(0); } }
 
+/* Loading overlay for cards/sections */
+.is-loading { position:relative; pointer-events:none; opacity:0.6; }
+.is-loading::after { content:''; position:absolute; top:50%; left:50%; width:24px; height:24px; margin:-12px 0 0 -12px; border:3px solid var(--border); border-top-color:var(--accent); border-radius:50%; animation:spin 0.6s linear infinite; z-index:10; }
+@keyframes spin { to { transform:rotate(360deg); } }
+
 @media (max-width: 768px) {
   .split { flex-direction: column; height: auto; }
   .split-left { width: 100%; max-height: 300px; }
   .form-grid { grid-template-columns: 1fr; }
   .card-grid { grid-template-columns: 1fr; }
+  #tabs { overflow-x: auto; white-space: nowrap; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+  #tabs::-webkit-scrollbar { display: none; }
+  #tabs button { flex-shrink: 0; font-size: 13px; padding: 10px 14px; }
+  header h1 { font-size: 16px; }
+  .tab-content { padding: 12px; }
+  .card { padding: 14px; }
+  h2 { font-size: 15px; }
+}
+
+@media (max-width: 480px) {
+  header { padding: 8px 12px; }
+  #tabs button { font-size: 12px; padding: 8px 10px; }
+  .card { padding: 10px; margin-bottom: 10px; }
+  .btn { font-size: 12px; padding: 6px 12px; }
+  .device-details { font-size: 12px; }
+  .tool-result { font-size: 11px; }
 }
 </style>
 </head>
@@ -919,6 +940,11 @@ function fmtTime(ts) {
   if (!ts) return '--';
   const d = new Date(typeof ts === 'number' ? ts * 1000 : ts);
   return d.toLocaleString('en-GB', { month:'short', day:'numeric', hour:'2-digit', minute:'2-digit', second:'2-digit' });
+}
+
+function setLoading(id, on) {
+  const el = $(id);
+  if (el) { if (on) el.classList.add('is-loading'); else el.classList.remove('is-loading'); }
 }
 
 function fmtTimeShort(ts) {
@@ -1585,6 +1611,7 @@ function toggleStatelessMode() {
 
 // ── DEVICES ──
 async function loadDevices() {
+  setLoading('devices-grid', true);
   try {
     const data = await api(P + '/api/v1/devices');
     const grid = $('devices-grid');
@@ -1653,6 +1680,8 @@ async function loadDevices() {
     }).join('');
   } catch(e) {
     $('devices-grid').innerHTML = '<div class="empty">Failed to load devices</div>';
+  } finally {
+    setLoading('devices-grid', false);
   }
 }
 
@@ -1723,6 +1752,7 @@ async function deleteDevice(devId, devName) {
 
 // ── NOTES ──
 async function loadNotes() {
+  setLoading('notes-grid', true);
   try {
     const data = await api(P + '/api/notes?limit=50');
     const grid = $('notes-grid');
@@ -1751,6 +1781,7 @@ async function loadNotes() {
     `).join('');
   } catch(e) {
     $('notes-grid').innerHTML = '<div class="empty">Failed to load notes</div>';
+  } finally { setLoading('notes-grid', false);
   }
 }
 
@@ -1810,6 +1841,7 @@ $('notes-search').addEventListener('keydown', e => { if (e.key === 'Enter') sear
 
 // ── MEMORY ──
 async function loadMemory() {
+  setLoading('memory-grid', true);
   try {
     const data = await api(P + '/api/v1/memory');
     const grid = $('memory-grid');
@@ -1834,6 +1866,7 @@ async function loadMemory() {
     `).join('');
   } catch(e) {
     $('memory-grid').innerHTML = '<div class="empty">Failed to load memory facts</div>';
+  } finally { setLoading('memory-grid', false);
   }
 }
 
@@ -1909,6 +1942,7 @@ $('memory-search').addEventListener('keydown', e => { if (e.key === 'Enter') sea
 
 // ── DOCUMENTS ──
 async function loadDocuments() {
+  setLoading('docs-grid', true);
   try {
     const data = await api(P + '/api/v1/documents');
     const grid = $('docs-grid');
@@ -1934,6 +1968,7 @@ async function loadDocuments() {
     `).join('');
   } catch(e) {
     $('docs-grid').innerHTML = '<div class="empty">Failed to load documents</div>';
+  } finally { setLoading('docs-grid', false);
   }
 }
 
@@ -2021,6 +2056,7 @@ let selectedToolName = null;
 let selectedToolSchema = null;
 
 async function loadTools() {
+  setLoading('tools-grid', true);
   try {
     const data = await api(P + '/api/v1/tools');
     const grid = $('tools-grid');
@@ -2048,6 +2084,7 @@ async function loadTools() {
     for (const t of tools) window._toolsCache[t.name] = t;
   } catch(e) {
     $('tools-grid').innerHTML = '<div class="empty">Failed to load tools</div>';
+  } finally { setLoading('tools-grid', false);
   }
 }
 

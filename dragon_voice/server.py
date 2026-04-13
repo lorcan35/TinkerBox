@@ -75,6 +75,9 @@ class VoiceServer:
         app.router.add_get("/api/config", self._handle_get_config)
         app.router.add_post("/api/config", self._handle_set_config)
 
+        # Dashboard proxy — forwards /dashboard* to localhost:3500
+        app.router.add_route("*", "/dashboard{path:.*}", self._proxy_dashboard)
+
         # WebSocket route
         app.router.add_get("/ws/voice", self._handle_ws_voice)
 
@@ -99,6 +102,48 @@ class VoiceServer:
         response = await handler(request)
         response.headers["Access-Control-Allow-Origin"] = "*"
         return response
+
+    # --------------------------------------------------------------- Dashboard proxy
+
+    async def _proxy_dashboard(self, request: web.Request) -> web.StreamResponse:
+        """Reverse proxy /dashboard* to the dashboard on localhost:3500.
+
+        Rewrites paths: /dashboard/foo → /foo on port 3500.
+        This lets the dashboard be accessed via the ngrok tunnel at
+        https://tinkerbox.ngrok.dev/dashboard without a separate tunnel.
+        """
+        path = request.match_info.get("path", "")
+        target = f"http://127.0.0.1:3500{path}"
+        if request.query_string:
+            target += f"?{request.query_string}"
+
+        try:
+            import aiohttp as _aiohttp
+            timeout = _aiohttp.ClientTimeout(total=30)
+            async with _aiohttp.ClientSession(timeout=timeout) as session:
+                method = request.method
+                headers = {k: v for k, v in request.headers.items()
+                           if k.lower() not in ("host", "content-length", "transfer-encoding")}
+                body = await request.read() if request.can_read_body else None
+
+                async with session.request(method, target, headers=headers, data=body) as resp:
+                    response = web.StreamResponse(
+                        status=resp.status,
+                        headers={k: v for k, v in resp.headers.items()
+                                 if k.lower() not in ("transfer-encoding", "content-encoding")},
+                    )
+                    response.content_type = resp.content_type
+                    await response.prepare(request)
+                    async for chunk in resp.content.iter_any():
+                        await response.write(chunk)
+                    await response.write_eof()
+                    return response
+        except Exception as e:
+            logger.warning("Dashboard proxy failed: %s", e)
+            return web.json_response(
+                {"error": f"Dashboard not reachable: {e}"},
+                status=502,
+            )
 
     # --------------------------------------------------------------- Lifecycle
 

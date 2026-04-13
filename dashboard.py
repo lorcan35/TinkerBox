@@ -544,6 +544,7 @@ tr.clickable { cursor: pointer; }
   <button data-tab="tools">Tools</button>
   <button data-tab="logs">Logs</button>
   <button data-tab="ota">OTA</button>
+  <button data-tab="debug">Debug</button>
 </nav>
 
 <div class="tab-content">
@@ -963,6 +964,70 @@ tr.clickable { cursor: pointer; }
   </div>
 </div>
 
+<!-- ═══════════════ DEBUG TAB ═══════════════ -->
+<div class="tab-panel" id="tab-debug">
+  <div class="card-grid" style="grid-template-columns: 1fr 1fr;">
+
+    <!-- E2E Test Runner -->
+    <div class="card" style="grid-row: span 2;">
+      <h2>E2E Test Suite</h2>
+      <p style="color:var(--muted); font-size:12px; margin-bottom:12px;">Automated test runner for all API endpoints. Tests data integrity, response codes, and schema.</p>
+      <div class="btn-row" style="margin-top:0; margin-bottom:16px;">
+        <button class="btn" id="run-tests-btn" onclick="runAllTests()">Run All Tests</button>
+        <span id="test-summary" style="font-size:13px; font-weight:600;"></span>
+      </div>
+      <div id="test-results" style="max-height:calc(100vh - 320px); overflow-y:auto;">
+        <div class="empty" style="padding:20px;">Click "Run All Tests" to start</div>
+      </div>
+    </div>
+
+    <!-- Tab5 Remote Control -->
+    <div class="card">
+      <h2>Tab5 Remote Control</h2>
+      <p style="color:var(--muted); font-size:12px; margin-bottom:12px;">Control and monitor the Tab5 device remotely via its debug server.</p>
+      <div style="display:grid; grid-template-columns: 1fr 1fr; gap:8px; margin-bottom:12px;">
+        <button class="btn small" onclick="tab5Screenshot()">Screenshot</button>
+        <button class="btn small secondary" onclick="tab5Info()">Device Info</button>
+        <button class="btn small secondary" onclick="tab5Selftest()">Self-Test</button>
+        <button class="btn small secondary" onclick="tab5VoiceReconnect()">Voice Reconnect</button>
+      </div>
+      <div style="display:flex; gap:8px; margin-bottom:12px;">
+        <select id="tab5-nav-screen" style="flex:1;">
+          <option value="home">Home</option>
+          <option value="notes">Notes</option>
+          <option value="chat">Chat</option>
+          <option value="settings">Settings</option>
+          <option value="camera">Camera</option>
+          <option value="files">Files</option>
+        </select>
+        <button class="btn small" onclick="tab5Navigate()">Navigate</button>
+      </div>
+      <div style="display:flex; gap:8px; margin-bottom:12px;">
+        <input id="tab5-touch-x" type="number" placeholder="X" style="width:70px;">
+        <input id="tab5-touch-y" type="number" placeholder="Y" style="width:70px;">
+        <button class="btn small" onclick="tab5Touch()">Tap</button>
+      </div>
+      <div style="display:flex; gap:8px; margin-bottom:12px;">
+        <input id="tab5-chat-text" type="text" placeholder="Send text to Tinker..." style="flex:1;">
+        <button class="btn small" onclick="tab5Chat()">Send</button>
+      </div>
+      <div style="display:flex; gap:8px; margin-bottom:12px;">
+        <button class="btn small" onclick="tab5Mode(0)">Local</button>
+        <button class="btn small" onclick="tab5Mode(1)">Hybrid</button>
+        <button class="btn small" onclick="tab5Mode(2)">Cloud</button>
+      </div>
+    </div>
+
+    <!-- Screenshot / Info Display -->
+    <div class="card">
+      <h2>Tab5 Output</h2>
+      <div id="tab5-output" style="min-height:200px;">
+        <div class="empty" style="padding:20px;">Use controls above to interact with Tab5</div>
+      </div>
+    </div>
+  </div>
+</div>
+
 </div><!-- tab-content -->
 </div><!-- app -->
 
@@ -1080,6 +1145,7 @@ function onTabSwitch(tab) {
   if (tab === 'logs') { loadEvents(); startEventPoll(); }
   if (tab !== 'logs') stopEventPoll();
   if (tab === 'ota') { loadOtaInfo(); }
+  if (tab === 'debug') { /* no auto-load */ }
 }
 
 // ── OVERVIEW ──
@@ -2448,6 +2514,144 @@ async function applyDeviceConfig(deviceId) {
   } finally {
     btn.disabled = false; btn.textContent = 'Apply';
   }
+}
+
+// ── E2E TEST SUITE ──
+const TAB5_IP = '192.168.1.90';
+const TAB5 = 'http://' + TAB5_IP + ':8080';
+
+const E2E_TESTS = [
+  { name:'Health', fn: async()=>{ const d=await api(P+'/health'); return d.status==='ok' ? 'ok' : 'status='+d.status; }},
+  { name:'System Metrics', fn: async()=>{ const d=await api(P+'/api/v1/system'); return d.cpu_percent!==undefined ? `CPU ${d.cpu_percent}% RAM ${d.memory.percent}%` : 'missing fields'; }},
+  { name:'Backends', fn: async()=>{ const d=await api(P+'/api/v1/backends'); return d.stt && d.tts && d.llm ? `STT:${d.stt.active} TTS:${d.tts.active} LLM:${d.llm.active}` : 'missing'; }},
+  { name:'Sessions List', fn: async()=>{ const d=await api(P+'/api/v1/sessions?limit=3'); return d.items ? `${d.items.length} sessions` : 'no items'; }},
+  { name:'Devices List', fn: async()=>{ const d=await api(P+'/api/v1/devices'); const items=d.items||d; return `${items.length} devices`; }},
+  { name:'Tools List', fn: async()=>{ const d=await api(P+'/api/v1/tools'); const t=d.tools||d.items||[]; return `${t.length} tools`; }},
+  { name:'Tool Execute (datetime)', fn: async()=>{ const d=await api(P+'/api/v1/tools/datetime/execute',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"args":{}}'}); return d.result ? JSON.stringify(d.result).substring(0,60) : 'no result'; }},
+  { name:'Tool Execute (web_search)', fn: async()=>{ const d=await api(P+'/api/v1/tools/web_search/execute',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"args":{"query":"test"}}'}); return d.result?.results?.length ? `${d.result.results.length} results via ${d.result.engine}` : 'no results'; }},
+  { name:'Memory Facts', fn: async()=>{ const d=await api(P+'/api/v1/memory'); return `${d.count||d.items?.length||0} facts`; }},
+  { name:'Memory Search', fn: async()=>{ const d=await api(P+'/api/v1/memory/search',{method:'POST',headers:{'Content-Type':'application/json'},body:'{"query":"user"}'}); const items=d.items||d.results||[]; return items.length ? `${items.length} results, top: ${items[0].content?.substring(0,40)}` : '0 results'; }},
+  { name:'Documents', fn: async()=>{ const d=await api(P+'/api/v1/documents'); return `${(d.items||d).length} docs`; }},
+  { name:'Notes', fn: async()=>{ const d=await api(P+'/api/notes?limit=5'); return `${d.total||d.notes?.length||0} notes`; }},
+  { name:'Events', fn: async()=>{ const d=await api(P+'/api/v1/events?limit=5&since_id=0'); return `${(d.items||[]).length} events`; }},
+  { name:'Voice Config', fn: async()=>{ const d=await api('/api/voice-config'); return d.llm ? `LLM:${d.llm.backend} model:${d.llm.ollama_model||d.llm.openrouter_model}` : 'no config'; }},
+  { name:'OTA Check', fn: async()=>{ const d=await api(P+'/api/ota/check?current=0.6.0'); return d.update!==undefined ? `update=${d.update} v${d.version||'?'}` : 'no data'; }},
+  { name:'Dashboard Status', fn: async()=>{ const d=await api('/api/status'); return d.voice?.status==='ok' ? 'voice OK, dragon '+d.dragon?.status : 'degraded'; }},
+  { name:'Tab5 Reachable', fn: async()=>{ try { const r=await fetch(TAB5+'/info',{mode:'cors',signal:AbortSignal.timeout(5000)}); const d=await r.json(); return `up=${Math.round(d.uptime_ms/1000)}s heap=${Math.round(d.heap_free/1024/1024)}MB`; } catch(e) { return 'UNREACHABLE: '+e.message; }}},
+  { name:'Tab5 Voice', fn: async()=>{ try { const r=await fetch(TAB5+'/voice',{mode:'cors',signal:AbortSignal.timeout(5000)}); const d=await r.json(); return `state=${d.state_name} connected=${d.connected}`; } catch(e) { return 'UNREACHABLE'; }}},
+];
+
+async function runAllTests() {
+  const btn = $('run-tests-btn');
+  const container = $('test-results');
+  const summary = $('test-summary');
+  btn.disabled = true; btn.textContent = 'Running...';
+  container.innerHTML = '';
+  let pass=0, fail=0, total=E2E_TESTS.length;
+
+  for (const test of E2E_TESTS) {
+    const row = document.createElement('div');
+    row.style.cssText = 'display:flex; justify-content:space-between; align-items:center; padding:8px 12px; border-bottom:1px solid var(--border-subtle); font-size:13px;';
+    row.innerHTML = `<span style="font-weight:500;">${test.name}</span><span style="color:var(--muted);">Running...</span>`;
+    container.appendChild(row);
+
+    const t0 = performance.now();
+    try {
+      const result = await test.fn();
+      const ms = Math.round(performance.now() - t0);
+      const isErr = typeof result === 'string' && (result.includes('UNREACHABLE') || result.includes('missing') || result.includes('no '));
+      if (isErr) { fail++; } else { pass++; }
+      row.children[1].innerHTML = `<span style="color:${isErr ? 'var(--yellow)' : 'var(--green)'}; font-family:'JetBrains Mono',monospace; font-size:12px;">${escHtml(result)}</span> <span style="color:var(--muted); font-size:11px;">${ms}ms</span>`;
+    } catch(e) {
+      fail++;
+      const ms = Math.round(performance.now() - t0);
+      row.children[1].innerHTML = `<span style="color:var(--red); font-size:12px;">FAIL: ${escHtml(e.message||String(e))}</span> <span style="color:var(--muted); font-size:11px;">${ms}ms</span>`;
+    }
+    summary.innerHTML = `<span style="color:var(--green);">${pass} pass</span> / <span style="color:${fail?'var(--red)':'var(--muted)'}">${fail} fail</span> / ${total} total`;
+  }
+  btn.disabled = false; btn.textContent = 'Run All Tests';
+}
+
+// ── TAB5 REMOTE CONTROL ──
+async function tab5Fetch(path, opts={}) {
+  try {
+    const r = await fetch(TAB5 + path, { ...opts, mode:'cors', signal:AbortSignal.timeout(8000) });
+    return await r.json();
+  } catch(e) {
+    showToast('Tab5 unreachable: ' + e.message, 'error');
+    return null;
+  }
+}
+
+async function tab5Screenshot() {
+  const out = $('tab5-output');
+  out.innerHTML = '<div style="text-align:center; padding:20px; color:var(--muted);">Loading screenshot...</div>';
+  try {
+    const url = TAB5 + '/screenshot?' + Date.now();
+    out.innerHTML = `<img src="${url}" style="max-width:100%; border-radius:var(--radius-sm); border:1px solid var(--border);" onerror="this.parentNode.innerHTML='<div class=\\'empty\\'>Failed to load screenshot</div>'" alt="Tab5 Screenshot">`;
+  } catch(e) { out.innerHTML = '<div class="empty">Failed: '+escHtml(e.message)+'</div>'; }
+}
+
+async function tab5Info() {
+  const d = await tab5Fetch('/info');
+  if (!d) return;
+  $('tab5-output').innerHTML = `<pre style="font-size:12px; font-family:'JetBrains Mono',monospace; white-space:pre-wrap; color:var(--text);">${JSON.stringify(d, null, 2)}</pre>`;
+}
+
+async function tab5Selftest() {
+  const d = await tab5Fetch('/selftest');
+  if (!d) return;
+  const items = d.tests || d;
+  let html = '<div style="font-size:13px;">';
+  if (Array.isArray(items)) {
+    for (const t of items) {
+      const ok = t.pass || t.status === 'pass' || t.ok;
+      html += `<div style="padding:6px 0; border-bottom:1px solid var(--border-subtle); display:flex; justify-content:space-between;"><span>${escHtml(t.name||t.test||'?')}</span><span class="badge ${ok?'ok':'err'}">${ok?'PASS':'FAIL'}</span></div>`;
+    }
+  } else {
+    html += `<pre style="font-size:12px; white-space:pre-wrap;">${JSON.stringify(d,null,2)}</pre>`;
+  }
+  html += '</div>';
+  $('tab5-output').innerHTML = html;
+}
+
+async function tab5VoiceReconnect() {
+  const d = await tab5Fetch('/voice/reconnect', { method:'POST' });
+  showToast(d ? 'Voice reconnect triggered' : 'Failed', d ? 'info' : 'error');
+}
+
+async function tab5Navigate() {
+  const screen = $('tab5-nav-screen').value;
+  const d = await tab5Fetch('/navigate?screen=' + screen, { method:'POST' });
+  if (d) showToast('Navigated to ' + screen);
+  setTimeout(tab5Screenshot, 2000);
+}
+
+async function tab5Touch() {
+  const x = $('tab5-touch-x').value, y = $('tab5-touch-y').value;
+  if (!x || !y) { showToast('Enter X and Y coordinates', 'error'); return; }
+  try {
+    await fetch(TAB5 + '/touch', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({x:parseInt(x),y:parseInt(y),action:'tap'}), mode:'cors', signal:AbortSignal.timeout(5000) });
+    showToast(`Tapped (${x}, ${y})`);
+    setTimeout(tab5Screenshot, 1500);
+  } catch(e) { showToast('Tap failed: '+e.message, 'error'); }
+}
+
+async function tab5Chat() {
+  const text = $('tab5-chat-text').value;
+  if (!text) return;
+  try {
+    await fetch(TAB5 + '/chat', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text}), mode:'cors', signal:AbortSignal.timeout(5000) });
+    showToast('Sent: ' + text.substring(0,40));
+    $('tab5-chat-text').value = '';
+  } catch(e) { showToast('Send failed: '+e.message, 'error'); }
+}
+
+async function tab5Mode(m) {
+  try {
+    await fetch(TAB5 + '/mode?m=' + m, { method:'POST', mode:'cors', signal:AbortSignal.timeout(5000) });
+    showToast('Mode set to ' + ['Local','Hybrid','Cloud'][m]);
+  } catch(e) { showToast('Mode switch failed: '+e.message, 'error'); }
 }
 
 // ── INIT ──

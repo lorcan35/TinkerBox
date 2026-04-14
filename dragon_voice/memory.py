@@ -84,7 +84,7 @@ class MemoryService:
             async with aiohttp.ClientSession() as session:
                 async with session.post(
                     f"{self._ollama_url}/api/embed",
-                    json={"model": self._embed_model, "input": text},
+                    json={"model": self._embed_model, "input": text, "keep_alive": "30s"},
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:
                     if resp.status != 200:

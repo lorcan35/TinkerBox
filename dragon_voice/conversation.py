@@ -12,7 +12,12 @@ import time
 from typing import AsyncIterator, Optional
 
 from dragon_voice.db import Database
-from dragon_voice.messages import MessageStore
+from dragon_voice.messages import (
+    MessageStore,
+    CONTEXT_BUDGET_LOCAL,
+    CONTEXT_BUDGET_CLOUD,
+    trim_context_to_budget,
+)
 from dragon_voice.llm import create_llm, LLMBackend
 from dragon_voice.config import LLMConfig
 
@@ -146,7 +151,11 @@ class ConversationEngine:
         return response_text
 
     async def _build_context(self, session_id: str, user_text: str) -> list[dict]:
-        """Build LLM context with optional memory augmentation and tool descriptions."""
+        """Build LLM context with optional memory augmentation and tool descriptions.
+
+        After assembling the full context (system prompt + memory + tools + history),
+        trims oldest messages to fit within the model's token budget (US-P16).
+        """
         # Mode-aware context depth: local models have tiny context windows,
         # cloud models (128K+) can use much more conversation history.
         is_local = self._llm_config.backend in ("ollama", "npu_genie", "lmstudio")
@@ -171,6 +180,12 @@ class ConversationEngine:
             tool_desc = self._tool_registry.format_for_llm(compact=is_local)
             if tool_desc and context and context[0]["role"] == "system":
                 context[0]["content"] += "\n" + tool_desc
+
+        # ── Token budget enforcement (US-P16) ─────────────────────────
+        # After all augmentation (memory, tools), trim oldest messages so
+        # total context fits within the model's context window.
+        budget = CONTEXT_BUDGET_LOCAL if is_local else CONTEXT_BUDGET_CLOUD
+        context = trim_context_to_budget(context, budget)
 
         return context
 

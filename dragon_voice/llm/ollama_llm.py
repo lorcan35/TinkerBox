@@ -20,6 +20,13 @@ logger = logging.getLogger(__name__)
 class OllamaBackend(LLMBackend):
     """LLM backend using Ollama's REST API."""
 
+    # How long Ollama keeps a model loaded in memory after the last request.
+    # Default is 5 minutes which causes OOM on 8GB Dragon when switching
+    # between models (e.g. qwen3:1.7b -> qwen3:4b).  30s is enough to
+    # avoid reload latency for back-to-back requests while freeing RAM
+    # fast enough to prevent dual-model memory spikes.
+    KEEP_ALIVE = "30s"
+
     def __init__(self, config: LLMConfig) -> None:
         self._config = config
         self._base_url = config.ollama_url.rstrip("/")
@@ -99,6 +106,7 @@ class OllamaBackend(LLMBackend):
                 "model": self._model,
                 "messages": messages,
                 "stream": True,
+                "keep_alive": self.KEEP_ALIVE,
                 "options": {
                     "num_predict": self._config.max_tokens,
                     "temperature": self._config.temperature,
@@ -167,6 +175,7 @@ class OllamaBackend(LLMBackend):
             "model": self._model,
             "messages": messages,
             "stream": True,
+            "keep_alive": self.KEEP_ALIVE,
             "options": {
                 "num_predict": self._config.max_tokens,
                 "temperature": self._config.temperature,

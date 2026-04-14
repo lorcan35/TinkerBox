@@ -1,0 +1,19 @@
+# /etc/default/ollama — Ollama environment configuration for Dragon Q6A
+#
+# Deploy to Dragon:
+#   scp systemd/ollama.defaults radxa@192.168.1.91:/tmp/ollama
+#   ssh radxa@192.168.1.91 "sudo cp /tmp/ollama /etc/default/ollama && sudo systemctl restart ollama"
+#
+# The ollama systemd service reads this file via EnvironmentFile=/etc/default/ollama
+
+# Reduce keep-alive from 5 minutes (default) to 30 seconds.
+# On the 8GB Dragon, switching between models (e.g. qwen3:1.7b at 1.4GB
+# and qwen3:4b at 2.5GB) with 5-minute keep-alive causes both models to
+# be resident simultaneously, spiking to ~4GB and triggering the OOM killer.
+# 30 seconds is long enough to avoid reload latency for rapid back-to-back
+# requests, but short enough that the old model is unloaded before the new
+# one needs to load during a voice mode switch.
+OLLAMA_KEEP_ALIVE=30s
+
+# Bind to localhost only (Dragon services are proxied via ngrok/voice server)
+OLLAMA_HOST=0.0.0.0:11434

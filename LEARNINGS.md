@@ -403,6 +403,20 @@ sequentially across the whole file (don't restart per section).
 - **Fix:** Added `tinkerclaw` LLM backend (`dragon_voice/llm/tinkerclaw_llm.py`). In voice mode 3, Dragon handles STT and TTS only — the transcript is forwarded to TinkerClaw gateway on port 18789 (localhost). ConversationEngine, ToolRegistry, and MemoryService are all bypassed; TinkerClaw owns the intelligence layer. Session continuity is maintained by passing Dragon's `session_id` as the `user` field. If the gateway is unreachable, Dragon sends an error to Tab5 and auto-reverts to Local mode (same fallback pattern as cloud modes).
 - **Prevention:** The TinkerClaw backend must be treated as an optional dependency — Dragon must start and function normally without it. Never import tinkerclaw_llm.py at module level. The gateway health check (connect to 18789) must have a short timeout (2s) to avoid blocking the voice pipeline. Config lives in `~/.tinkerclaw/tinkerclaw.json`, separate from Dragon's `config.yaml`.
 
+### 52. Context window overflow from message-count-only limiting (US-P16)
+- **Date:** 2026-04-14
+- **Symptom:** OpenRouter returns HTTP 400 "context_length_exceeded" during cloud LLM calls, crashing the session. Happens when conversation history has many long messages (e.g. 29 messages * 800 tokens = 23,200 tokens + system prompt + memory + tools).
+- **Root Cause:** `_build_context()` in `conversation.py` limited history by message COUNT (10 local, 30 cloud), not by TOKEN count. A few long messages could easily exceed the model's context window.
+- **Fix:** Added `estimate_tokens()` (len/4 approximation) and `trim_context_to_budget()` in `messages.py`. After building the full context (system prompt + memory + tools + history), `_build_context()` trims oldest non-system messages to stay within budget: 25,600 tokens for local (80% of 32K), 100,000 tokens for cloud (80% of 128K). Also added context_length_exceeded retry in `openrouter_llm.py` — if the API still rejects the context, it halves the budget and retries once.
+- **Prevention:** Always enforce token budgets, not just message counts. The system prompt + memory + tools can grow unpredictably (tool results, long memory facts), so trimming must happen AFTER all augmentation is applied.
+
+### 53. Piper TTS zombie process accumulation (US-P24)
+- **Date:** 2026-04-14
+- **Symptom:** After hours of use with frequent interruptions (user speaks mid-response), dozens of Piper subprocesses accumulate as zombies, consuming PIDs and memory.
+- **Root Cause:** `_synthesize_binary()` used `subprocess.run()` which blocks in a thread pool. When the pipeline is cancelled (user interrupts), the asyncio task is cancelled but the thread running subprocess.run() continues until the process exits naturally. If the process hangs or takes long, it becomes orphaned.
+- **Fix:** Replaced `subprocess.run()` with `subprocess.Popen()` + explicit tracking in `self._active_procs`. Each process is tracked and removed after completion. Added `kill_active_procs()` method called from both `pipeline.cancel()` (flush/interrupt) and `shutdown()`. Note: Piper supports a persistent server mode (`piper --server`) that avoids fork overhead entirely — documented as future optimization.
+- **Prevention:** Never use untracked `subprocess.run()` in async code where cancellation can occur. Always use Popen with explicit lifecycle management. Track all child processes and kill them on cancel/shutdown.
+
 ### 51. ngrok WS stability — protocol pings not counted as activity
 - **Date:** 2026-04-14
 - **Symptom:** Dragon's aiohttp heartbeat killed WS connections through ngrok. Protocol pings were not counted as activity.

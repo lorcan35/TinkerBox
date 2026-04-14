@@ -10,6 +10,7 @@ import logging
 import numpy as np
 
 from dragon_voice.config import STTConfig
+from dragon_voice.pipeline import inference_executor
 from dragon_voice.stt.base import STTBackend
 
 logger = logging.getLogger(__name__)
@@ -83,7 +84,7 @@ class MoonshineBackend(STTBackend):
             )
 
         try:
-            self._transcriber = await loop.run_in_executor(None, _load)
+            self._transcriber = await loop.run_in_executor(inference_executor, _load)
             logger.info("Moonshine model loaded successfully")
         except Exception:
             logger.exception("Failed to load Moonshine model")
@@ -112,7 +113,7 @@ class MoonshineBackend(STTBackend):
                 return " ".join(texts)
 
             try:
-                text = await loop.run_in_executor(None, _transcribe)
+                text = await loop.run_in_executor(inference_executor, _transcribe)
             except Exception:
                 logger.exception("Moonshine transcription failed")
                 return ""

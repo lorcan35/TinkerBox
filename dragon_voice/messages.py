@@ -14,6 +14,46 @@ from dragon_voice.db import Database
 
 logger = logging.getLogger(__name__)
 
+
+# ── Token budget helpers ──────────────────────────────────────────────
+
+# Context window sizes (tokens) by backend class
+CONTEXT_BUDGET_LOCAL = 25_600    # 80% of 32K (qwen3:1.7b, ollama, npu_genie)
+CONTEXT_BUDGET_CLOUD = 100_000  # ~80% of 128K (Claude/GPT via OpenRouter)
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token count estimate: ~4 chars per token."""
+    return max(1, len(text) // 4)
+
+
+def trim_context_to_budget(messages: list[dict], budget_tokens: int) -> list[dict]:
+    """Remove oldest non-system messages until context fits within budget.
+
+    Preserves:
+      - messages[0] (system prompt) — always kept
+      - messages[-1] (latest user message) — always kept
+
+    Removes from index 1 onward (oldest conversation messages first).
+    """
+    if len(messages) <= 2:
+        return messages
+
+    total = sum(estimate_tokens(m.get("content", "")) for m in messages)
+    removed_count = 0
+    while total > budget_tokens and len(messages) > 2:
+        removed = messages.pop(1)  # remove oldest after system prompt
+        total -= estimate_tokens(removed.get("content", ""))
+        removed_count += 1
+
+    if removed_count > 0:
+        logger.info(
+            "Trimmed %d messages to fit token budget (%d tokens, budget=%d)",
+            removed_count, total, budget_tokens,
+        )
+
+    return messages
+
 # Default system prompt if none is set on the session
 DEFAULT_SYSTEM_PROMPT = (
     "You are Tinker, a helpful AI assistant on a portable device called "

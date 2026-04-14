@@ -6,6 +6,7 @@ its own conversation state, skills, and memory — Dragon just pipes
 audio and streams text.
 """
 
+import asyncio
 import json
 import logging
 from typing import AsyncIterator, Optional
@@ -35,7 +36,7 @@ class TinkerClawBackend(LLMBackend):
             headers["Authorization"] = f"Bearer {self._token}"
 
         self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=300, sock_read=120),
+            timeout=aiohttp.ClientTimeout(total=120, sock_read=30),
             headers=headers,
         )
 
@@ -94,7 +95,7 @@ class TinkerClawBackend(LLMBackend):
                 if resp.status != 200:
                     error_text = await resp.text()
                     logger.error("TinkerClaw error %d: %s", resp.status, error_text[:300])
-                    yield f"[TinkerClaw error: {resp.status}]"
+                    yield "Sorry, my agent system returned an error. Please try again."
                     return
 
                 async for line in resp.content:
@@ -120,9 +121,12 @@ class TinkerClawBackend(LLMBackend):
                     if token:
                         yield token
 
+        except asyncio.TimeoutError:
+            logger.error("TinkerClaw SSE stream timed out (sock_read=30s)")
+            yield "Response timed out, please try again."
         except aiohttp.ClientError as e:
             logger.error("TinkerClaw request failed: %s", e)
-            yield "[TinkerClaw unavailable — check if gateway is running]"
+            yield "I'm having trouble connecting to my agent system. Please try again in a moment."
 
     async def shutdown(self) -> None:
         if self._session and not self._session.closed:

@@ -9,11 +9,13 @@ refs #16, #17, #18
 """
 
 import asyncio
+import copy
 import json
 import logging
 import time
 from typing import Optional
 
+import aiohttp
 from aiohttp import web, WSMsgType
 
 from dragon_voice.api import setup_all_routes
@@ -88,19 +90,36 @@ class VoiceServer:
         self._app = app
         return app
 
+    # Allowed CORS origins — only these can make cross-origin API calls
+    _CORS_ALLOWED_ORIGINS = {
+        "http://localhost:3500",
+        "http://127.0.0.1:3500",
+        "http://192.168.1.90:8080",
+        "https://tinkerclaw-dashboard.ngrok.dev",
+    }
+
     @web.middleware
     async def _cors_middleware(self, request: web.Request, handler):
-        """Add CORS headers to all API responses."""
-        # Handle preflight OPTIONS requests
+        """Add CORS headers to API responses for allowed origins only (SEC12)."""
+        origin = request.headers.get("Origin", "")
+
+        # If origin is not in the allowlist, skip CORS headers entirely
+        # (browser will block the cross-origin request)
+        if origin not in self._CORS_ALLOWED_ORIGINS:
+            if request.method == "OPTIONS":
+                return web.Response(status=403)
+            return await handler(request)
+
+        # Handle preflight OPTIONS requests for allowed origins
         if request.method == "OPTIONS":
             return web.Response(headers={
-                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Origin": origin,
                 "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
                 "Access-Control-Allow-Headers": "Content-Type, X-Sample-Rate, Accept",
                 "Access-Control-Max-Age": "3600",
             })
         response = await handler(request)
-        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Origin"] = origin
         return response
 
     # --------------------------------------------------------------- Dashboard proxy
@@ -463,25 +482,74 @@ class VoiceServer:
         )
         await ws.prepare(request)
 
+        # Per-connection config: deep copy so mutations (voice_mode switch,
+        # model changes) don't bleed between connections.  self._config
+        # remains the immutable server default for new connections.
+        conn_config = copy.deepcopy(self._config)
+
         ws_id = f"ws{self._session_count}"
         self._session_count += 1
         peer = request.remote or "unknown"
         logger.info("WebSocket connected: %s (ws_id=%s)", peer, ws_id)
 
-        # Server-side keepalive: ping every 20s to prevent ngrok idle timeout.
-        # ngrok drops WS connections after ~30s of silence. This ensures max
-        # 20s between frames regardless of voice mode or processing state.
+        # Server-side keepalive: ping every 15s to prevent ngrok idle timeout.
+        # ngrok drops WS connections after ~30s of silence. Detects dead
+        # connections via send-failure counter + response timeout (US-DQ20).
         _keepalive_running = True
+        # Shared flag: last time ANY message was received from the client.
+        # Updated in the main message loop; read by the keepalive task.
+        _last_client_msg_time = time.monotonic()
 
         async def _ws_keepalive():
+            nonlocal _last_client_msg_time
+            fail_count = 0
             while _keepalive_running and not ws.closed:
+                await asyncio.sleep(15)  # 15s < ngrok's ~30s idle threshold
+                if ws.closed or not _keepalive_running:
+                    break
+                # Send JSON pong (data frame) — ngrok counts data frames as activity.
+                # 5s timeout prevents sends from blocking indefinitely when the
+                # event loop is delayed by GIL contention from inference (US-DQ05).
                 try:
-                    await asyncio.sleep(15)  # 15s < ngrok's ~30s idle threshold
-                    if not ws.closed and _keepalive_running:
-                        # Send JSON pong (data frame) — ngrok counts data frames as activity.
-                        # Protocol-level ws.ping() may not prevent ngrok idle timeout.
-                        await ws.send_json({"type": "pong"})
+                    await asyncio.wait_for(
+                        ws.send_json({"type": "pong"}), timeout=5.0
+                    )
+                    fail_count = 0
+                except asyncio.TimeoutError:
+                    fail_count += 1
+                    logger.warning(
+                        "Keepalive send timed out for %s (%d/3) — event loop may be blocked",
+                        ws_id, fail_count,
+                    )
+                    if fail_count >= 3:
+                        logger.warning("Keepalive: 3 consecutive timeouts, closing WS %s", ws_id)
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+                        break
+                    continue
                 except Exception:
+                    fail_count += 1
+                    logger.warning("Keepalive send failed for %s (%d/3)", ws_id, fail_count)
+                    if fail_count >= 3:
+                        logger.warning("Keepalive: 3 consecutive send failures, closing WS %s", ws_id)
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+                        break
+                    continue
+
+                # Response timeout: Tab5 sends pings every 8s.  If we haven't
+                # received ANY message in 30s the connection is dead.
+                silence = time.monotonic() - _last_client_msg_time
+                if silence > 30:
+                    logger.warning("Keepalive: no client message for %.0fs, closing WS %s", silence, ws_id)
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
                     break
 
         _keepalive_task = asyncio.create_task(_ws_keepalive())
@@ -494,6 +562,7 @@ class VoiceServer:
             "device_id": None,
             "registered": False,
             "mode": "ask",  # "ask" or "dictate"
+            "config": conn_config,  # per-connection config (deep copy of server default)
         }
         self._active_connections[ws_id] = conn_state
 
@@ -525,6 +594,8 @@ class VoiceServer:
 
         try:
             async for msg in ws:
+                _last_client_msg_time = time.monotonic()
+
                 if msg.type == WSMsgType.BINARY:
                     # Raw PCM audio data — forward to pipeline
                     pipeline = conn_state.get("pipeline")
@@ -541,7 +612,7 @@ class VoiceServer:
                     cmd_type = cmd.get("type", "")
 
                     if cmd_type == "register":
-                        await self._handle_register(ws, conn_state, cmd, on_audio, on_event)
+                        await self._handle_register(ws, conn_state, cmd, on_audio, on_event, conn_config)
 
                     elif cmd_type == "start":
                         pipeline = conn_state.get("pipeline")
@@ -660,15 +731,15 @@ class VoiceServer:
                                 # TinkerClaw mode — gateway handles everything
                                 llm_be = "tinkerclaw"
                                 if llm_model:
-                                    self._config.llm.tinkerclaw_model = llm_model
+                                    conn_config.llm.tinkerclaw_model = llm_model
                             elif voice_mode == 2:
                                 llm_be = "openrouter"
                                 if llm_model:
-                                    self._config.llm.openrouter_model = llm_model
+                                    conn_config.llm.openrouter_model = llm_model
                             else:
-                                llm_be = self._config.llm.local_backend or "ollama"
+                                llm_be = conn_config.llm.local_backend or "ollama"
                                 if llm_model and llm_be == "ollama" and "/" not in llm_model:
-                                    self._config.llm.ollama_model = llm_model
+                                    conn_config.llm.ollama_model = llm_model
                                     logger.info("Local model switched to: %s", llm_model)
 
                             # Apply mode-aware system prompt and max_tokens
@@ -676,23 +747,45 @@ class VoiceServer:
                             if voice_mode == 3:
                                 pass  # TinkerClaw manages its own prompts and limits
                             elif voice_mode == 0:
-                                self._config.llm.system_prompt = SYSTEM_PROMPT_LOCAL
-                                self._config.llm.max_tokens = MAX_TOKENS_LOCAL
+                                conn_config.llm.system_prompt = SYSTEM_PROMPT_LOCAL
+                                conn_config.llm.max_tokens = MAX_TOKENS_LOCAL
                             elif voice_mode == 1:
-                                self._config.llm.system_prompt = SYSTEM_PROMPT_HYBRID
-                                self._config.llm.max_tokens = MAX_TOKENS_HYBRID
+                                conn_config.llm.system_prompt = SYSTEM_PROMPT_HYBRID
+                                conn_config.llm.max_tokens = MAX_TOKENS_HYBRID
                             else:
-                                self._config.llm.system_prompt = SYSTEM_PROMPT_CLOUD
-                                self._config.llm.max_tokens = MAX_TOKENS_CLOUD
+                                conn_config.llm.system_prompt = SYSTEM_PROMPT_CLOUD
+                                conn_config.llm.max_tokens = MAX_TOKENS_CLOUD
 
                             logger.info("Connection %s: voice_mode=%d → stt=%s tts=%s llm=%s model=%s tokens=%d",
                                         ws_id, voice_mode, stt_be, tts_be, llm_be,
-                                        self._config.llm.openrouter_model if voice_mode == 2 else "(local)",
-                                        self._config.llm.max_tokens)
+                                        conn_config.llm.openrouter_model if voice_mode == 2 else "(local)",
+                                        conn_config.llm.max_tokens)
+
+                            # Validate TinkerClaw gateway is reachable before switching to mode 3
+                            if voice_mode == 3:
+                                try:
+                                    tc_url = (conn_config.llm.tinkerclaw_url or "http://localhost:18789").rstrip("/")
+                                    async with aiohttp.ClientSession(
+                                        timeout=aiohttp.ClientTimeout(total=5)
+                                    ) as tc_session:
+                                        async with tc_session.get(f"{tc_url}/health") as tc_resp:
+                                            if tc_resp.status != 200:
+                                                logger.error("TinkerClaw health check returned %d", tc_resp.status)
+                                                raise RuntimeError(f"health check returned {tc_resp.status}")
+                                    logger.info("TinkerClaw gateway health OK at %s", tc_url)
+                                except Exception as tc_err:
+                                    logger.error("TinkerClaw gateway not reachable: %s", tc_err)
+                                    if not ws.closed:
+                                        await ws.send_json({
+                                            "type": "config_update",
+                                            "error": "TinkerClaw gateway is not reachable",
+                                            "voice_mode": voice_mode,
+                                        })
+                                    continue
 
                             # Validate API key for cloud modes (1=Hybrid, 2=Cloud need OpenRouter)
                             # Mode 3 (TinkerClaw) doesn't need Dragon's OpenRouter key — uses own gateway
-                            if voice_mode in (1, 2) and not self._config.llm.openrouter_api_key:
+                            if voice_mode in (1, 2) and not conn_config.llm.openrouter_api_key:
                                 logger.error("Cloud mode requested but no API key configured")
                                 if not ws.closed:
                                     await ws.send_json({
@@ -707,28 +800,28 @@ class VoiceServer:
                             if sid and self._db:
                                 try:
                                     await self._db.update_session(
-                                        sid, system_prompt=self._config.llm.system_prompt
+                                        sid, system_prompt=conn_config.llm.system_prompt
                                     )
                                 except Exception:
                                     logger.warning("Failed to update session system_prompt")
 
                             # Apply config
-                            self._config.stt.backend = stt_be
-                            self._config.tts.backend = tts_be
-                            self._config.llm.backend = llm_be
+                            conn_config.stt.backend = stt_be
+                            conn_config.tts.backend = tts_be
+                            conn_config.llm.backend = llm_be
 
                             # Propagate API keys for cloud STT/TTS backends (modes 1-2, or mode 3 with cloud STT)
                             if voice_mode in (1, 2) or (voice_mode == 3 and stt_be == "openrouter"):
-                                self._config.stt.openrouter_api_key = self._config.llm.openrouter_api_key
-                                self._config.stt.openrouter_url = self._config.llm.openrouter_url
-                                self._config.tts.openrouter_api_key = self._config.llm.openrouter_api_key
-                                self._config.tts.openrouter_url = self._config.llm.openrouter_url
+                                conn_config.stt.openrouter_api_key = conn_config.llm.openrouter_api_key
+                                conn_config.stt.openrouter_url = conn_config.llm.openrouter_url
+                                conn_config.tts.openrouter_api_key = conn_config.llm.openrouter_api_key
+                                conn_config.tts.openrouter_url = conn_config.llm.openrouter_url
 
                             # Hot-swap backends on pipeline AND conversation engine
                             pipeline = conn_state.get("pipeline")
                             if pipeline:
                                 try:
-                                    await pipeline.swap_backends(self._config)
+                                    await pipeline.swap_backends(conn_config)
                                     # Inject session key for TinkerClaw conversation continuity
                                     if llm_be == "tinkerclaw" and hasattr(pipeline, '_llm'):
                                         if hasattr(pipeline._llm, 'set_session_key'):
@@ -750,7 +843,7 @@ class VoiceServer:
                                     from dragon_voice.llm import create_llm
                                     if self._conversation._llm:
                                         await self._conversation._llm.shutdown()
-                                    new_llm = create_llm(self._config.llm)
+                                    new_llm = create_llm(conn_config.llm)
                                     await new_llm.initialize()
                                     self._conversation._llm = new_llm
                                     logger.info("ConversationEngine LLM swapped to %s", new_llm.name)
@@ -766,11 +859,11 @@ class VoiceServer:
                             if not ws.closed:
                                 # Report actual model for any mode
                                 if voice_mode == 2:
-                                    active_model = self._config.llm.openrouter_model
+                                    active_model = conn_config.llm.openrouter_model
                                 elif llm_be == "tinkerclaw":
-                                    active_model = self._config.llm.tinkerclaw_model
+                                    active_model = conn_config.llm.tinkerclaw_model
                                 elif llm_be == "ollama":
-                                    active_model = self._config.llm.ollama_model
+                                    active_model = conn_config.llm.ollama_model
                                 else:
                                     active_model = ""
                                 await ws.send_json({
@@ -816,6 +909,7 @@ class VoiceServer:
         cmd: dict,
         on_audio,
         on_event,
+        conn_config: VoiceConfig,
     ) -> None:
         """Handle device registration message."""
         device_id = cmd.get("device_id", "")
@@ -848,7 +942,7 @@ class VoiceServer:
         session, resumed = await self._session_mgr.get_or_create_session(
             device_id=device_id,
             requested_session_id=requested_session,
-            system_prompt=self._config.llm.system_prompt,
+            system_prompt=conn_config.llm.system_prompt,
         )
         session_id = session["id"]
 
@@ -881,12 +975,12 @@ class VoiceServer:
                 "resumed": resumed,
                 "message_count": session.get("message_count", 0),
                 "config": {
-                    "stt": self._config.stt.backend,
-                    "tts": self._config.tts.backend,
-                    "llm": self._config.llm.backend,
-                    "tts_sample_rate": self._config.audio.input_sample_rate,
+                    "stt": conn_config.stt.backend,
+                    "tts": conn_config.tts.backend,
+                    "llm": conn_config.llm.backend,
+                    "tts_sample_rate": conn_config.audio.input_sample_rate,
                     "response_mode": "match_input",
-                    "system_prompt": self._config.llm.system_prompt,
+                    "system_prompt": conn_config.llm.system_prompt,
                 },
             })
         except Exception as e:
@@ -898,19 +992,19 @@ class VoiceServer:
             device_id, session_id, resumed, ws_id,
         )
 
-        # Reset config to local defaults before pipeline init.
+        # Reset conn_config to local defaults before pipeline init.
         # Tab5 will immediately send config_update with its actual mode,
         # so this avoids initializing cloud backends only to swap them out.
-        self._config.stt.backend = "moonshine"
-        self._config.tts.backend = "piper"
-        self._config.llm.backend = self._config.llm.local_backend or "ollama"
-        self._config.llm.system_prompt = SYSTEM_PROMPT_LOCAL
-        self._config.llm.max_tokens = MAX_TOKENS_LOCAL
+        conn_config.stt.backend = "moonshine"
+        conn_config.tts.backend = "piper"
+        conn_config.llm.backend = conn_config.llm.local_backend or "ollama"
+        conn_config.llm.system_prompt = SYSTEM_PROMPT_LOCAL
+        conn_config.llm.max_tokens = MAX_TOKENS_LOCAL
 
         # NOW initialize the voice pipeline (slow: Moonshine load ~2s)
         # This happens AFTER session_start is sent so Tab5 doesn't timeout
         pipeline = VoicePipeline(
-            self._config, on_audio, on_event,
+            conn_config, on_audio, on_event,
             conversation_engine=self._conversation,
             session_id=session_id,
         )
@@ -945,7 +1039,8 @@ class VoiceServer:
 
         # TinkerClaw mode: bypass ConversationEngine, use ConversationEngine's
         # swapped LLM (not pipeline._llm which may be stale after swap race)
-        if self._config.llm.backend == "tinkerclaw" and self._conversation and self._conversation._llm:
+        conn_cfg = conn_state.get("config")
+        if conn_cfg and conn_cfg.llm.backend == "tinkerclaw" and self._conversation and self._conversation._llm:
             llm = self._conversation._llm
             logger.info("_handle_text TinkerClaw bypass via ConvEngine LLM: %s", llm.name)
             if hasattr(llm, 'set_session_key'):
@@ -957,15 +1052,17 @@ class VoiceServer:
             if not ws.closed:
                 await ws.send_json({"type": "llm", "text": ""})
 
-            # Also start a keepalive task that pings every 10s during processing
+            # Also start a keepalive task that pings every 10s during processing.
+            # 5s timeout on each send prevents blocking if the event loop is
+            # delayed by inference GIL contention (US-DQ05).
             keepalive_active = True
             async def _keepalive():
                 while keepalive_active:
                     await asyncio.sleep(10)
                     if keepalive_active and not ws.closed:
                         try:
-                            await ws.ping()
-                        except Exception:
+                            await asyncio.wait_for(ws.ping(), timeout=5.0)
+                        except (asyncio.TimeoutError, Exception):
                             break
 
             keepalive_task = asyncio.create_task(_keepalive())
@@ -1024,7 +1121,7 @@ class VoiceServer:
 
                     if audio_bytes:
                         tts_rate = pipeline._tts.sample_rate
-                        target_rate = self._config.audio.input_sample_rate
+                        target_rate = conn_cfg.audio.input_sample_rate if conn_cfg else 16000
                         if tts_rate != target_rate:
                             import numpy as np
                             audio_i16 = np.frombuffer(audio_bytes, dtype=np.int16)

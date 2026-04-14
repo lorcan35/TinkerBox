@@ -67,9 +67,13 @@ class OpenRouterBackend(LLMBackend):
             logger.warning("Cannot reach OpenRouter: %s", e)
 
     async def _stream_messages(
-        self, messages: list[dict]
+        self, messages: list[dict], _retried: bool = False,
     ) -> AsyncIterator[str]:
-        """Internal: stream tokens from OpenRouter given a full message list."""
+        """Internal: stream tokens from OpenRouter given a full message list.
+
+        If the API returns a context_length_exceeded error (HTTP 400), trims
+        oldest non-system messages aggressively and retries once (US-P16).
+        """
         if self._session is None or self._session.closed:
             await self.initialize()
 
@@ -91,6 +95,24 @@ class OpenRouterBackend(LLMBackend):
                     logger.error(
                         "OpenRouter error %d: %s", resp.status, error_text[:300]
                     )
+
+                    # Handle context_length_exceeded: trim and retry once
+                    if (resp.status == 400
+                            and "context_length" in error_text.lower()
+                            and not _retried
+                            and len(messages) > 2):
+                        logger.warning(
+                            "Context length exceeded — trimming aggressively and retrying"
+                        )
+                        from dragon_voice.messages import trim_context_to_budget
+                        # Halve the current estimated budget for aggressive trim
+                        from dragon_voice.messages import estimate_tokens
+                        current = sum(estimate_tokens(m.get("content", "")) for m in messages)
+                        trimmed = trim_context_to_budget(messages, current // 2)
+                        async for token in self._stream_messages(trimmed, _retried=True):
+                            yield token
+                        return
+
                     yield f"[OpenRouter error: {resp.status}]"
                     return
 

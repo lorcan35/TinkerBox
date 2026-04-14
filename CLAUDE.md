@@ -32,8 +32,8 @@ Before writing any fix, CHECK LEARNINGS.md first. Your bug might already be docu
 ## Dragon Access
 - **Host:** 192.168.1.91 (static IP on LAN)
 - **User:** radxa
-- **Password:** radxa
-- **SSH:** `sshpass -p 'radxa' ssh radxa@192.168.1.91`
+- **Password:** `<DRAGON_SSH_PASSWORD>`
+- **SSH:** `ssh radxa@192.168.1.91  # password in ~/.ssh/config or use key auth`
 - **OS:** Debian (Radxa Zero 3W, ARM64)
 - **Connection:** Ethernet only (WiFi disabled). Static IP on enp1s0.
 - **Services stripped:** gdm3, snapd, ollama, nanobot masked. Only tinkerclaw-voice, tinkerclaw-dashboard, tinkerclaw-ngrok run.
@@ -55,12 +55,12 @@ Before writing any fix, CHECK LEARNINGS.md first. Your bug might already be docu
 ## Deploy
 ```bash
 # Sync code to Dragon (includes new STT/TTS backends + notes module)
-sshpass -p 'radxa' scp -r dragon_voice/ radxa@192.168.1.91:/home/radxa/
-sshpass -p 'radxa' scp dashboard.py radxa@192.168.1.91:/home/radxa/
-sshpass -p 'radxa' scp schema.sql radxa@192.168.1.91:/home/radxa/
+scp -r dragon_voice/ radxa@192.168.1.91:/home/radxa/
+scp dashboard.py radxa@192.168.1.91:/home/radxa/
+scp schema.sql radxa@192.168.1.91:/home/radxa/
 
 # Restart services
-sshpass -p 'radxa' ssh radxa@192.168.1.91 "echo 'radxa' | sudo -S systemctl restart tinkerclaw-voice"
+ssh radxa@192.168.1.91 "sudo systemctl restart tinkerclaw-voice"
 ```
 
 ### Post-Deploy Checklist

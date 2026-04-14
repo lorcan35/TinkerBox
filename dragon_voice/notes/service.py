@@ -219,6 +219,7 @@ class NotesService:
                     "model": self._config.llm.ollama_model,
                     "prompt": prompt,
                     "stream": False,
+                    "keep_alive": "30s",
                     "options": {"num_predict": 128, "temperature": 0.3},
                 },
             ) as resp:
@@ -243,7 +244,7 @@ class NotesService:
         try:
             async with self._session.post(
                 f"{self._ollama_url}/api/embed",
-                json={"model": self._embedding_model, "input": text},
+                json={"model": self._embedding_model, "input": text, "keep_alive": "30s"},
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()

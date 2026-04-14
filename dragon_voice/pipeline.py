@@ -9,6 +9,7 @@ import asyncio
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Awaitable, Optional
 
 import numpy as np
@@ -19,6 +20,11 @@ from dragon_voice.tts import create_tts, TTSBackend
 from dragon_voice.llm import create_llm, LLMBackend
 
 logger = logging.getLogger(__name__)
+
+# Dedicated thread pool for CPU-bound STT/TTS inference.
+# Separates inference threads from the default executor (used for I/O-bound
+# tasks like DB queries and HTTP requests) so they don't compete for GIL time.
+inference_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="inference")
 
 # Regex for sentence boundary detection
 _SENTENCE_END = re.compile(r"[.!?]\s*$")
@@ -203,7 +209,7 @@ class VoicePipeline:
                 pass
 
     async def cancel(self) -> None:
-        """Cancel ongoing processing."""
+        """Cancel ongoing processing and clean up in-flight TTS subprocesses."""
         self._cancelled = True
         if self._process_task and not self._process_task.done():
             self._process_task.cancel()
@@ -211,6 +217,9 @@ class VoicePipeline:
                 await self._process_task
             except asyncio.CancelledError:
                 pass
+        # Kill any in-flight Piper TTS subprocesses (US-P24)
+        if self._tts and hasattr(self._tts, "kill_active_procs"):
+            self._tts.kill_active_procs()
         self._processing = False
         self._cancelled = False
         self._audio_buffer.clear()

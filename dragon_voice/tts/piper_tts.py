@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from dragon_voice.config import TTSConfig
+from dragon_voice.pipeline import inference_executor
 from dragon_voice.tts.base import TTSBackend
 
 logger = logging.getLogger(__name__)
@@ -25,7 +26,14 @@ _PIPER_VOICES_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
 
 
 class PiperBackend(TTSBackend):
-    """TTS backend using Piper (piper-tts Python package or binary)."""
+    """TTS backend using Piper (piper-tts Python package or binary).
+
+    Note: Piper also supports a persistent server mode (``piper --server``
+    listening on a Unix socket) which avoids subprocess-per-synthesis overhead.
+    This is a potential future optimization but is not used here — the current
+    binary-per-call approach is simpler and the ~50ms fork overhead is
+    negligible compared to inference time on ARM64.
+    """
 
     def __init__(self, config: TTSConfig) -> None:
         self._config = config
@@ -35,6 +43,8 @@ class PiperBackend(TTSBackend):
         self._model_path: Path | None = None
         self._sample_rate = config.sample_rate or 22050
         self._lock = asyncio.Lock()
+        # Track in-flight binary subprocesses for cleanup on cancel/shutdown (US-P24)
+        self._active_procs: list[subprocess.Popen] = []
 
     async def initialize(self) -> None:
         """Load the Piper voice model.
@@ -59,7 +69,7 @@ class PiperBackend(TTSBackend):
                 voice = piper.PiperVoice.load(str(model_path))
                 return voice
 
-            self._voice = await loop.run_in_executor(None, _load)
+            self._voice = await loop.run_in_executor(inference_executor, _load)
             self._model_path = model_path
             # Piper voices declare their sample rate in config
             config_path = model_path.with_suffix(model_path.suffix + ".json")
@@ -151,9 +161,9 @@ class PiperBackend(TTSBackend):
             loop = asyncio.get_running_loop()
 
             if self._use_binary:
-                return await loop.run_in_executor(None, self._synthesize_binary, text)
+                return await loop.run_in_executor(inference_executor, self._synthesize_binary, text)
             else:
-                return await loop.run_in_executor(None, self._synthesize_python, text)
+                return await loop.run_in_executor(inference_executor, self._synthesize_python, text)
 
     def _synthesize_python(self, text: str) -> bytes:
         """Synthesize using piper-tts Python package."""
@@ -171,30 +181,73 @@ class PiperBackend(TTSBackend):
         return pcm_data
 
     def _synthesize_binary(self, text: str) -> bytes:
-        """Synthesize using piper command-line binary."""
+        """Synthesize using piper command-line binary.
+
+        Uses Popen with explicit tracking so in-flight processes can be
+        killed on pipeline cancel or shutdown (US-P24).
+        """
+        proc = None
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 [
                     self._binary_path,
                     "--model", str(self._model_path),
                     "--output_raw",
                 ],
-                input=text.encode("utf-8"),
-                capture_output=True,
-                timeout=30,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
-            if result.returncode != 0:
-                logger.error("Piper binary error: %s", result.stderr.decode())
+            self._active_procs.append(proc)
+
+            try:
+                stdout, stderr = proc.communicate(
+                    input=text.encode("utf-8"), timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                logger.error("Piper binary timed out — killing process")
+                proc.kill()
+                proc.wait(timeout=2)
                 return b""
-            return result.stdout
-        except subprocess.TimeoutExpired:
-            logger.error("Piper binary timed out")
-            return b""
+
+            if proc.returncode != 0:
+                logger.error("Piper binary error: %s", stderr.decode(errors="replace"))
+                return b""
+            return stdout
         except Exception:
             logger.exception("Piper binary synthesis failed")
+            if proc and proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=2)
             return b""
+        finally:
+            if proc is not None:
+                try:
+                    self._active_procs.remove(proc)
+                except ValueError:
+                    pass
+
+    def kill_active_procs(self) -> None:
+        """Kill all tracked in-flight Piper subprocesses (US-P24).
+
+        Called on pipeline flush/cancel and on shutdown to prevent zombie
+        process accumulation.
+        """
+        killed = 0
+        for proc in list(self._active_procs):
+            if proc.poll() is None:  # still running
+                try:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                    killed += 1
+                except Exception:
+                    logger.debug("Failed to kill Piper proc pid=%s", proc.pid)
+        self._active_procs.clear()
+        if killed:
+            logger.info("Killed %d in-flight Piper processes", killed)
 
     async def shutdown(self) -> None:
+        self.kill_active_procs()
         self._voice = None
         logger.info("Piper TTS shut down")
 

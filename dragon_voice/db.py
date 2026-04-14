@@ -54,6 +54,13 @@ class Database:
             # WAL mode + foreign keys — this is where corruption surfaces
             await self._db.execute("PRAGMA journal_mode = WAL")
             await self._db.execute("PRAGMA foreign_keys = ON")
+            # Reduce eMMC write amplification (DQ04):
+            # - synchronous=NORMAL skips fsync on WAL writes (safe in WAL mode,
+            #   only risks losing last transaction on OS crash, not corruption)
+            # - wal_autocheckpoint=1000 is the SQLite default (1000 pages ~4MB),
+            #   set explicitly to prevent any library from lowering it
+            await self._db.execute("PRAGMA synchronous = NORMAL")
+            await self._db.execute("PRAGMA wal_autocheckpoint = 1000")
             # Quick integrity probe: read from sqlite_master
             await self._db.execute("SELECT count(*) FROM sqlite_master")
         except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
@@ -69,6 +76,8 @@ class Database:
                 self._db.row_factory = aiosqlite.Row
                 await self._db.execute("PRAGMA journal_mode = WAL")
                 await self._db.execute("PRAGMA foreign_keys = ON")
+                await self._db.execute("PRAGMA synchronous = NORMAL")
+                await self._db.execute("PRAGMA wal_autocheckpoint = 1000")
             else:
                 raise
 
@@ -497,6 +506,16 @@ class Database:
         )
         evt_count = cursor.rowcount
         await self.conn.commit()
+
+        # PASSIVE checkpoint after bulk deletes — moves WAL pages back into
+        # the main DB file without blocking readers. Reduces WAL file growth
+        # and consolidates writes to reduce eMMC wear (DQ04).
+        if msg_count > 0 or evt_count > 0:
+            try:
+                await self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+                logger.info("WAL passive checkpoint after purge")
+            except Exception as ckpt_err:
+                logger.warning("WAL checkpoint after purge failed: %s", ckpt_err)
 
         logger.info(
             "Purged %d messages and %d events older than %d days",

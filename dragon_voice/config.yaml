@@ -28,7 +28,7 @@ tts:
 
 llm:
   local_backend: "ollama"  # Stores original local backend for cloud-to-local fallback
-  backend: "ollama"  # ollama, openrouter, lmstudio, npu_genie
+  backend: "ollama"  # ollama, openrouter, lmstudio, npu_genie, tinkerclaw
   # ollama
   ollama_url: "http://localhost:11434"
   ollama_model: "qwen3:1.7b"

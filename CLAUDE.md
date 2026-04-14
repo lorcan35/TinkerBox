@@ -50,7 +50,7 @@ Before writing any fix, CHECK LEARNINGS.md first. Your bug might already be docu
 | Ollama | 11434 | ollama | Local LLM inference (CPU, slow) |
 | NPU Genie | — | (via voice pipeline) | Llama 3.2 1B on QCS6490 HTP (~8 tok/s) |
 | TinkerClaw GW | 18789 | tinkerclaw-gateway | TinkerClaw sidecar agent runner (localhost only) |
-| ngrok | 443 (ext) | tinkerclaw-ngrok | tinkerbox.ngrok.dev → 192.168.1.91:3500 (dashboard, not voice) |
+| ngrok | 443 (ext) | tinkerclaw-ngrok | tinkerclaw-dashboard.ngrok.dev → 3500, tinkerclaw-voice.ngrok.dev → 3502, tinkerclaw-gateway.ngrok.dev → 18789 |
 
 ## Deploy
 ```bash
@@ -66,10 +66,19 @@ sshpass -p 'radxa' ssh radxa@192.168.1.91 "echo 'radxa' | sudo -S systemctl rest
 ### Post-Deploy Checklist
 - **Clear `__pycache__`:** After `scp` deploy, stale `.pyc` files can cause import errors. Run `find /home/radxa/dragon_voice -name '__pycache__' -exec rm -rf {} +` on Dragon before restarting.
 - **Restore secrets in `config.yaml`:** `scp` overwrites the Dragon's `config.yaml` with the workstation copy, which has empty API keys. After deploy, restore `openrouter_api_key` and `searxng_url` in `dragon_voice/config.yaml` on Dragon.
-- **ngrok on workstation** points to `192.168.1.91:3500` (dashboard), not the voice server. The dashboard serves `/dashboard` as a proxy route on the voice server for ngrok access.
+- **Restore `tinkerclaw_token` in `config.yaml`:** Must match `~/.tinkerclaw/tinkerclaw.json` gateway auth token.
+- **ngrok domains:** Three tunnels are active:
+  - `tinkerclaw-dashboard.ngrok.dev` → 3500 (dashboard)
+  - `tinkerclaw-voice.ngrok.dev` → 3502 (voice)
+  - `tinkerclaw-gateway.ngrok.dev` → 18789 (TinkerClaw)
 
 ## Three-Tier Voice Mode
-Tab5 sends `{"type":"config_update","voice_mode":0|1|2,"llm_model":"..."}`. Dragon hot-swaps backends:
+Tab5 sends `{"type":"config_update","voice_mode":0|1|2,"llm_model":"...","conn_mode":0|1|2}`. Dragon hot-swaps backends:
+
+**Connection mode (`conn_mode`):** Tab5 sends `conn_mode` in config_update to indicate its network path:
+- `0` = LAN direct (low latency, no proxy)
+- `1` = ngrok tunnel (higher latency, WS keepalive required)
+- `2` = mixed / unknown
 
 | Mode | voice_mode | STT | LLM | TTS |
 |------|-----------|-----|-----|-----|
@@ -123,7 +132,7 @@ The web dashboard is an 11-tab single-page application served by `dashboard.py` 
 
 **Proxy architecture:** The dashboard proxies ALL API calls through `/api/proxy/` to the voice server (port 3502). The dashboard itself is a thin frontend — all data lives in the voice server's SQLite database. This means the dashboard has no direct DB access and can be restarted independently without affecting active sessions.
 
-**ngrok access:** The voice server exposes `/dashboard` as a proxy route, so the dashboard is accessible via ngrok without a separate tunnel.
+**ngrok access:** Each service has its own ngrok domain — `tinkerclaw-dashboard.ngrok.dev` (dashboard), `tinkerclaw-voice.ngrok.dev` (voice), `tinkerclaw-gateway.ngrok.dev` (TinkerClaw gateway).
 
 | Tab | Description |
 |-----|-------------|
@@ -319,7 +328,7 @@ dragon_voice/         — Voice pipeline package (port 3502)
     datetime_tool.py  — Current date/time tool
   stt/                — STT backends (moonshine, whisper_cpp, vosk, openrouter)
   tts/                — TTS backends (piper, kokoro, edge_tts, openrouter)
-  llm/                — LLM backends (ollama, openrouter, lmstudio, npu_genie)
+  llm/                — LLM backends (ollama, openrouter, lmstudio, npu_genie, tinkerclaw)
   notes/              — Notes module (CRUD + search + audio ingestion)
 tests/                — E2E test suite
   test_api_e2e.py     — 29 tests (14 single-step, 8 multi-step, 7 complex chained)

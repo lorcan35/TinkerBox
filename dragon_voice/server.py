@@ -457,7 +457,8 @@ class VoiceServer:
 
         ws = web.WebSocketResponse(
             max_msg_size=10 * 1024 * 1024,  # 10MB max message
-            heartbeat=600.0,
+            heartbeat=None,  # DISABLED — ESP-IDF transport doesn't auto-PONG protocol pings.
+            # Keepalive handled by _ws_keepalive task (20s server pings) + Tab5 JSON pings (8s).
         )
         await ws.prepare(request)
 
@@ -465,6 +466,22 @@ class VoiceServer:
         self._session_count += 1
         peer = request.remote or "unknown"
         logger.info("WebSocket connected: %s (ws_id=%s)", peer, ws_id)
+
+        # Server-side keepalive: ping every 20s to prevent ngrok idle timeout.
+        # ngrok drops WS connections after ~30s of silence. This ensures max
+        # 20s between frames regardless of voice mode or processing state.
+        _keepalive_running = True
+
+        async def _ws_keepalive():
+            while _keepalive_running and not ws.closed:
+                try:
+                    await asyncio.sleep(20)
+                    if not ws.closed and _keepalive_running:
+                        await ws.ping()
+                except Exception:
+                    break
+
+        _keepalive_task = asyncio.create_task(_ws_keepalive())
 
         # Connection state — populated after register
         conn_state: dict = {
@@ -779,6 +796,9 @@ class VoiceServer:
         except Exception:
             logger.exception("WebSocket handler error for %s", ws_id)
         finally:
+            # Stop keepalive
+            _keepalive_running = False
+            _keepalive_task.cancel()
             # Clean up: pause session, mark device offline, shut down pipeline
             await self._handle_disconnect(conn_state)
             self._active_connections.pop(ws_id, None)

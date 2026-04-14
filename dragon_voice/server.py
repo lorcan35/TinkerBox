@@ -927,13 +927,38 @@ class VoiceServer:
             logger.info("_handle_text TinkerClaw bypass via ConvEngine LLM: %s", llm.name)
             if hasattr(llm, 'set_session_key'):
                 llm.set_session_key(conn_state.get("session_id", ""))
+
+            # Send a "thinking" indicator immediately to keep the WS alive.
+            # TinkerClaw agent can take 10-30s before first token (memory recall,
+            # skill execution). Without this, ngrok kills the idle connection.
+            if not ws.closed:
+                await ws.send_json({"type": "llm", "text": ""})
+
+            # Also start a keepalive task that pings every 10s during processing
+            keepalive_active = True
+            async def _keepalive():
+                while keepalive_active:
+                    await asyncio.sleep(10)
+                    if keepalive_active and not ws.closed:
+                        try:
+                            await ws.ping()
+                        except Exception:
+                            break
+
+            keepalive_task = asyncio.create_task(_keepalive())
+
             full_response = []
-            async for token in llm.generate_stream_with_messages([
-                {"role": "user", "content": text}
-            ]):
-                full_response.append(token)
-                if not ws.closed:
-                    await ws.send_json({"type": "llm", "text": token})
+            try:
+                async for token in llm.generate_stream_with_messages([
+                    {"role": "user", "content": text}
+                ]):
+                    full_response.append(token)
+                    if not ws.closed:
+                        await ws.send_json({"type": "llm", "text": token})
+            finally:
+                keepalive_active = False
+                keepalive_task.cancel()
+
             response_text = "".join(full_response)
             logger.info("TinkerClaw text response (%d chars): %s",
                         len(response_text), response_text[:80])

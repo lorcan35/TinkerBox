@@ -51,6 +51,7 @@ class VoiceServer:
         # Active WebSocket sessions: ws_id -> {pipeline, session_id, device_id}
         self._active_connections: dict[str, dict] = {}
         self._max_connections = 10
+        self._purge_task: Optional[asyncio.Task] = None
 
         # Backend names for status page
         self._stt_name = config.stt.backend
@@ -285,11 +286,46 @@ class VoiceServer:
         except Exception as e:
             logger.warning("MCP bridge not available: %s", e)
 
+        # Run initial message purge and schedule periodic purge (US-DQ14)
+        retention_days = self._config.database.message_retention_days
+        if retention_days > 0:
+            try:
+                result = await self._db.purge_old_messages(days=retention_days)
+                logger.info(
+                    "Startup purge complete: %d messages, %d events removed (retention=%d days)",
+                    result["messages"], result["events"], retention_days,
+                )
+            except Exception as e:
+                logger.warning("Startup purge failed: %s", e)
+
+            self._purge_task = asyncio.create_task(
+                self._periodic_purge(retention_days)
+            )
+
         logger.info("Foundation modules initialized")
+
+    async def _periodic_purge(self, days: int) -> None:
+        """Run message/event purge every 24 hours."""
+        while True:
+            await asyncio.sleep(86400)  # 24 hours
+            if self._db is None:
+                break
+            try:
+                result = await self._db.purge_old_messages(days=days)
+                logger.info(
+                    "Periodic purge: %d messages, %d events removed",
+                    result["messages"], result["events"],
+                )
+            except Exception as e:
+                logger.warning("Periodic purge failed: %s", e)
 
     async def _on_shutdown(self, app: web.Application) -> None:
         """Clean up all active sessions and foundation modules on server shutdown."""
         logger.info("Server shutting down — closing %d connections", len(self._active_connections))
+
+        # Cancel periodic purge task
+        if self._purge_task and not self._purge_task.done():
+            self._purge_task.cancel()
 
         # Shut down pipelines
         tasks = []
@@ -487,6 +523,12 @@ class VoiceServer:
         # remains the immutable server default for new connections.
         conn_config = copy.deepcopy(self._config)
 
+        # Per-connection processing lock (US-P10): serializes voice and text
+        # requests so they don't corrupt shared state (conversation context,
+        # LLM backend, TTS output path).  One lock per connection — different
+        # devices are independent.
+        conn_lock = asyncio.Lock()
+
         ws_id = f"ws{self._session_count}"
         self._session_count += 1
         peer = request.remote or "unknown"
@@ -598,6 +640,13 @@ class VoiceServer:
 
                 if msg.type == WSMsgType.BINARY:
                     # Raw PCM audio data — forward to pipeline
+                    # Note: feed_audio is NOT locked (US-P10) — it only
+                    # appends to the audio buffer and the VAD check is
+                    # lightweight. The heavy processing (_process_utterance)
+                    # is triggered via asyncio.create_task inside feed_audio
+                    # and that task is serialized by the pipeline's own
+                    # _processing flag. Locking here would block audio
+                    # ingestion during LLM/TTS processing.
                     pipeline = conn_state.get("pipeline")
                     if pipeline:
                         await pipeline.feed_audio(msg.data)
@@ -630,7 +679,8 @@ class VoiceServer:
                         pipeline = conn_state.get("pipeline")
                         if pipeline and conn_state.get("mode") == "dictate":
                             logger.info("Connection %s: segment marker", ws_id)
-                            await pipeline.process_segment()
+                            async with conn_lock:  # US-P10: serialize with text
+                                await pipeline.process_segment()
 
                     elif cmd_type == "stop":
                         pipeline = conn_state.get("pipeline")
@@ -638,27 +688,28 @@ class VoiceServer:
                             mode = conn_state.get("mode", "ask")
                             buf_size = len(pipeline._audio_buffer) + len(pipeline._segment_buffer)
                             logger.info("Connection %s: stop (mode=%s, buffer=%d bytes)", ws_id, mode, buf_size)
-                            if mode == "dictate":
-                                transcript = await pipeline.finish_dictation()
-                                # Auto-save dictation to Dragon notes DB
-                                if transcript and len(transcript.strip()) > 10 and self._notes_svc:
-                                    try:
-                                        note = await self._notes_svc.create_from_text(
-                                            transcript.strip(), title=""
-                                        )
-                                        logger.info("Auto-created note %s from dictation (%d chars)",
-                                                    note.id, len(transcript))
-                                        if not ws.closed:
-                                            await ws.send_json({
-                                                "type": "note_created",
-                                                "note_id": note.id,
-                                                "title": note.title,
-                                                "transcript": transcript[:200],
-                                            })
-                                    except Exception as e:
-                                        logger.error("Failed to auto-create dictation note: %s", e)
-                            else:
-                                await pipeline.start_processing()
+                            async with conn_lock:  # US-P10: serialize with text
+                                if mode == "dictate":
+                                    transcript = await pipeline.finish_dictation()
+                                    # Auto-save dictation to Dragon notes DB
+                                    if transcript and len(transcript.strip()) > 10 and self._notes_svc:
+                                        try:
+                                            note = await self._notes_svc.create_from_text(
+                                                transcript.strip(), title=""
+                                            )
+                                            logger.info("Auto-created note %s from dictation (%d chars)",
+                                                        note.id, len(transcript))
+                                            if not ws.closed:
+                                                await ws.send_json({
+                                                    "type": "note_created",
+                                                    "note_id": note.id,
+                                                    "title": note.title,
+                                                    "transcript": transcript[:200],
+                                                })
+                                        except Exception as e:
+                                            logger.error("Failed to auto-create dictation note: %s", e)
+                                else:
+                                    await pipeline.start_processing()
 
                     elif cmd_type == "clear":
                         pipeline = conn_state.get("pipeline")
@@ -693,7 +744,8 @@ class VoiceServer:
                             await pipeline.cancel()
 
                     elif cmd_type == "text":
-                        await self._handle_text(ws, conn_state, cmd)
+                        async with conn_lock:  # US-P10: serialize with voice
+                            await self._handle_text(ws, conn_state, cmd)
 
                     elif cmd_type == "record_start" or cmd_type == "record_stop":
                         # Superseded by dictation mode (start with mode=dictate)
@@ -821,6 +873,11 @@ class VoiceServer:
                             pipeline = conn_state.get("pipeline")
                             if pipeline:
                                 try:
+                                    # Cancel in-flight processing before swap (US-P12)
+                                    if pipeline._process_task and not pipeline._process_task.done():
+                                        logger.info("Connection %s: cancelling in-flight processing before backend swap", ws_id)
+                                        await pipeline.cancel()
+                                        await asyncio.sleep(0.1)  # let cancel propagate
                                     await pipeline.swap_backends(conn_config)
                                     # Inject session key for TinkerClaw conversation continuity
                                     if llm_be == "tinkerclaw" and hasattr(pipeline, '_llm'):

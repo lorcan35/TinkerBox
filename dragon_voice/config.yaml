@@ -56,6 +56,10 @@ audio:
   vad_enabled: true
   vad_silence_ms: 600
 
+# Database maintenance
+database:
+  message_retention_days: 30  # Purge messages older than this (0 = never purge)
+
 # Tools configuration
 tools:
   enabled: true

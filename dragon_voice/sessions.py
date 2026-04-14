@@ -47,11 +47,14 @@ class SessionManager:
         logger.info("SessionManager started (timeout=%ds)", self._timeout_s)
 
     async def _cleanup_stale_on_startup(self) -> None:
-        """End sessions left active/paused from a previous server run.
+        """Pause or end sessions left active/paused from a previous server run.
 
-        Any session with status 'active' or 'paused' whose last_active_at
-        is older than 30 minutes is presumed orphaned and set to 'ended'.
+        US-A09: Sessions that are still within the timeout window are paused
+        (not ended) so that reconnecting devices can resume them.  Only
+        sessions whose last_active_at is older than the timeout are ended.
+        This preserves conversation context across Dragon crashes/restarts.
         """
+        # End truly stale sessions (inactive longer than timeout)
         stale = await self._db.get_stale_sessions(self._timeout_s)
         for session in stale:
             await self._db.update_session_status(session["id"], "ended")
@@ -59,8 +62,23 @@ class SessionManager:
             logger.info(
                 "Startup cleanup: ended %d stale session(s)", len(stale)
             )
-        else:
-            logger.debug("Startup cleanup: no stale sessions found")
+
+        # Pause any remaining active sessions (recent, but server just restarted
+        # so no WebSocket is connected — they should be paused, not active).
+        # Paused sessions can be resumed when the device reconnects.
+        recent_active = await self._db.list_sessions(status="active", limit=100)
+        paused_count = 0
+        for session in recent_active:
+            await self._db.update_session_status(session["id"], "paused")
+            paused_count += 1
+        if paused_count:
+            logger.info(
+                "Startup cleanup: paused %d recent active session(s) for potential resume",
+                paused_count,
+            )
+
+        if not stale and not paused_count:
+            logger.debug("Startup cleanup: no orphaned sessions found")
 
     async def stop(self) -> None:
         """Stop the background cleanup task."""

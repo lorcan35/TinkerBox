@@ -124,6 +124,11 @@ class ToolsConfig:
 
 
 @dataclass
+class DatabaseConfig:
+    message_retention_days: int = 30  # Purge messages older than this (0 = never purge)
+
+
+@dataclass
 class MemoryConfig:
     enabled: bool = True
     embed_model: str = "nomic-embed-text"
@@ -143,6 +148,7 @@ class VoiceConfig:
     audio: AudioConfig = field(default_factory=AudioConfig)
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
+    database: DatabaseConfig = field(default_factory=DatabaseConfig)
 
     def validate(self) -> list[str]:
         """Validate configuration values.
@@ -260,7 +266,7 @@ def load_config(path: Optional[str] = None) -> VoiceConfig:
         )
 
     # Ensure all sections exist
-    for section in ("server", "stt", "tts", "llm", "audio", "tools", "memory"):
+    for section in ("server", "stt", "tts", "llm", "audio", "tools", "memory", "database"):
         raw.setdefault(section, {})
 
     # Apply environment variable overrides
@@ -275,6 +281,7 @@ def load_config(path: Optional[str] = None) -> VoiceConfig:
         audio=_dict_to_dataclass(AudioConfig, raw["audio"]),
         tools=_dict_to_dataclass(ToolsConfig, raw["tools"]),
         memory=_dict_to_dataclass(MemoryConfig, raw["memory"]),
+        database=_dict_to_dataclass(DatabaseConfig, raw["database"]),
     )
 
     # Remember original local LLM backend for fallback from cloud mode

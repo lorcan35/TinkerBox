@@ -1,0 +1,25 @@
+# TinkerClaw ngrok tunnels — exposes Dashboard, Voice, and Gateway externally
+#
+# Starts AFTER tinkerclaw-voice and tinkerclaw-gateway so that the tunnelled
+# ports are actually listening before ngrok connects. Without this ordering,
+# ngrok advertises URLs that return 502 until the backend services finish
+# starting, which confuses external health checks and mobile clients.
+#
+# Deploy:
+#   scp systemd/tinkerclaw-ngrok.service radxa@192.168.1.91:/tmp/
+#   ssh radxa@192.168.1.91 "sudo cp /tmp/tinkerclaw-ngrok.service /etc/systemd/system/ && sudo systemctl daemon-reload"
+
+[Unit]
+Description=TinkerClaw ngrok Tunnels (Dashboard + Voice + Gateway)
+After=network-online.target tinkerclaw-voice.service tinkerclaw-gateway.service
+Wants=network-online.target tinkerclaw-voice.service tinkerclaw-gateway.service
+
+[Service]
+Type=simple
+User=radxa
+ExecStart=/usr/local/bin/ngrok start --all
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

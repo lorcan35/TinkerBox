@@ -1,0 +1,24 @@
+# Ollama LLM inference service for Dragon Q6A
+#
+# Starts first — no dependencies. Other services depend on this for
+# embeddings (nomic-embed-text) and local LLM inference (qwen3:1.7b).
+#
+# Deploy:
+#   scp systemd/ollama.service radxa@192.168.1.91:/tmp/
+#   ssh radxa@192.168.1.91 "sudo cp /tmp/ollama.service /etc/systemd/system/ && sudo systemctl daemon-reload"
+
+[Unit]
+Description=Ollama Service
+After=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/ollama serve
+User=ollama
+Group=ollama
+Restart=always
+RestartSec=3
+Environment="PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin"
+EnvironmentFile=-/etc/default/ollama
+
+[Install]
+WantedBy=default.target

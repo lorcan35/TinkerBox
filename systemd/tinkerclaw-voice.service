@@ -1,0 +1,32 @@
+# TinkerClaw Voice Server — STT/LLM/TTS pipeline on Dragon
+#
+# Starts AFTER both ollama.service (embeddings for memory/RAG) and
+# tinkerclaw-gateway.service (voice mode 3 delegates LLM to gateway).
+# If either dependency is not yet ready, the voice server will start
+# but gracefully degrade (local-only mode, no TinkerClaw mode).
+#
+# Deploy:
+#   scp systemd/tinkerclaw-voice.service radxa@192.168.1.91:/tmp/
+#   ssh radxa@192.168.1.91 "sudo cp /tmp/tinkerclaw-voice.service /etc/systemd/system/ && sudo systemctl daemon-reload"
+
+[Unit]
+Description=TinkerClaw Voice Server (STT/LLM/TTS)
+After=network.target ollama.service tinkerclaw-gateway.service
+Wants=network.target ollama.service tinkerclaw-gateway.service
+
+[Service]
+Type=simple
+User=radxa
+WorkingDirectory=/home/radxa
+ExecStart=/usr/bin/python3 -u -m dragon_voice --log-level INFO
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/home/radxa/.env
+Environment=PYTHONPATH=/home/radxa
+Environment=LD_LIBRARY_PATH=/home/radxa/qairt/models/llama32-1b:/home/radxa/qairt/lib
+Environment=ADSP_LIBRARY_PATH=/home/radxa/qairt/models/llama32-1b:/home/radxa/qairt/lib/hexagon-v73
+Environment=PATH=/home/radxa/qairt/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=multi-user.target

@@ -639,7 +639,15 @@ class VoicePipeline:
         """Hot-swap backends based on new configuration.
 
         Only reinitializes backends that have actually changed.
+        Cancels any in-flight processing first (US-P12) to avoid
+        orphaned Piper subprocesses and partial audio.
         """
+        # Cancel in-flight processing before swapping (US-P12)
+        if self._processing or (self._process_task and not self._process_task.done()):
+            logger.info("Cancelling in-flight processing before backend swap")
+            await self.cancel()
+            await asyncio.sleep(0.1)  # let pending async tasks clean up
+
         old_config = self._config
         self._config = config
 

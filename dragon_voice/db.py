@@ -454,6 +454,56 @@ class Database:
         row = await cursor.fetchone()
         return dict(row) if row else None
 
+    async def purge_old_messages(self, days: int = 30) -> dict[str, int]:
+        """Purge messages and orphaned events older than `days`.
+
+        Skips messages belonging to active or paused sessions to avoid
+        deleting context from sessions still in use.
+
+        Returns dict with counts: {"messages": N, "events": M}.
+        """
+        if days <= 0:
+            logger.info("Message purge disabled (days=%d)", days)
+            return {"messages": 0, "events": 0}
+
+        cutoff = time.time() - (days * 86400)
+
+        # Delete old messages, but only from ended sessions (or sessions
+        # with no matching row, i.e. orphaned messages)
+        cursor = await self.conn.execute(
+            """
+            DELETE FROM messages
+            WHERE created_at < ?
+              AND session_id NOT IN (
+                  SELECT id FROM sessions WHERE status IN ('active', 'paused')
+              )
+            """,
+            (cutoff,),
+        )
+        msg_count = cursor.rowcount
+        await self.conn.commit()
+
+        # Delete orphaned events older than the cutoff
+        cursor = await self.conn.execute(
+            """
+            DELETE FROM events
+            WHERE created_at < ?
+              AND (session_id IS NULL
+                   OR session_id NOT IN (
+                       SELECT id FROM sessions WHERE status IN ('active', 'paused')
+                   ))
+            """,
+            (cutoff,),
+        )
+        evt_count = cursor.rowcount
+        await self.conn.commit()
+
+        logger.info(
+            "Purged %d messages and %d events older than %d days",
+            msg_count, evt_count, days,
+        )
+        return {"messages": msg_count, "events": evt_count}
+
     async def delete_messages(self, session_id: str) -> int:
         """Delete all messages for a session. Returns count deleted."""
         count = await self.count_messages(session_id)

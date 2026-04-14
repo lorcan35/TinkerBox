@@ -100,6 +100,10 @@ class LLMConfig:
     )
     max_tokens: int = 128
     temperature: float = 0.7
+    # TinkerClaw agent gateway (optional sidecar on localhost:18789)
+    tinkerclaw_url: str = "http://localhost:18789"
+    tinkerclaw_token: str = ""
+    tinkerclaw_model: str = "ollama/qwen3:1.7b"
 
 
 @dataclass

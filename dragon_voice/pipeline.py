@@ -404,8 +404,16 @@ class VoicePipeline:
             sentence_buffer = ""
             full_response = ""
 
-            # Choose LLM path: conversation engine (multi-turn) or direct (legacy)
-            if self._conversation_engine and self._session_id:
+            # Choose LLM path
+            if self._config.llm.backend == "tinkerclaw":
+                # TinkerClaw mode: bypass ConversationEngine entirely.
+                # Send only the latest user message — TinkerClaw owns context.
+                if hasattr(self._llm, 'set_session_key') and self._session_id:
+                    self._llm.set_session_key(self._session_id)
+                llm_stream = self._llm.generate_stream_with_messages([
+                    {"role": "user", "content": transcript}
+                ])
+            elif self._conversation_engine and self._session_id:
                 # Multi-turn: routes through ConversationEngine which stores
                 # messages in DB and builds context from history
                 audio_duration = len(audio_data) / (self._config.audio.input_sample_rate * 2)

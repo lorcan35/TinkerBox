@@ -622,27 +622,40 @@ class VoiceServer:
                             voice_mode = 2 if cloud_mode else 0
 
                         if voice_mode is not None:
-                            # STT+TTS: local for mode 0, cloud for mode 1+2
+                            # STT+TTS: local for mode 0, cloud for mode 1+2+3
                             if voice_mode == 0:
                                 stt_be, tts_be = "moonshine", "piper"
+                            elif voice_mode == 3:
+                                # TinkerClaw mode: default local STT/TTS
+                                # "cloud" suffix in llm_model → use OpenRouter STT/TTS
+                                if llm_model and "cloud" in llm_model.lower():
+                                    stt_be, tts_be = "openrouter", "openrouter"
+                                else:
+                                    stt_be, tts_be = "moonshine", "piper"
                             else:
                                 stt_be, tts_be = "openrouter", "openrouter"
 
-                            # LLM: cloud only for mode 2, local for 0+1
-                            if voice_mode == 2:
+                            # LLM backend selection
+                            if voice_mode == 3:
+                                # TinkerClaw mode — gateway handles everything
+                                llm_be = "tinkerclaw"
+                                if llm_model:
+                                    self._config.llm.tinkerclaw_model = llm_model
+                            elif voice_mode == 2:
                                 llm_be = "openrouter"
                                 if llm_model:
                                     self._config.llm.openrouter_model = llm_model
                             else:
                                 llm_be = self._config.llm.local_backend or "ollama"
-                                # Local model picker: user can select qwen3:0.6b/1.7b/4b etc.
-                                # Only apply if it looks like an Ollama model (no '/' = not a cloud model ID)
                                 if llm_model and llm_be == "ollama" and "/" not in llm_model:
                                     self._config.llm.ollama_model = llm_model
                                     logger.info("Local model switched to: %s", llm_model)
 
                             # Apply mode-aware system prompt and max_tokens
-                            if voice_mode == 0:
+                            # Mode 3 (TinkerClaw): skip — TinkerClaw owns personality
+                            if voice_mode == 3:
+                                pass  # TinkerClaw manages its own prompts and limits
+                            elif voice_mode == 0:
                                 self._config.llm.system_prompt = SYSTEM_PROMPT_LOCAL
                                 self._config.llm.max_tokens = MAX_TOKENS_LOCAL
                             elif voice_mode == 1:
@@ -695,6 +708,11 @@ class VoiceServer:
                             if pipeline:
                                 try:
                                     await pipeline.swap_backends(self._config)
+                                    # Inject session key for TinkerClaw conversation continuity
+                                    if llm_be == "tinkerclaw" and hasattr(pipeline, '_llm'):
+                                        if hasattr(pipeline._llm, 'set_session_key'):
+                                            pipeline._llm.set_session_key(
+                                                conn_state.get("session_id", ""))
                                 except Exception as e:
                                     logger.exception("Backend swap failed")
                                     if not ws.closed:

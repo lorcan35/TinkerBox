@@ -7,7 +7,6 @@ Uses the edge-tts package for async streaming synthesis.
 import asyncio
 import io
 import logging
-import struct
 
 import numpy as np
 

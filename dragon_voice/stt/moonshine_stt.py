@@ -6,8 +6,6 @@ on ARM. Uses the ONNX-based C++ runtime with NEON acceleration.
 
 import asyncio
 import logging
-import struct
-from typing import Optional
 
 import numpy as np
 

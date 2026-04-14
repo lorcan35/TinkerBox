@@ -520,8 +520,8 @@ class VoiceServer:
                         device_id=conn_state.get("device_id"),
                         data={k: v for k, v in event.items() if k != "type"},
                     )
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.debug("Callback error: %s", e)
 
         try:
             async for msg in ws:

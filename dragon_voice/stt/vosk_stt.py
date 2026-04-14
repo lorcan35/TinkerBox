@@ -9,8 +9,6 @@ import json
 import logging
 from pathlib import Path
 
-import numpy as np
-
 from dragon_voice.config import STTConfig
 from dragon_voice.stt.base import STTBackend
 

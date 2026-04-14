@@ -243,8 +243,8 @@ class ConversationEngine:
                     if on_tool_call:
                         try:
                             await on_tool_call(tool_call)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug("Callback error: %s", e)
 
                     # Execute the tool
                     result = await self._tool_registry.execute(tool_call["tool"], tool_call["args"])
@@ -252,8 +252,8 @@ class ConversationEngine:
                     if on_tool_result:
                         try:
                             await on_tool_result(result)
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug("Callback error: %s", e)
 
                     # Store tool interaction as messages
                     import json as _json

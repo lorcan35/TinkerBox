@@ -107,6 +107,7 @@ When `voice_mode=3` is active, Dragon delegates all intelligence to the TinkerCl
 - **Fallback:** If the gateway is down (connection refused on 18789), Dragon sends an error to Tab5 (same pattern as cloud fallback — auto-revert to Local mode).
 - **Config:** `~/.tinkerclaw/tinkerclaw.json`
 - **Session continuity:** Dragon's `session_id` is passed as the `user` field in TinkerClaw requests, so TinkerClaw can maintain per-session context.
+- **Text bypass:** Text input via WebSocket in mode 3 bypasses ConversationEngine and routes directly through tinkerclaw_llm.py
 - **New files:** `dragon_voice/llm/tinkerclaw_llm.py` — LLM backend adapter that forwards requests to the TinkerClaw gateway.
 
 ## OTA Firmware Endpoints
@@ -204,7 +205,7 @@ See `schema.sql` — 6 tables: devices, sessions, messages, notes, events, confi
 - Paginate through old sessions via REST API
 - Dashboard shows live conversation via WebSocket events
 
-## API-First Architecture (50 REST endpoints + 1 WebSocket)
+## API-First Architecture (44 REST endpoints + 1 WebSocket)
 
 Dragon is an API-first server. Every capability is accessible via REST so any hardware client can use it.
 

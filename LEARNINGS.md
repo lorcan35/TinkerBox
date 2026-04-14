@@ -391,3 +391,14 @@ sequentially across the whole file (don't restart per section).
 - **Root Cause:** The `scp -r dragon_voice/` command copies the entire directory including `config.yaml`. The source repo's `config.yaml` had `backend: openrouter` as the default LLM backend, which overwrote Dragon's local config that had `backend: ollama` (the correct default for the ARM64 hardware).
 - **Fix:** Changed the default `backend` in the source `config.yaml` to `ollama` so that even if the file is overwritten during deploy, Dragon gets a safe default that works without cloud API keys.
 - **Prevention:** Default config values in the repo should always be the safest/most-compatible option (local backends, no API keys required). Consider adding `config.yaml` to a deploy exclude list, or use a `config.local.yaml` overlay pattern where local overrides are never touched by deploy.
+
+---
+
+## TinkerClaw Sidecar Integration (2026-04-14)
+
+### 50. TinkerClaw sidecar — voice mode 3 bypasses Dragon intelligence
+- **Date:** 2026-04-14
+- **Symptom:** N/A (new feature — voice mode 3 added).
+- **Root Cause:** Dragon's local LLM (1B on NPU) and cloud LLM (OpenRouter) have different tradeoffs — local is fast but limited, cloud is capable but adds latency and cost. TinkerClaw provides a third option: a full agent runner (with its own tools, memory, and skills) running as a sidecar on localhost.
+- **Fix:** Added `tinkerclaw` LLM backend (`dragon_voice/llm/tinkerclaw_llm.py`). In voice mode 3, Dragon handles STT and TTS only — the transcript is forwarded to TinkerClaw gateway on port 18789 (localhost). ConversationEngine, ToolRegistry, and MemoryService are all bypassed; TinkerClaw owns the intelligence layer. Session continuity is maintained by passing Dragon's `session_id` as the `user` field. If the gateway is unreachable, Dragon sends an error to Tab5 and auto-reverts to Local mode (same fallback pattern as cloud modes).
+- **Prevention:** The TinkerClaw backend must be treated as an optional dependency — Dragon must start and function normally without it. Never import tinkerclaw_llm.py at module level. The gateway health check (connect to 18789) must have a short timeout (2s) to avoid blocking the voice pipeline. Config lives in `~/.tinkerclaw/tinkerclaw.json`, separate from Dragon's `config.yaml`.

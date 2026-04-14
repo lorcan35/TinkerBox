@@ -49,6 +49,7 @@ Before writing any fix, CHECK LEARNINGS.md first. Your bug might already be docu
 | SearXNG | 8888 | searxng | Self-hosted metasearch engine (web_search tool backend) |
 | Ollama | 11434 | ollama | Local LLM inference (CPU, slow) |
 | NPU Genie | — | (via voice pipeline) | Llama 3.2 1B on QCS6490 HTP (~8 tok/s) |
+| TinkerClaw GW | 18789 | tinkerclaw-gateway | TinkerClaw sidecar agent runner (localhost only) |
 | ngrok | 443 (ext) | tinkerclaw-ngrok | tinkerbox.ngrok.dev → 192.168.1.91:3500 (dashboard, not voice) |
 
 ## Deploy
@@ -75,16 +76,29 @@ Tab5 sends `{"type":"config_update","voice_mode":0|1|2,"llm_model":"..."}`. Drag
 | **Local** | 0 | Moonshine | Local (npu_genie/ollama) | Piper (22050Hz) |
 | **Hybrid** | 1 | OpenRouter gpt-audio-mini | Local (unchanged) | OpenRouter gpt-audio-mini (24kHz) |
 | **Full Cloud** | 2 | OpenRouter gpt-audio-mini | OpenRouter (user-selected model) | OpenRouter gpt-audio-mini (24kHz) |
+| **TinkerClaw** | 3 | Moonshine (or OpenRouter) | TinkerClaw Gateway (agent runner) | Piper (or OpenRouter) |
 
 - **LLM Model Selection:** `llm_model` field selects cloud model: `anthropic/claude-3-haiku`, `anthropic/claude-sonnet-4-20250514`, `openai/gpt-4o-mini`. Stored in `LLMConfig.openrouter_model`.
 - **API Key:** Auto-propagated from `llm.openrouter_api_key` to `stt.openrouter_api_key` and `tts.openrouter_api_key`. Validated before swap — rejects with error if empty.
 - **Auto-Fallback:** If cloud STT/TTS fails (timeout, API error), pipeline auto-falls back to local (Moonshine/Piper) for that request AND sends `config_update` with `error` field to Tab5 → auto-reverts to Local mode.
 - **Backward compat:** Old `cloud_mode` boolean still accepted (maps to voice_mode 0 or 2).
 - **Config fields:** `LLMConfig.local_backend` (remembers original for fallback), `LLMConfig.openrouter_model` (user-selectable).
-- **Valid backends:** STT: `moonshine`, `whisper_cpp`, `vosk`, `openrouter`. TTS: `piper`, `kokoro`, `edge_tts`, `openrouter`. LLM: `ollama`, `npu_genie`, `openrouter`, `lmstudio`.
+- **Valid backends:** STT: `moonshine`, `whisper_cpp`, `vosk`, `openrouter`. TTS: `piper`, `kokoro`, `edge_tts`, `openrouter`. LLM: `ollama`, `npu_genie`, `openrouter`, `lmstudio`, `tinkerclaw`.
 - **Mode-aware system prompts:** Each voice mode sets a different system prompt length — Local (concise, 128 tokens), Hybrid (medium, 256 tokens), Cloud (rich, 512 tokens). This keeps local model context tight while giving cloud models room for nuanced instructions.
 - **Session system_prompt updated on mode switch:** When voice_mode changes, the session's `system_prompt` is updated in the DB immediately so the conversation engine picks it up on the next turn.
 - **Pipeline init resets to local defaults on reconnect:** When a device reconnects, the pipeline is re-initialized with local defaults (voice_mode 0) regardless of the previous session's mode. The client must re-send `config_update` to restore cloud mode.
+
+## TinkerClaw Integration (Optional Sidecar)
+
+When `voice_mode=3` is active, Dragon delegates all intelligence to the TinkerClaw gateway running on the same machine. Dragon becomes an audio pipe only — STT captures speech, the transcript is forwarded to TinkerClaw, and the response is spoken back via TTS.
+
+- **Port:** 18789, localhost only
+- **Service:** `tinkerclaw-gateway.service`
+- **Dragon role in mode 3:** Audio pipe only — STT and TTS still run on Dragon, but `ConversationEngine`, `ToolRegistry`, and `MemoryService` are all bypassed. The LLM call goes to TinkerClaw instead of a local/cloud backend.
+- **Fallback:** If the gateway is down (connection refused on 18789), Dragon sends an error to Tab5 (same pattern as cloud fallback — auto-revert to Local mode).
+- **Config:** `~/.tinkerclaw/tinkerclaw.json`
+- **Session continuity:** Dragon's `session_id` is passed as the `user` field in TinkerClaw requests, so TinkerClaw can maintain per-session context.
+- **New files:** `dragon_voice/llm/tinkerclaw_llm.py` — LLM backend adapter that forwards requests to the TinkerClaw gateway.
 
 ## OTA Firmware Endpoints
 Dragon serves firmware updates for Tab5 via two endpoints:

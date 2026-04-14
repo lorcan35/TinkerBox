@@ -10,6 +10,7 @@ refs #16, #17, #18
 
 import asyncio
 import copy
+import gc
 import json
 import logging
 import time
@@ -52,6 +53,11 @@ class VoiceServer:
         self._active_connections: dict[str, dict] = {}
         self._max_connections = 10
         self._purge_task: Optional[asyncio.Task] = None
+        self._memory_monitor_task: Optional[asyncio.Task] = None
+
+        # Memory thresholds (MB) — Dragon has 8GB total, Ollama ~1.5GB, TinkerClaw ~300MB
+        self._mem_warn_mb = 2048   # Force GC above this
+        self._mem_crit_mb = 3072   # Restart pipeline above this (after GC)
 
         # Backend names for status page
         self._stt_name = config.stt.backend
@@ -302,6 +308,12 @@ class VoiceServer:
                 self._periodic_purge(retention_days)
             )
 
+        # Start periodic memory monitor (A04)
+        self._memory_monitor_task = asyncio.create_task(self._memory_monitor())
+        rss = self._get_rss_mb()
+        logger.info("Memory monitor started (RSS=%.0f MB, warn=%d MB, crit=%d MB)",
+                     rss, self._mem_warn_mb, self._mem_crit_mb)
+
         logger.info("Foundation modules initialized")
 
     async def _periodic_purge(self, days: int) -> None:
@@ -319,11 +331,93 @@ class VoiceServer:
             except Exception as e:
                 logger.warning("Periodic purge failed: %s", e)
 
+    @staticmethod
+    def _get_rss_mb() -> float:
+        """Read current process RSS from /proc/self/status (no psutil dependency)."""
+        try:
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS"):
+                        return int(line.split()[1]) / 1024.0  # kB -> MB
+        except Exception:
+            pass
+        return 0.0
+
+    async def _memory_monitor(self) -> None:
+        """Periodic memory check every 5 minutes (A04).
+
+        - Log RSS at INFO level
+        - If RSS > warn threshold: force gc.collect() and log WARNING
+        - If RSS > critical threshold after GC: gracefully restart all pipelines
+        """
+        while True:
+            await asyncio.sleep(300)  # 5 minutes
+            rss = self._get_rss_mb()
+            if rss <= 0:
+                continue
+
+            active = len(self._active_connections)
+            logger.info("Memory monitor: RSS=%.0f MB, connections=%d", rss, active)
+
+            if rss > self._mem_warn_mb:
+                logger.warning(
+                    "Memory monitor: RSS %.0f MB exceeds warning threshold (%d MB) — forcing GC",
+                    rss, self._mem_warn_mb,
+                )
+                collected = gc.collect()
+                rss_after = self._get_rss_mb()
+                logger.warning(
+                    "Memory monitor: GC collected %d objects, RSS now %.0f MB",
+                    collected, rss_after,
+                )
+
+                if rss_after > self._mem_crit_mb:
+                    logger.error(
+                        "Memory monitor: RSS %.0f MB exceeds critical threshold (%d MB) "
+                        "after GC — restarting all pipelines",
+                        rss_after, self._mem_crit_mb,
+                    )
+                    # Gracefully restart every active pipeline
+                    for ws_id, conn in list(self._active_connections.items()):
+                        pipeline = conn.get("pipeline")
+                        if pipeline:
+                            try:
+                                await pipeline.shutdown()
+                                conn["pipeline"] = None
+                                logger.info("Memory monitor: shut down pipeline for %s", ws_id)
+                            except Exception as e:
+                                logger.warning("Memory monitor: pipeline shutdown failed for %s: %s", ws_id, e)
+
+                    # Force another GC after pipeline shutdown
+                    gc.collect()
+                    rss_final = self._get_rss_mb()
+                    logger.warning("Memory monitor: post-restart RSS %.0f MB", rss_final)
+
+                    # Re-initialize pipelines for registered connections
+                    for ws_id, conn in list(self._active_connections.items()):
+                        if conn.get("registered") and conn.get("pipeline") is None:
+                            cfg = conn.get("config", self._config)
+                            try:
+                                pipeline = VoicePipeline(
+                                    cfg,
+                                    conn.get("_on_audio"),
+                                    conn.get("_on_event"),
+                                    conversation_engine=self._conversation,
+                                    session_id=conn.get("session_id", ""),
+                                )
+                                await pipeline.initialize()
+                                conn["pipeline"] = pipeline
+                                logger.info("Memory monitor: re-initialized pipeline for %s", ws_id)
+                            except Exception as e:
+                                logger.error("Memory monitor: pipeline re-init failed for %s: %s", ws_id, e)
+
     async def _on_shutdown(self, app: web.Application) -> None:
         """Clean up all active sessions and foundation modules on server shutdown."""
         logger.info("Server shutting down — closing %d connections", len(self._active_connections))
 
-        # Cancel periodic purge task
+        # Cancel periodic tasks
+        if self._memory_monitor_task and not self._memory_monitor_task.done():
+            self._memory_monitor_task.cancel()
         if self._purge_task and not self._purge_task.done():
             self._purge_task.cancel()
 
@@ -605,6 +699,8 @@ class VoiceServer:
             "registered": False,
             "mode": "ask",  # "ask" or "dictate"
             "config": conn_config,  # per-connection config (deep copy of server default)
+            "_on_audio": None,   # stored for pipeline re-init (A04)
+            "_on_event": None,
         }
         self._active_connections[ws_id] = conn_state
 
@@ -633,6 +729,10 @@ class VoiceServer:
                     )
                 except Exception as e:
                     logger.debug("Callback error: %s", e)
+
+        # Store callback refs for pipeline re-init (A04 memory monitor)
+        conn_state["_on_audio"] = on_audio
+        conn_state["_on_event"] = on_event
 
         try:
             async for msg in ws:
@@ -984,6 +1084,39 @@ class VoiceServer:
 
         ws_id = conn_state["ws_id"]
         logger.info("Registering device %s (hw=%s) on connection %s", device_id, hardware_id, ws_id)
+
+        # P13: Evict stale connections for the same device_id.
+        # Race condition: new connection arrives before aiohttp detects old TCP close.
+        # The old keepalive task is still running, and its pipeline isn't shut down yet.
+        for old_ws_id, old_conn in list(self._active_connections.items()):
+            if old_ws_id == ws_id:
+                continue  # Skip ourselves
+            if old_conn.get("device_id") == device_id and old_conn.get("registered"):
+                logger.warning(
+                    "P13: Device %s already has connection %s — evicting stale connection",
+                    device_id, old_ws_id,
+                )
+                # Shut down the old pipeline
+                old_pipeline = old_conn.get("pipeline")
+                if old_pipeline:
+                    try:
+                        await old_pipeline.shutdown()
+                    except Exception as e:
+                        logger.warning("P13: old pipeline shutdown failed for %s: %s", old_ws_id, e)
+                    old_conn["pipeline"] = None
+
+                # Pause the old session (not end — it might be resumed by the new connection)
+                old_sid = old_conn.get("session_id")
+                if old_sid and self._session_mgr:
+                    await self._session_mgr.pause_session(old_sid)
+
+                # Mark as unregistered so _handle_disconnect won't mark device offline
+                old_conn["registered"] = False
+
+                # Remove from active connections — _handle_disconnect will be a no-op
+                self._active_connections.pop(old_ws_id, None)
+
+                logger.info("P13: Evicted stale connection %s for device %s", old_ws_id, device_id)
 
         # Upsert device in DB
         await self._db.upsert_device(

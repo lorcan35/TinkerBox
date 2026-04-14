@@ -430,3 +430,31 @@ sequentially across the whole file (don't restart per section).
 - **Root Cause:** Three gaps: (1) `feed_audio()` had no guard against backend swaps -- it continued appending PCM data during the swap window, creating stale audio for the new backend. (2) `swap_backends()` did not clear audio buffers after cancelling in-flight processing -- audio arriving between cancel() and swap completion accumulated. (3) The `config_update` handler did not acquire `conn_lock`, so it could race with `stop`/`text` handlers that also mutate pipeline state.
 - **Fix:** (1) Added `_swapping` flag to pipeline -- `feed_audio()` drops all incoming audio while True. (2) `swap_backends()` now clears `_audio_buffer`, `_segment_buffer`, and `_is_speaking` after cancel and before initializing new backends, wrapped in try/finally to always clear `_swapping`. (3) The pipeline swap section of `config_update` in server.py now acquires `conn_lock` to serialize with stop/text handlers. Redundant cancel in server.py removed since `swap_backends()` handles it internally.
 - **Prevention:** Any operation that tears down or replaces pipeline backends must set `_swapping=True` first and clear audio buffers. All pipeline-mutating WS commands must acquire `conn_lock`.
+
+### 55. TinkerClaw SSE truncation silently sends partial response to TTS (A07)
+- **Date:** 2026-04-14
+- **Symptom:** When TinkerClaw crashes mid-SSE-stream (e.g., sqlite-vec segfault), Dragon's `async for line in resp.content` silently returns empty on connection close. Dragon treats the partial 800-token fragment as a complete response and sends it to TTS, which reads a mid-sentence fragment aloud.
+- **Root Cause:** The SSE parser had no way to distinguish between a completed stream (which ends with `data: [DONE]`) and a truncated stream (which just closes the connection). Both caused the `async for` loop to exit normally.
+- **Fix:** Added `saw_done` and `token_count` tracking in `generate_stream_with_messages()`. After the loop exits, if `[DONE]` was never received: (1) if tokens were received, append " ... (response interrupted)" and log a warning; (2) if zero tokens were received, yield the connection error message. Also raised `sock_read` timeout from 30s to 90s and `total` from 120s to 180s to accommodate TinkerClaw tool execution gaps (see #56).
+- **Prevention:** Any SSE parser must track whether the stream terminated cleanly (`[DONE]`) vs. was interrupted. Never assume loop exit = complete response.
+
+### 56. TinkerClaw tool-calling SSE gap causes timeout (P05)
+- **Date:** 2026-04-14
+- **Symptom:** When TinkerClaw's MiniMax M2.5 calls a tool (e.g., web_search), there is a 10-30s gap in the SSE stream while the tool executes. Dragon's `sock_read=30s` timeout could fire during this gap, killing the stream.
+- **Root Cause:** TinkerClaw sends a SINGLE SSE stream for the entire agent run. `agentCommandFromIngress()` in `openai-http.ts` runs the full agent loop (tool calls + final response) as one async operation. The SSE event listener streams `assistant` deltas, but during tool execution no content deltas are emitted — only a gap. There is only ONE `[DONE]` at the very end (after lifecycle.end fires). The original fear of "intermediate [DONE] after tool_call" was unfounded.
+- **Fix:** Raised `sock_read` from 30s to 90s and `total` from 120s to 180s. No parser changes needed — Dragon already correctly skips empty-content deltas (tool_call chunks have no `content` field) and picks up the final assistant text when it arrives. The `server.py` _handle_text keepalive task (10s ws.ping) already keeps the WebSocket alive during the gap.
+- **Prevention:** When integrating with agent systems that execute tools server-side, SSE read timeouts must be set generously (>= max tool execution time). Document the expected SSE flow for each integration point.
+
+### 57. Dragon memory growth over 24h causes OOM kill (A04)
+- **Date:** 2026-04-14
+- **Symptom:** After 24h of continuous voice conversations, Dragon's RSS grows from Moonshine/ONNX inference buffers, aiohttp connection pools, and Python GC not collecting circular references. Eventually the OOM killer fires.
+- **Root Cause:** No memory monitoring or proactive cleanup. Python's GC doesn't always collect circular references promptly, and ONNX Runtime inference buffers accumulate.
+- **Fix:** Added `_memory_monitor` periodic task (every 5 min) in `server.py`. Reads RSS from `/proc/self/status` (no psutil dependency). Logs RSS at INFO level. At 2GB warning threshold: forces `gc.collect()`. At 3GB critical threshold (after GC): gracefully shuts down and re-initializes all active pipelines, freeing Moonshine/ONNX buffers and connection pool memory.
+- **Prevention:** Always monitor RSS in long-running inference services. Set memory thresholds well below the OOM kill point (Dragon has 8GB total, Ollama uses ~1.5GB, TinkerClaw ~300MB, so Dragon gets ~2-3GB headroom).
+
+### 58. Stale session and pipeline on Tab5 reconnect (P13)
+- **Date:** 2026-04-14
+- **Symptom:** When Tab5 disconnects and reconnects quickly (WiFi drop, reboot), the old keepalive coroutine may still be running (sending pongs to a dead WS). Two connections exist for the same device_id in the race window before aiohttp detects the old TCP close.
+- **Root Cause:** `_handle_register` did not check for existing connections with the same `device_id`. The old WS cleanup only ran when aiohttp detected the TCP close (via `async for msg in ws` loop ending), but a new connection could arrive before that detection.
+- **Fix:** Added device_id collision check at the start of `_handle_register`. Iterates `_active_connections` for any existing registered connection with the same `device_id`. If found: shuts down the old pipeline, pauses the old session, marks the old connection as unregistered, and removes it from `_active_connections`. The old WS handler's `finally` block still runs but `_handle_disconnect` becomes a no-op (pipeline already None, registered=False).
+- **Prevention:** Any system with reconnecting clients must handle the "new connection before old close detection" race. Always do a device_id lookup on registration, not just rely on transport-level close detection.

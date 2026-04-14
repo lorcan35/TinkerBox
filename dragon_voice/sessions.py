@@ -148,7 +148,11 @@ class SessionManager:
 
     async def pause_session(self, session_id: str) -> None:
         """Pause a session (e.g., on WebSocket disconnect)."""
-        session = await self._db.get_session(session_id)
+        try:
+            session = await self._db.get_session(session_id)
+        except (RuntimeError, Exception):
+            # Database already closed during server shutdown — safe to ignore
+            return
         if not session or session["status"] != "active":
             return
 

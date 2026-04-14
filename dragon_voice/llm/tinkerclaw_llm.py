@@ -36,7 +36,11 @@ class TinkerClawBackend(LLMBackend):
             headers["Authorization"] = f"Bearer {self._token}"
 
         self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=120, sock_read=30),
+            # P05: sock_read raised from 30s to 90s. TinkerClaw tool execution
+            # (web_search, memory recall, etc.) can take 10-30s with no SSE
+            # data flowing. The total=180s covers the full agent run including
+            # multiple tool rounds.
+            timeout=aiohttp.ClientTimeout(total=180, sock_read=90),
             headers=headers,
         )
 
@@ -75,6 +79,22 @@ class TinkerClawBackend(LLMBackend):
 
         Dragon sends only the latest user message. TinkerClaw maintains
         full conversation history internally via the session key.
+
+        Truncation detection (A07): If the SSE stream ends without a
+        [DONE] marker (e.g. TinkerClaw crash, sqlite-vec segfault, network
+        drop), we append a truncation indicator so the user knows the
+        response is incomplete rather than silently sending a mid-sentence
+        fragment to TTS.
+
+        Tool-calling note (P05): TinkerClaw sends a SINGLE SSE stream for
+        the entire agent run. Tool calls happen internally — the agent
+        runner executes tools and then streams the final assistant text,
+        all within one HTTP response. There is only one [DONE] at the very
+        end. During tool execution there may be a long gap (10-30s) with
+        no content deltas; the sock_read timeout (set below) must be long
+        enough to cover this. Dragon's parser already handles this correctly:
+        tool_call deltas have empty "content" and are silently skipped,
+        then the final text deltas are yielded normally.
         """
         if not self._session or self._session.closed:
             await self.initialize()
@@ -98,6 +118,9 @@ class TinkerClawBackend(LLMBackend):
                     yield "Sorry, my agent system returned an error. Please try again."
                     return
 
+                saw_done = False
+                token_count = 0
+
                 async for line in resp.content:
                     line = line.decode("utf-8", errors="replace").strip()
                     if not line or not line.startswith("data: "):
@@ -105,6 +128,7 @@ class TinkerClawBackend(LLMBackend):
 
                     data_str = line[6:]
                     if data_str == "[DONE]":
+                        saw_done = True
                         break
 
                     try:
@@ -119,10 +143,27 @@ class TinkerClawBackend(LLMBackend):
                     delta = choices[0].get("delta", {})
                     token = delta.get("content", "")
                     if token:
+                        token_count += 1
                         yield token
 
+                # A07: Truncation detection — stream ended without [DONE]
+                if not saw_done:
+                    if token_count > 0:
+                        logger.warning(
+                            "SSE stream ended without [DONE] after %d tokens "
+                            "— response may be truncated (TinkerClaw crash?)",
+                            token_count,
+                        )
+                        yield " ... (response interrupted)"
+                    else:
+                        logger.warning(
+                            "SSE stream ended without [DONE] and 0 tokens "
+                            "— connection may have dropped before any response"
+                        )
+                        yield "I'm having trouble connecting to my agent system. Please try again in a moment."
+
         except asyncio.TimeoutError:
-            logger.error("TinkerClaw SSE stream timed out (sock_read=30s)")
+            logger.error("TinkerClaw SSE stream timed out (sock_read=90s)")
             yield "Response timed out, please try again."
         except aiohttp.ClientError as e:
             logger.error("TinkerClaw request failed: %s", e)

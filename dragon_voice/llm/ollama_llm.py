@@ -232,8 +232,26 @@ class OllamaBackend(LLMBackend):
             self._conversation = self._conversation[-max_messages:]
 
     async def shutdown(self) -> None:
+        """Shut down the Ollama backend, closing the aiohttp session.
+
+        Uses a 5-second timeout to prevent hanging when Ollama is mid-inference
+        (A14). aiohttp session.close() cancels in-flight requests, but the TCP
+        teardown can stall if the streaming response is blocked in a kernel
+        buffer. After timeout, we force-close the underlying connector.
+        """
         if self._session and not self._session.closed:
-            await self._session.close()
+            try:
+                await asyncio.wait_for(self._session.close(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Ollama session.close() timed out after 5s (mid-inference?) "
+                    "— force-closing connector"
+                )
+                # Force-close the underlying connector to drop TCP connections
+                if self._session.connector and not self._session.connector.closed:
+                    self._session.connector.close()
+            except Exception as e:
+                logger.warning("Ollama session close error: %s", e)
         self._session = None
         logger.info("Ollama backend shut down")
 

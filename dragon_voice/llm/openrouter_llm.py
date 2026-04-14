@@ -73,6 +73,10 @@ class OpenRouterBackend(LLMBackend):
 
         If the API returns a context_length_exceeded error (HTTP 400), trims
         oldest non-system messages aggressively and retries once (US-P16).
+
+        If the API returns HTTP 429 (rate limited), parses Retry-After header
+        and waits before retrying once (A20). This handles thundering-herd
+        scenarios where Dragon and TinkerClaw share an OpenRouter API key.
         """
         if self._session is None or self._session.closed:
             await self.initialize()
@@ -95,6 +99,24 @@ class OpenRouterBackend(LLMBackend):
                     logger.error(
                         "OpenRouter error %d: %s", resp.status, error_text[:300]
                     )
+
+                    # Handle 429 rate limit: wait Retry-After and retry once (A20)
+                    if resp.status == 429 and not _retried:
+                        retry_after = resp.headers.get("Retry-After", "")
+                        try:
+                            wait_secs = float(retry_after) if retry_after else 2.0
+                        except (ValueError, TypeError):
+                            wait_secs = 2.0
+                        # Cap the wait to 30s to avoid blocking the user forever
+                        wait_secs = min(wait_secs, 30.0)
+                        logger.warning(
+                            "OpenRouter rate limited (429) — waiting %.1fs before retry",
+                            wait_secs,
+                        )
+                        await asyncio.sleep(wait_secs)
+                        async for token in self._stream_messages(messages, _retried=True):
+                            yield token
+                        return
 
                     # Handle context_length_exceeded: trim and retry once
                     if (resp.status == 400

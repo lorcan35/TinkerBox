@@ -555,21 +555,34 @@ class VoiceServer:
             self._tts_name = new_config.tts.backend
             self._llm_name = new_config.llm.backend
 
-            # Swap backends on all active pipelines
-            swap_tasks = []
-            for ws_id, conn in self._active_connections.items():
+            # Swap backends on all active pipelines.
+            # A06: Acquire each connection's conn_lock before swapping to
+            # prevent races with WS config_update on the same connection.
+            # Two concurrent swap_backends() calls would interleave
+            # shutdown/init of backends, causing use-after-free errors.
+            swap_errors = []
+            for ws_id, conn in list(self._active_connections.items()):
                 pipeline = conn.get("pipeline")
                 if pipeline:
+                    lock = conn.get("conn_lock")
                     logger.info("Swapping backends for connection %s", ws_id)
-                    swap_tasks.append(pipeline.swap_backends(new_config))
+                    try:
+                        if lock:
+                            async with lock:
+                                await pipeline.swap_backends(new_config)
+                        else:
+                            await pipeline.swap_backends(new_config)
+                    except Exception as e:
+                        logger.warning("Backend swap failed for %s: %s", ws_id, e)
+                        swap_errors.append(str(e))
 
-            if swap_tasks:
-                await asyncio.gather(*swap_tasks, return_exceptions=True)
-
+            pipelines_with_swap = sum(
+                1 for c in self._active_connections.values() if c.get("pipeline")
+            )
             return web.json_response(
                 {
                     "status": "ok",
-                    "message": f"Config updated, {len(swap_tasks)} pipelines reloaded",
+                    "message": f"Config updated, {pipelines_with_swap} pipelines reloaded",
                     "backends": {
                         "stt": new_config.stt.backend,
                         "tts": new_config.tts.backend,
@@ -699,6 +712,7 @@ class VoiceServer:
             "registered": False,
             "mode": "ask",  # "ask" or "dictate"
             "config": conn_config,  # per-connection config (deep copy of server default)
+            "conn_lock": conn_lock,  # A06: stored so HTTP config handler can serialize
             "_on_audio": None,   # stored for pipeline re-init (A04)
             "_on_event": None,
         }
@@ -1359,27 +1373,27 @@ class VoiceServer:
         ws_id = conn_state.get("ws_id")
         pipeline = conn_state.get("pipeline")
 
-        # Pause session (not end — it can be resumed)
-        if session_id and self._session_mgr:
-            await self._session_mgr.pause_session(session_id)
+        try:
+            # Pause session (not end — it can be resumed)
+            if session_id and self._session_mgr:
+                await self._session_mgr.pause_session(session_id)
 
-        # Mark device offline ONLY if no other active connection for same device.
-        # Prevents race: old connection disconnect runs after new boot's register,
-        # which would incorrectly mark the device offline.
-        if device_id and self._db:
-            other_active = any(
-                c.get("device_id") == device_id and c.get("registered")
-                for cid, c in self._active_connections.items()
-                if cid != ws_id
-            )
-            if not other_active:
-                await self._db.set_device_online(device_id, False)
-                await self._db.add_event(
-                    "device.disconnected", device_id=device_id,
-                    data={"session_id": session_id},
+            # Mark device offline ONLY if no other active connection for same device.
+            if device_id and self._db:
+                other_active = any(
+                    c.get("device_id") == device_id and c.get("registered")
+                    for cid, c in self._active_connections.items()
+                    if cid != ws_id
                 )
-            else:
-                logger.info("Device %s still has active connection — keeping online", device_id)
+                if not other_active:
+                    await self._db.set_device_online(device_id, False)
+                    await self._db.add_event(
+                        "device.disconnected", device_id=device_id,
+                        data={"session_id": session_id},
+                    )
+        except (RuntimeError, Exception) as e:
+            # Database may be closed during server shutdown — safe to ignore
+            logger.debug("_handle_disconnect db access failed (shutdown?): %s", e)
 
         # Shut down pipeline
         if pipeline:

@@ -920,22 +920,26 @@ class VoiceServer:
         text = content
         logger.info("Text input on session %s: %s", session_id, text[:80])
 
-        # TinkerClaw mode: bypass ConversationEngine
-        if self._config.llm.backend == "tinkerclaw":
-            pipeline = conn_state.get("pipeline")
-            if pipeline and pipeline._llm:
-                if hasattr(pipeline._llm, 'set_session_key'):
-                    pipeline._llm.set_session_key(conn_state.get("session_id", ""))
-                full_response = []
-                async for token in pipeline._llm.generate_stream_with_messages([
-                    {"role": "user", "content": text}
-                ]):
-                    full_response.append(token)
-                    if not ws.closed:
-                        await ws.send_json({"type": "llm", "text": token})
+        # TinkerClaw mode: bypass ConversationEngine, use ConversationEngine's
+        # swapped LLM (not pipeline._llm which may be stale after swap race)
+        if self._config.llm.backend == "tinkerclaw" and self._conversation and self._conversation._llm:
+            llm = self._conversation._llm
+            logger.info("_handle_text TinkerClaw bypass via ConvEngine LLM: %s", llm.name)
+            if hasattr(llm, 'set_session_key'):
+                llm.set_session_key(conn_state.get("session_id", ""))
+            full_response = []
+            async for token in llm.generate_stream_with_messages([
+                {"role": "user", "content": text}
+            ]):
+                full_response.append(token)
                 if not ws.closed:
-                    await ws.send_json({"type": "llm_done", "llm_ms": 0, "text": "".join(full_response)})
-                return
+                    await ws.send_json({"type": "llm", "text": token})
+            response_text = "".join(full_response)
+            logger.info("TinkerClaw text response (%d chars): %s",
+                        len(response_text), response_text[:80])
+            if not ws.closed:
+                await ws.send_json({"type": "llm_done", "llm_ms": 0, "text": response_text})
+            return
 
         try:
             # Stream LLM response via conversation engine

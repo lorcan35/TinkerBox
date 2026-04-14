@@ -756,6 +756,9 @@ class VoiceServer:
                         await ws.send_json({"type": "pong"})
 
                     elif cmd_type == "config_update":
+                        # US-P01: Acquire conn_lock to serialize with stop/text
+                        # handlers. Prevents swap_backends() from running while
+                        # start_processing() or finish_dictation() is in flight.
                         # Three-tier voice mode: 0=local, 1=hybrid, 2=cloud
                         voice_mode = cmd.get("voice_mode")
                         llm_model = cmd.get("llm_model")
@@ -869,43 +872,44 @@ class VoiceServer:
                                 conn_config.tts.openrouter_api_key = conn_config.llm.openrouter_api_key
                                 conn_config.tts.openrouter_url = conn_config.llm.openrouter_url
 
-                            # Hot-swap backends on pipeline AND conversation engine
-                            pipeline = conn_state.get("pipeline")
-                            if pipeline:
-                                try:
-                                    # Cancel in-flight processing before swap (US-P12)
-                                    if pipeline._process_task and not pipeline._process_task.done():
-                                        logger.info("Connection %s: cancelling in-flight processing before backend swap", ws_id)
-                                        await pipeline.cancel()
-                                        await asyncio.sleep(0.1)  # let cancel propagate
-                                    await pipeline.swap_backends(conn_config)
-                                    # Inject session key for TinkerClaw conversation continuity
-                                    if llm_be == "tinkerclaw" and hasattr(pipeline, '_llm'):
-                                        if hasattr(pipeline._llm, 'set_session_key'):
-                                            pipeline._llm.set_session_key(
-                                                conn_state.get("session_id", ""))
-                                except Exception as e:
-                                    logger.exception("Backend swap failed")
-                                    if not ws.closed:
-                                        await ws.send_json({
-                                            "type": "config_update",
-                                            "error": f"Backend swap failed: {e}",
-                                            "voice_mode": 0,
-                                        })
-                                    continue
+                            # US-P01: Acquire conn_lock to serialize the swap with
+                            # stop/text handlers. Without this, start_processing()
+                            # could run concurrently with swap_backends().
+                            async with conn_lock:
+                                # Hot-swap backends on pipeline AND conversation engine
+                                pipeline = conn_state.get("pipeline")
+                                if pipeline:
+                                    try:
+                                        # swap_backends() now handles cancel internally
+                                        # and sets _swapping flag to drop audio during swap
+                                        await pipeline.swap_backends(conn_config)
+                                        # Inject session key for TinkerClaw conversation continuity
+                                        if llm_be == "tinkerclaw" and hasattr(pipeline, '_llm'):
+                                            if hasattr(pipeline._llm, 'set_session_key'):
+                                                pipeline._llm.set_session_key(
+                                                    conn_state.get("session_id", ""))
+                                    except Exception as e:
+                                        logger.exception("Backend swap failed")
+                                        if not ws.closed:
+                                            await ws.send_json({
+                                                "type": "config_update",
+                                                "error": f"Backend swap failed: {e}",
+                                                "voice_mode": 0,
+                                            })
+                                        continue
 
-                            # Also swap ConversationEngine LLM (used by _handle_text)
-                            if self._conversation:
-                                try:
-                                    from dragon_voice.llm import create_llm
-                                    if self._conversation._llm:
-                                        await self._conversation._llm.shutdown()
-                                    new_llm = create_llm(conn_config.llm)
-                                    await new_llm.initialize()
-                                    self._conversation._llm = new_llm
-                                    logger.info("ConversationEngine LLM swapped to %s", new_llm.name)
-                                except Exception as e:
-                                    logger.exception("ConversationEngine LLM swap failed: %s", e)
+                                # Also swap ConversationEngine LLM (used by _handle_text)
+                                if self._conversation:
+                                    try:
+                                        from dragon_voice.llm import create_llm
+                                        if self._conversation._llm:
+                                            await self._conversation._llm.shutdown()
+                                        new_llm = create_llm(conn_config.llm)
+                                        await new_llm.initialize()
+                                        self._conversation._llm = new_llm
+                                        logger.info("ConversationEngine LLM swapped to %s", new_llm.name)
+                                    except Exception as e:
+                                        logger.exception("ConversationEngine LLM swap failed: %s", e)
 
                             # Update displayed names
                             self._stt_name = stt_be

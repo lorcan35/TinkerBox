@@ -94,6 +94,7 @@ class VoicePipeline:
         # Pipeline state
         self._processing = False
         self._cancelled = False
+        self._swapping = False  # US-P01: drop incoming audio during backend swap
         self._tts_started = False
         self._tts_total_ms = 0.0
         self._process_task: Optional[asyncio.Task] = None
@@ -132,6 +133,11 @@ class VoicePipeline:
         When silence is detected after speech, triggers processing.
         In dictation mode, Tab5 handles VAD — Dragon just buffers.
         """
+        # US-P01: drop all incoming audio while backends are being swapped.
+        # Prevents stale audio from accumulating during the swap window.
+        if self._swapping:
+            return
+
         if self._dictation_mode:
             # Dictation: buffer in segment buffer, no Dragon-side VAD.
             # Tab5 sends {"type":"segment"} markers when it detects pauses.
@@ -641,51 +647,70 @@ class VoicePipeline:
         Only reinitializes backends that have actually changed.
         Cancels any in-flight processing first (US-P12) to avoid
         orphaned Piper subprocesses and partial audio.
+
+        US-P01: Sets _swapping flag so feed_audio() drops incoming PCM
+        during the swap window. Clears audio buffers after cancel to
+        prevent stale audio from bleeding into the new backend.
         """
-        # Cancel in-flight processing before swapping (US-P12)
-        if self._processing or (self._process_task and not self._process_task.done()):
-            logger.info("Cancelling in-flight processing before backend swap")
-            await self.cancel()
-            await asyncio.sleep(0.1)  # let pending async tasks clean up
+        # US-P01: Block audio ingestion during the entire swap
+        self._swapping = True
 
-        old_config = self._config
-        self._config = config
+        try:
+            # Cancel in-flight processing before swapping (US-P12)
+            if self._processing or (self._process_task and not self._process_task.done()):
+                logger.info("Cancelling in-flight processing before backend swap")
+                await self.cancel()
+                await asyncio.sleep(0.1)  # let pending async tasks clean up
 
-        tasks = []
+            # US-P01: Clear audio buffers AFTER cancel to ensure no stale
+            # audio from the old backend context survives into the new one.
+            # cancel() also clears these, but audio could have arrived
+            # between cancel() returning and us reaching this point.
+            self._audio_buffer.clear()
+            self._segment_buffer.clear()
+            self._is_speaking = False
 
-        # Check if STT backend changed
-        if (
-            config.stt.backend != old_config.stt.backend
-            or config.stt.model != old_config.stt.model
-        ):
-            logger.info("Swapping STT: %s -> %s", old_config.stt.backend, config.stt.backend)
-            if self._stt:
-                await self._stt.shutdown()
-            self._stt = create_stt(config.stt)
-            tasks.append(self._stt.initialize())
+            old_config = self._config
+            self._config = config
 
-        # Check if TTS backend changed
-        if config.tts.backend != old_config.tts.backend:
-            logger.info("Swapping TTS: %s -> %s", old_config.tts.backend, config.tts.backend)
-            if self._tts:
-                await self._tts.shutdown()
-            self._tts = create_tts(config.tts)
-            tasks.append(self._tts.initialize())
+            tasks = []
 
-        # Check if LLM backend changed
-        if (
-            config.llm.backend != old_config.llm.backend
-            or config.llm.ollama_model != old_config.llm.ollama_model
-        ):
-            logger.info("Swapping LLM: %s -> %s", old_config.llm.backend, config.llm.backend)
-            if self._llm:
-                await self._llm.shutdown()
-            self._llm = create_llm(config.llm)
-            tasks.append(self._llm.initialize())
+            # Check if STT backend changed
+            if (
+                config.stt.backend != old_config.stt.backend
+                or config.stt.model != old_config.stt.model
+            ):
+                logger.info("Swapping STT: %s -> %s", old_config.stt.backend, config.stt.backend)
+                if self._stt:
+                    await self._stt.shutdown()
+                self._stt = create_stt(config.stt)
+                tasks.append(self._stt.initialize())
 
-        if tasks:
-            await asyncio.gather(*tasks)
-            logger.info("Backend swap complete")
+            # Check if TTS backend changed
+            if config.tts.backend != old_config.tts.backend:
+                logger.info("Swapping TTS: %s -> %s", old_config.tts.backend, config.tts.backend)
+                if self._tts:
+                    await self._tts.shutdown()
+                self._tts = create_tts(config.tts)
+                tasks.append(self._tts.initialize())
+
+            # Check if LLM backend changed
+            if (
+                config.llm.backend != old_config.llm.backend
+                or config.llm.ollama_model != old_config.llm.ollama_model
+            ):
+                logger.info("Swapping LLM: %s -> %s", old_config.llm.backend, config.llm.backend)
+                if self._llm:
+                    await self._llm.shutdown()
+                self._llm = create_llm(config.llm)
+                tasks.append(self._llm.initialize())
+
+            if tasks:
+                await asyncio.gather(*tasks)
+                logger.info("Backend swap complete")
+        finally:
+            # US-P01: Re-enable audio ingestion after swap completes (or fails)
+            self._swapping = False
 
     @property
     def stt_name(self) -> str:

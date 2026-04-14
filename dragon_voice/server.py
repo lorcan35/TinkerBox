@@ -491,6 +491,17 @@ class VoiceServer:
                     await ws.send_json(event)
                 except Exception:
                     logger.warning("Failed to send event to %s", ws_id)
+            # Persist API usage events for cost tracking
+            if event.get("type") == "api_usage" and self._db:
+                try:
+                    await self._db.add_event(
+                        "api_usage",
+                        session_id=conn_state.get("session_id"),
+                        device_id=conn_state.get("device_id"),
+                        data={k: v for k, v in event.items() if k != "type"},
+                    )
+                except Exception:
+                    pass
 
         try:
             async for msg in ws:
@@ -623,7 +634,12 @@ class VoiceServer:
                                 if llm_model:
                                     self._config.llm.openrouter_model = llm_model
                             else:
-                                llm_be = self._config.llm.local_backend or "openrouter"
+                                llm_be = self._config.llm.local_backend or "ollama"
+                                # Local model picker: user can select qwen3:0.6b/1.7b/4b etc.
+                                # Only apply if it looks like an Ollama model (no '/' = not a cloud model ID)
+                                if llm_model and llm_be == "ollama" and "/" not in llm_model:
+                                    self._config.llm.ollama_model = llm_model
+                                    logger.info("Local model switched to: %s", llm_model)
 
                             # Apply mode-aware system prompt and max_tokens
                             if voice_mode == 0:
@@ -709,12 +725,19 @@ class VoiceServer:
 
                             # Confirm to Tab5
                             if not ws.closed:
+                                # Report actual model for any mode
+                                if voice_mode == 2:
+                                    active_model = self._config.llm.openrouter_model
+                                elif llm_be == "ollama":
+                                    active_model = self._config.llm.ollama_model
+                                else:
+                                    active_model = ""
                                 await ws.send_json({
                                     "type": "config_update",
                                     "config": {
                                         "stt": stt_be, "tts": tts_be,
                                         "llm": llm_be,
-                                        "llm_model": self._config.llm.openrouter_model if voice_mode == 2 else "",
+                                        "llm_model": active_model,
                                         "voice_mode": voice_mode,
                                         "cloud_mode": voice_mode >= 1,
                                     },

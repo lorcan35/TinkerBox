@@ -147,7 +147,11 @@ class ConversationEngine:
 
     async def _build_context(self, session_id: str, user_text: str) -> list[dict]:
         """Build LLM context with optional memory augmentation and tool descriptions."""
-        context = await self._messages.get_context(session_id)
+        # Mode-aware context depth: local models have tiny context windows,
+        # cloud models (128K+) can use much more conversation history.
+        is_local = self._llm_config.backend in ("ollama", "npu_genie", "lmstudio")
+        max_msgs = 10 if is_local else 30
+        context = await self._messages.get_context(session_id, max_messages=max_msgs)
 
         # Inject memory context before the user's message
         if self._memory_service:

@@ -29,6 +29,8 @@ class OpenRouterSTTBackend(STTBackend):
         self._base_url = (config.openrouter_url or "https://openrouter.ai/api/v1").rstrip("/")
         self._api_key = config.openrouter_api_key or os.environ.get("OPENROUTER_API_KEY", "")
         self._session: Optional[aiohttp.ClientSession] = None
+        self._last_usage: dict = {}  # Token usage from last API call
+        self.total_calls: int = 0    # Total API calls made
 
     async def initialize(self) -> None:
         if not self._api_key:
@@ -73,6 +75,7 @@ class OpenRouterSTTBackend(STTBackend):
         }
 
         try:
+            self.total_calls += 1
             async with self._session.post(
                 f"{self._base_url}/chat/completions", json=payload
             ) as resp:
@@ -81,8 +84,17 @@ class OpenRouterSTTBackend(STTBackend):
                     logger.error("OpenRouter STT error %d: %s", resp.status, err[:300])
                     return ""
                 data = await resp.json()
-                text = data["choices"][0]["message"]["content"].strip()
-                logger.info("OpenRouter STT: '%s'", text[:80])
+                # Defensive parsing — OpenRouter format may vary
+                choices = data.get("choices", [])
+                if not choices:
+                    logger.warning("OpenRouter STT: no choices in response")
+                    return ""
+                message = choices[0].get("message", {})
+                text = (message.get("content") or "").strip()
+                # Extract usage for cost tracking
+                usage = data.get("usage", {})
+                self._last_usage = usage
+                logger.info("OpenRouter STT: '%s' (tokens: %s)", text[:80], usage)
                 return text
         except Exception as e:
             logger.error("OpenRouter STT request failed: %s", e)

@@ -24,6 +24,10 @@ logger = logging.getLogger(__name__)
 _SENTENCE_END = re.compile(r"[.!?]\s*$")
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 
+# Clause boundary for local mode — start TTS earlier on slow models
+# Triggers on comma/semicolon/colon/dash with 20+ chars buffered
+_CLAUSE_END = re.compile(r"[,;:\u2014—]\s*$")
+
 # Hallucination stop patterns — LLMs sometimes simulate user turns or continue
 # generating after answering. Truncate response at these markers.
 _HALLUCINATION_STOPS = re.compile(
@@ -381,9 +385,12 @@ class VoicePipeline:
             stt_ms = (time.monotonic() - t0) * 1000
 
             if not transcript.strip():
-                logger.info("STT returned empty transcript (audio=%d bytes)", len(audio_data))
+                logger.info("STT returned empty transcript (audio=%d bytes, backend=%s)",
+                            len(audio_data), self._config.stt.backend)
                 await self._on_event({"type": "stt", "text": "", "stt_ms": round(stt_ms)})
-                await self._on_event({"type": "error", "message": "No speech detected"})
+                # User-friendly error — Tab5 shows this on voice overlay
+                await self._on_event({"type": "error",
+                                      "message": "Couldn't hear you — try again"})
                 return
 
             logger.info("STT (%.0fms): %s", stt_ms, transcript)
@@ -456,6 +463,14 @@ class VoicePipeline:
                             # Last fragment is incomplete — keep buffering
                             remainder = sentence
                     sentence_buffer = remainder
+                # Local mode: flush on clause boundary (comma/semicolon/colon/dash)
+                # when buffer has 20+ chars. Starts TTS 1-2s earlier on slow models.
+                elif (self._config.llm.backend in ("ollama", "npu_genie", "lmstudio")
+                      and len(sentence_buffer) >= 20
+                      and _CLAUSE_END.search(sentence_buffer)):
+                    if sentence_buffer.strip():
+                        await self._synthesize_and_send(sentence_buffer.strip())
+                    sentence_buffer = ""
 
             # Flush remaining text
             if sentence_buffer.strip() and not self._cancelled:
@@ -491,6 +506,24 @@ class VoicePipeline:
             total_ms = (time.monotonic() - pipeline_start) * 1000
             logger.info("Pipeline total: %.0fms", total_ms)
             self._processing = False
+
+            # Log OpenRouter API usage for cost tracking
+            try:
+                cost_data = {}
+                if hasattr(self._stt, 'total_calls') and self._stt.total_calls > 0:
+                    cost_data["stt_calls"] = self._stt.total_calls
+                    cost_data["stt_backend"] = "openrouter"
+                if hasattr(self._tts, 'total_calls') and self._tts.total_calls > 0:
+                    cost_data["tts_calls"] = self._tts.total_calls
+                    cost_data["tts_backend"] = "openrouter"
+                if cost_data:
+                    cost_data["pipeline_ms"] = round(total_ms)
+                    await self._on_event({
+                        "type": "api_usage",
+                        **cost_data,
+                    })
+            except Exception:
+                pass  # Cost tracking is best-effort
 
     async def _synthesize_and_send(self, text: str) -> None:
         """Synthesize a sentence, resample to 16kHz, and stream paced to client.

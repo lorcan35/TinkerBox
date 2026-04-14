@@ -31,6 +31,7 @@ class OpenRouterTTSBackend(TTSBackend):
         self._sample_rate_val = 24000  # OpenAI audio models output 24kHz pcm16
 
         self._session: Optional[aiohttp.ClientSession] = None
+        self.total_calls: int = 0    # Total API calls made
 
     async def initialize(self) -> None:
         if not self._api_key:
@@ -63,6 +64,7 @@ class OpenRouterTTSBackend(TTSBackend):
         }
 
         try:
+            self.total_calls += 1
             async with self._session.post(
                 f"{self._base_url}/chat/completions", json=payload
             ) as resp:

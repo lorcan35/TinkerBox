@@ -670,8 +670,9 @@ class VoiceServer:
                                         self._config.llm.openrouter_model if voice_mode == 2 else "(local)",
                                         self._config.llm.max_tokens)
 
-                            # Validate API key for cloud modes
-                            if voice_mode >= 1 and not self._config.llm.openrouter_api_key:
+                            # Validate API key for cloud modes (1=Hybrid, 2=Cloud need OpenRouter)
+                            # Mode 3 (TinkerClaw) doesn't need Dragon's OpenRouter key — uses own gateway
+                            if voice_mode in (1, 2) and not self._config.llm.openrouter_api_key:
                                 logger.error("Cloud mode requested but no API key configured")
                                 if not ws.closed:
                                     await ws.send_json({
@@ -696,8 +697,8 @@ class VoiceServer:
                             self._config.tts.backend = tts_be
                             self._config.llm.backend = llm_be
 
-                            # Propagate API keys for cloud backends
-                            if voice_mode >= 1:
+                            # Propagate API keys for cloud STT/TTS backends (modes 1-2, or mode 3 with cloud STT)
+                            if voice_mode in (1, 2) or (voice_mode == 3 and stt_be == "openrouter"):
                                 self._config.stt.openrouter_api_key = self._config.llm.openrouter_api_key
                                 self._config.stt.openrouter_url = self._config.llm.openrouter_url
                                 self._config.tts.openrouter_api_key = self._config.llm.openrouter_api_key
@@ -746,6 +747,8 @@ class VoiceServer:
                                 # Report actual model for any mode
                                 if voice_mode == 2:
                                     active_model = self._config.llm.openrouter_model
+                                elif llm_be == "tinkerclaw":
+                                    active_model = self._config.llm.tinkerclaw_model
                                 elif llm_be == "ollama":
                                     active_model = self._config.llm.ollama_model
                                 else:
@@ -914,7 +917,25 @@ class VoiceServer:
         if not content:
             return
 
-        logger.info("Text input on session %s: %s", session_id, content[:80])
+        text = content
+        logger.info("Text input on session %s: %s", session_id, text[:80])
+
+        # TinkerClaw mode: bypass ConversationEngine
+        if self._config.llm.backend == "tinkerclaw":
+            pipeline = conn_state.get("pipeline")
+            if pipeline and pipeline._llm:
+                if hasattr(pipeline._llm, 'set_session_key'):
+                    pipeline._llm.set_session_key(conn_state.get("session_id", ""))
+                full_response = []
+                async for token in pipeline._llm.generate_stream_with_messages([
+                    {"role": "user", "content": text}
+                ]):
+                    full_response.append(token)
+                    if not ws.closed:
+                        await ws.send_json({"type": "llm", "text": token})
+                if not ws.closed:
+                    await ws.send_json({"type": "llm_done", "llm_ms": 0, "text": "".join(full_response)})
+                return
 
         try:
             # Stream LLM response via conversation engine

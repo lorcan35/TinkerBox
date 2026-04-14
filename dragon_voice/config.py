@@ -157,7 +157,7 @@ class VoiceConfig:
                 f"stt.backend must be one of {valid_stt}, got '{self.stt.backend}'"
             )
 
-        valid_llm = ("ollama", "openrouter", "lmstudio", "npu_genie")
+        valid_llm = ("ollama", "openrouter", "lmstudio", "npu_genie", "tinkerclaw")
         if self.llm.backend not in valid_llm:
             errors.append(
                 f"llm.backend must be one of {valid_llm}, got '{self.llm.backend}'"

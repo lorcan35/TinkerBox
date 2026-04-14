@@ -40,6 +40,11 @@ llm:
   lmstudio_url: "http://localhost:1234/v1"
   lmstudio_model: "default"
 
+  # TinkerClaw agent gateway (optional sidecar)
+  tinkerclaw_url: "http://localhost:18789"
+  tinkerclaw_token: ""  # set to match gateway auth token
+  tinkerclaw_model: "minimax/MiniMax-M2.5"
+
   system_prompt: "You are Tinker, a helpful AI assistant. Reply in 1-2 sentences maximum. Be concise. Never simulate user responses. Never generate text after your answer. Stop immediately after answering."
   max_tokens: 256
   temperature: 0.7

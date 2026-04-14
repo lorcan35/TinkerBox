@@ -457,8 +457,9 @@ class VoiceServer:
 
         ws = web.WebSocketResponse(
             max_msg_size=10 * 1024 * 1024,  # 10MB max message
-            heartbeat=None,  # DISABLED — ESP-IDF transport doesn't auto-PONG protocol pings.
-            # Keepalive handled by _ws_keepalive task (20s server pings) + Tab5 JSON pings (8s).
+            heartbeat=None,  # DISABLED: although ESP-IDF v5.4.3 auto-PONGs, the latency through
+            # ngrok (200-500ms) plus SSL overhead causes spurious timeouts. Keepalive handled
+            # by _ws_keepalive task (20s ws.ping) + Tab5 JSON pings (8s).
         )
         await ws.prepare(request)
 
@@ -475,9 +476,11 @@ class VoiceServer:
         async def _ws_keepalive():
             while _keepalive_running and not ws.closed:
                 try:
-                    await asyncio.sleep(20)
+                    await asyncio.sleep(15)  # 15s < ngrok's ~30s idle threshold
                     if not ws.closed and _keepalive_running:
-                        await ws.ping()
+                        # Send JSON pong (data frame) — ngrok counts data frames as activity.
+                        # Protocol-level ws.ping() may not prevent ngrok idle timeout.
+                        await ws.send_json({"type": "pong"})
                 except Exception:
                     break
 

@@ -1413,8 +1413,10 @@ class VoiceServer:
                     if media_events:
                         logger.info("Sent %d media events for TinkerClaw response", len(media_events))
                         cleaned = self._media_pipeline.strip_rendered_content(response_text, media_events)
+                        logger.info("Text stripped: %d→%d chars", len(response_text), len(cleaned))
                         if cleaned != response_text and not ws.closed:
                             await ws.send_json({"type": "text_update", "text": cleaned})
+                            logger.info("Sent text_update with cleaned text")
                 except Exception as e:
                     logger.warning("TinkerClaw media detection failed: %s", e)
 

@@ -65,7 +65,7 @@ ssh radxa@192.168.1.91 "sudo systemctl restart tinkerclaw-voice"
 
 ### Post-Deploy Checklist
 - **Clear `__pycache__`:** After `scp` deploy, stale `.pyc` files can cause import errors. Run `find /home/radxa/dragon_voice -name '__pycache__' -exec rm -rf {} +` on Dragon before restarting.
-- **Restore secrets in `config.yaml`:** `scp` overwrites the Dragon's `config.yaml` with the workstation copy, which has empty API keys. After deploy, restore `openrouter_api_key` and `searxng_url` in `dragon_voice/config.yaml` on Dragon.
+- **API key in .env survives deploys:** The OpenRouter API key is stored in `/home/radxa/.env` (loaded by systemd `EnvironmentFile=`). This file is NOT overwritten by `scp -r dragon_voice/` deploys, so secrets survive code pushes. Do NOT put real API keys in `config.yaml` in the repo.
 - **Restore `tinkerclaw_token` in `config.yaml`:** Must match `~/.tinkerclaw/tinkerclaw.json` gateway auth token.
 - **ngrok domains:** Three tunnels are active:
   - `tinkerclaw-dashboard.ngrok.dev` → 3500 (dashboard)
@@ -94,8 +94,10 @@ Tab5 sends `{"type":"config_update","voice_mode":0|1|2,"llm_model":"...","conn_m
 - **Config fields:** `LLMConfig.local_backend` (remembers original for fallback), `LLMConfig.openrouter_model` (user-selectable).
 - **Valid backends:** STT: `moonshine`, `whisper_cpp`, `vosk`, `openrouter`. TTS: `piper`, `kokoro`, `edge_tts`, `openrouter`. LLM: `ollama`, `npu_genie`, `openrouter`, `lmstudio`, `tinkerclaw`.
 - **Mode-aware system prompts:** Each voice mode sets a different system prompt length — Local (concise, 128 tokens), Hybrid (medium, 256 tokens), Cloud (rich, 512 tokens). This keeps local model context tight while giving cloud models room for nuanced instructions.
+- **Mode-aware pipeline timeouts:** Local mode = 300s (5 min) for tool-calling chains on slow local models. Cloud mode = 60s (1 min). TinkerClaw mode = 180s (3 min, tool execution gaps). Timeouts configured per voice mode in pipeline.py.
 - **Session system_prompt updated on mode switch:** When voice_mode changes, the session's `system_prompt` is updated in the DB immediately so the conversation engine picks it up on the next turn.
 - **Pipeline init resets to local defaults on reconnect:** When a device reconnects, the pipeline is re-initialized with local defaults (voice_mode 0) regardless of the previous session's mode. The client must re-send `config_update` to restore cloud mode.
+- **Per-connection config (deep copy):** Each WebSocket connection gets a deep copy of the global config via `copy.deepcopy()`. This prevents one device's config_update (e.g., switching to cloud mode) from corrupting another device's pipeline config. Without deep copy, two Tab5s connected simultaneously would share the same mutable config object.
 
 ## TinkerClaw Integration (Optional Sidecar)
 

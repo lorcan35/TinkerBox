@@ -458,3 +458,35 @@ sequentially across the whole file (don't restart per section).
 - **Root Cause:** `_handle_register` did not check for existing connections with the same `device_id`. The old WS cleanup only ran when aiohttp detected the TCP close (via `async for msg in ws` loop ending), but a new connection could arrive before that detection.
 - **Fix:** Added device_id collision check at the start of `_handle_register`. Iterates `_active_connections` for any existing registered connection with the same `device_id`. If found: shuts down the old pipeline, pauses the old session, marks the old connection as unregistered, and removes it from `_active_connections`. The old WS handler's `finally` block still runs but `_handle_disconnect` becomes a no-op (pipeline already None, registered=False).
 - **Prevention:** Any system with reconnecting clients must handle the "new connection before old close detection" race. Always do a device_id lookup on registration, not just rely on transport-level close detection.
+
+---
+
+## Stability Sprint (2026-04-15)
+
+### 59. OpenRouter API key must be in /home/radxa/.env (survives scp deploy)
+- **Date:** 2026-04-15
+- **Symptom:** After `scp -r dragon_voice/` deploy, cloud mode failed with "No API key configured". Had to manually restore the key every deploy.
+- **Root Cause:** `scp -r dragon_voice/` overwrites `config.yaml` with the repo version which has empty API key placeholders. The live Dragon had the real key in `config.yaml`.
+- **Fix:** Moved the OpenRouter API key to `/home/radxa/.env` (format: `OPENROUTER_API_KEY=sk-or-v1-...`). The systemd unit uses `EnvironmentFile=/home/radxa/.env` to load it. Config.py reads from env var when the config.yaml value is empty. `.env` is never overwritten by `scp -r dragon_voice/`.
+- **Prevention:** Never store secrets in `config.yaml`. Use environment variables loaded from `/home/radxa/.env` via systemd `EnvironmentFile=`. This file survives code deploys.
+
+### 60. Dragon shutdown: sessions.py pause_session needs try/except for db-closed
+- **Date:** 2026-04-15
+- **Symptom:** On Dragon shutdown, `sessions.py pause_session()` threw `sqlite3.ProgrammingError: Cannot operate on a closed database` during the cleanup of active sessions.
+- **Root Cause:** During shutdown, `db.py close()` was called before all active sessions were paused. The session cleanup loop in `_handle_disconnect()` tried to update session status after the database was already closed.
+- **Fix:** Wrapped `pause_session()` call in try/except for `sqlite3.ProgrammingError` and `aiosqlite.Error`. If the DB is already closed, log a warning and skip the update — the session will be cleaned up on next startup anyway.
+- **Prevention:** Any database operation in shutdown/cleanup paths must handle the "already closed" case gracefully. Use try/except around DB calls in finally blocks and disconnect handlers.
+
+### 61. Mode-aware pipeline timeouts (300s local, 60s cloud, 180s TinkerClaw)
+- **Date:** 2026-04-15
+- **Symptom:** Local mode with qwen3:1.7b timed out during multi-tool chains (3 tool calls = 45s+ total). Cloud mode had unnecessarily generous timeouts.
+- **Root Cause:** A single 35s timeout was used for all modes. Local models are slow (7 tok/s) and tool-calling chains multiply the latency. Cloud models are fast but a 5-minute timeout masked failures.
+- **Fix:** Pipeline timeouts are now mode-aware: Local (voice_mode 0) = 300s (5 min), Cloud (voice_mode 2) = 60s (1 min), TinkerClaw (voice_mode 3) = 180s (3 min, accommodates server-side tool execution gaps). Updated in `pipeline.py` swap_backends and process methods.
+- **Prevention:** Always set timeouts proportional to the expected latency of each backend. Log the timeout value on mode switch for debugging.
+
+### 62. Per-connection config deep copy prevents cross-device corruption
+- **Date:** 2026-04-15
+- **Symptom:** Two Tab5 devices connected simultaneously. Device A switched to cloud mode → Device B's pipeline also started using cloud backends without being told to.
+- **Root Cause:** Both WebSocket connections shared the same `self._config` object (a mutable dataclass). Device A's `config_update` handler mutated the shared object, affecting Device B's pipeline.
+- **Fix:** Each new WebSocket connection in `_handle_ws()` creates a `copy.deepcopy(self._config)` stored as `conn_config`. All per-connection operations (pipeline init, config_update, backend swap) use the connection-local copy.
+- **Prevention:** Never share mutable config objects between connections. Always deep-copy config at connection init time. This is a classic shared-mutable-state bug — in async servers, every connection must have its own state.

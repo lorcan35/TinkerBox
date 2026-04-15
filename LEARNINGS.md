@@ -490,3 +490,21 @@ sequentially across the whole file (don't restart per section).
 - **Root Cause:** Both WebSocket connections shared the same `self._config` object (a mutable dataclass). Device A's `config_update` handler mutated the shared object, affecting Device B's pipeline.
 - **Fix:** Each new WebSocket connection in `_handle_ws()` creates a `copy.deepcopy(self._config)` stored as `conn_config`. All per-connection operations (pipeline init, config_update, backend swap) use the connection-local copy.
 - **Prevention:** Never share mutable config objects between connections. Always deep-copy config at connection init time. This is a classic shared-mutable-state bug — in async servers, every connection must have its own state.
+
+---
+
+## Rich Media Chat (2026-04-15)
+
+### 63. TinkerClaw bypass path — media detection must be before early return
+- **Date:** 2026-04-15
+- **Symptom:** Rich media rendering (code blocks as images, tables as images) worked in ConvEngine mode (voice_mode 0/1/2) but produced no media events in TinkerClaw mode (voice_mode 3). Code blocks were spoken aloud as raw text instead of rendered as images.
+- **Root Cause:** The TinkerClaw path in `server.py` has an early `return` after the TinkerClaw LLM response is processed (since ConvEngine, ToolRegistry, and MemoryService are all bypassed in mode 3). The media detection call (`media_pipeline.process_response()`) was placed AFTER this return, so it never executed for TinkerClaw responses.
+- **Fix:** Moved media detection (`process_response()` + `strip_rendered_content()` + media WebSocket sends + `text_update`) to BEFORE the TinkerClaw early return in `server.py`, so both code paths (ConvEngine and TinkerClaw) run media detection after `llm_done`.
+- **Prevention:** When adding post-LLM processing to `server.py`, always check BOTH the ConvEngine path AND the TinkerClaw bypass path. The TinkerClaw path has an early `return` — any new processing must be placed before it. Search for "tinkerclaw" and "return" in `server.py` to find the boundary.
+
+### 64. Pygments ImageFormatter requires system fonts (DejaVu Sans Mono)
+- **Date:** 2026-04-15
+- **Symptom:** Code block rendering via Pygments `ImageFormatter` produced blank or garbled images on Dragon. The same code worked on the development workstation.
+- **Root Cause:** Pygments `ImageFormatter` renders syntax-highlighted code as a bitmap image. It requires a monospace font to be available on the system. Dragon's minimal Debian image did not have any suitable fonts installed — Pygments silently fell back to a default that produced unreadable output.
+- **Fix:** Installed `fonts-dejavu-core` on Dragon: `sudo apt install fonts-dejavu-core`. This provides DejaVu Sans Mono which Pygments uses by default.
+- **Prevention:** When deploying Python packages that render text to images (Pygments, Pillow text drawing, matplotlib, etc.), always verify that the required system fonts are installed on the target machine. Add `apt install fonts-dejavu-core` to the Dragon setup script (`setup.sh`). Minimal ARM64 images rarely include fonts.

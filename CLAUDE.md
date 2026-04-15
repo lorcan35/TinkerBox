@@ -112,6 +112,19 @@ When `voice_mode=3` is active, Dragon delegates all intelligence to the TinkerCl
 - **Text bypass:** Text input via WebSocket in mode 3 bypasses ConversationEngine and routes directly through tinkerclaw_llm.py
 - **New files:** `dragon_voice/llm/tinkerclaw_llm.py` — LLM backend adapter that forwards requests to the TinkerClaw gateway.
 
+## Rich Media Chat (April 2026)
+
+Dragon renders rich content (code blocks, markdown tables, image URLs) from LLM responses as JPEG images and serves them to Tab5 for inline display in chat.
+
+- **MediaPipeline:** After `llm_done`, `process_response()` scans the full response text. Regex detects code blocks (```lang...```), markdown tables (|col|), and image URLs (.jpg/.png/.gif/.webp). Code blocks are rendered via Pygments `ImageFormatter` (native style, dark theme). Tables are drawn as styled grids (accent orange headers, dark bg) via Pillow. Image URLs are downloaded via aiohttp, resized to 660px max width, JPEG quality 80. Max 3 media items per response.
+- **MediaStore:** Disk-backed storage at `/home/radxa/media/`. 24-hour auto-cleanup via hourly task in `server.py`. 500MB max capacity.
+- **`strip_rendered_content()`:** After media items are rendered, code blocks that were converted to images are stripped from the text. The cleaned text is sent as a `text_update` message so Tab5 replaces the last AI bubble.
+- **Camera uploads:** Tab5 can send camera photos via `user_media` WebSocket message. Dragon receives the `media_id` from a prior `POST /api/media/upload`, loads the image, and passes it to the LLM for multimodal analysis.
+- **Protocol messages (Dragon → Tab5):** `media` (rendered image), `card` (rich card), `audio_clip` (audio player), `text_update` (replace AI bubble text). See `docs/protocol.md` for full spec.
+- **Protocol messages (Tab5 → Dragon):** `user_media` (camera photo for multimodal LLM). See `docs/protocol.md`.
+- **Dependencies:** Pillow (existing), Pygments>=2.17.0 (new — syntax highlighting). System font `fonts-dejavu-core` required on Dragon for Pygments.
+- **Both code paths:** Media detection runs in both ConvEngine and TinkerClaw (voice_mode 3) paths in `server.py`. The TinkerClaw path has an early `return` — media detection is placed before it.
+
 ## OTA Firmware Endpoints
 Dragon serves firmware updates for Tab5 via two endpoints:
 - **GET /api/ota/check?current=VERSION** — compares against `/home/radxa/ota/version.json`, returns `{"update":bool,"version":"...","url":"...","sha256":"..."}`
@@ -121,7 +134,7 @@ Dragon serves firmware updates for Tab5 via two endpoints:
 ## Key Technical Notes
 - **NPU inference (preferred):** Llama 3.2 1B on Genie/HTP achieves ~8 tok/s. Use `npu_genie` backend. See `docs/npu-setup.md`.
 - **ARM64 CPU fallback:** Ollama gemma3:4b is ~0.24 tok/s — 30x slower than NPU. Use only when NPU unavailable.
-- **Python packages:** Use `pip install --break-system-packages` on Dragon (PEP 668)
+- **Python packages:** Use `pip install --break-system-packages` on Dragon (PEP 668). Rich Media requires `Pygments>=2.17.0` and `fonts-dejavu-core` (`apt install fonts-dejavu-core`).
 - **User is radxa, NOT rock:** All service files, paths, and caches must use /home/radxa/
 - **PYTHONPATH:** dragon_voice runs as `python3 -m dragon_voice` with PYTHONPATH=/home/radxa
 - **Audio rates:** Piper TTS outputs 22050Hz, resampled to 16kHz before sending to Tab5. Tab5 upsamples 16k→48k. OpenRouter TTS outputs 24kHz (resampled to 16kHz before sending).
@@ -172,7 +185,7 @@ The web dashboard is an 11-tab single-page application served by `dashboard.py` 
 | #16 | Session management infrastructure | DONE (sessions.py, db.py) |
 | #17 | Multi-turn conversation engine | DONE (conversation.py, messages.py) |
 | #18 | Unified voice + text input | DONE (server.py handles both voice and text) |
-| #21 | REST API framework | DONE (api/ package, 50 endpoints) |
+| #21 | REST API framework | DONE (api/ package, 52 endpoints) |
 | #19 | Notes feature | DONE (notes/ module wired into server.py, API routes registered) |
 | — | Cloud mode (OpenRouter STT+TTS) | DONE (openrouter_stt.py, openrouter_tts.py, config_update WS command) |
 | — | Dictation mode + post-processing | DONE (dictation in pipeline.py, auto-generated title/summary) |
@@ -185,6 +198,7 @@ The web dashboard is an 11-tab single-page application served by `dashboard.py` 
 | — | Tolerant tool parser | DONE (handles stray `>`, missing `</args>`, small model XML quirks) |
 | — | Response timeout (local mode) | DONE (disabled/5 min for local mode, 35s for cloud mode) |
 | — | Default local LLM | DONE (qwen3:1.7b set as default, 7.1 tok/s, good tool calling) |
+| — | Rich Media Chat | DONE (MediaPipeline renders code/tables/images as JPEG, MediaStore with 24h cleanup, camera uploads, 44 tests) |
 
 ### Architecture Decisions (from scaffolding research)
 - **Session != Connection.** Sessions survive disconnects. Device reconnects → resume.
@@ -207,7 +221,7 @@ See `schema.sql` — 6 tables: devices, sessions, messages, notes, events, confi
 - Paginate through old sessions via REST API
 - Dashboard shows live conversation via WebSocket events
 
-## API-First Architecture (44 REST endpoints + 1 WebSocket)
+## API-First Architecture (46 REST endpoints + 1 WebSocket)
 
 Dragon is an API-first server. Every capability is accessible via REST so any hardware client can use it.
 
@@ -260,6 +274,8 @@ Dragon is an API-first server. Every capability is accessible via REST so any ha
 | | POST | `/api/notes/from-audio` | Create note from audio |
 | **OTA** | GET | `/api/ota/check` | Check firmware updates |
 | | GET | `/api/ota/firmware.bin` | Download firmware |
+| **Rich Media** | GET | `/api/media/{id}` | Serve rendered media file (JPEG/PNG/WAV), Cache-Control 1h |
+| | POST | `/api/media/upload` | Accept BMP/JPEG from Tab5 camera, convert+resize via Pillow, return media_id |
 
 ### Agentic Pipeline
 
@@ -308,7 +324,7 @@ dragon_voice/         — Voice pipeline package (port 3502)
   memory.py           — MemoryService: facts + documents + RAG with Ollama embeddings
   config.py           — Config dataclasses (incl. ToolsConfig, MemoryConfig)
   config.yaml         — Default configuration
-  api/                — Modular REST API package (50 endpoints)
+  api/                — Modular REST API package (52 endpoints)
     __init__.py       — setup_all_routes() entry point
     utils.py          — Shared helpers (json_error, pagination)
     sessions.py       — Session CRUD + lifecycle routes
@@ -333,8 +349,15 @@ dragon_voice/         — Voice pipeline package (port 3502)
   tts/                — TTS backends (piper, kokoro, edge_tts, openrouter)
   llm/                — LLM backends (ollama, openrouter, lmstudio, npu_genie, tinkerclaw)
   notes/              — Notes module (CRUD + search + audio ingestion)
+  media/              — Rich media rendering package
+    __init__.py       — Package exports (MediaStore, MediaPipeline)
+    store.py          — MediaStore: disk-backed media file storage, 24h auto-cleanup, 500MB max
+    pipeline.py       — MediaPipeline: detects code/tables/image URLs in LLM output, renders JPEG via Pygments/Pillow
+  api/media_routes.py — MediaRoutes: GET /api/media/{id} (serve), POST /api/media/upload (Tab5 camera)
 tests/                — E2E test suite
   test_api_e2e.py     — 29 tests (14 single-step, 8 multi-step, 7 complex chained)
+  test_media_store.py — 12 unit tests for MediaStore
+  test_media_pipeline.py — 32 unit tests for MediaPipeline
 docs/
   protocol.md         — WebSocket protocol spec (Tab5 ↔ Dragon)
   npu-setup.md        — Qualcomm NPU / QAIRT SDK setup guide
@@ -348,6 +371,11 @@ LEARNINGS.md          — Institutional knowledge (MANDATORY reading)
   - **14 single-step tests:** Basic CRUD operations (create session, list devices, store fact, etc.)
   - **8 multi-step tests:** Sequences requiring state (create session → send messages → retrieve history, etc.)
   - **7 complex chained tests:** Full workflows across multiple subsystems (session + chat + memory + tools, etc.)
+
+### Media Tests
+- **44 media tests** — all passing
+  - `tests/test_media_store.py` — 12 unit tests for MediaStore (disk storage, cleanup, capacity limits)
+  - `tests/test_media_pipeline.py` — 32 unit tests for MediaPipeline (code block detection, table rendering, image URL handling, strip logic)
 
 ### Dashboard Debug Tab E2E Suite
 - **55 tests** — runnable from the Debug tab in the dashboard

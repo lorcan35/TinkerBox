@@ -28,7 +28,8 @@ This document defines the WebSocket protocol between **Tab5** (ESP32-P4 thin cli
 12. [Tool Execution Events](#12-tool-execution-events)
 13. [OTA Protocol](#13-ota-protocol)
 14. [config_update Backward Compatibility](#14-config_update-backward-compatibility)
-15. [Message Reference](#15-message-reference)
+15. [Rich Media Messages](#15-rich-media-messages)
+16. [Message Reference](#16-message-reference)
 
 ---
 
@@ -1107,7 +1108,172 @@ Direct integer mode (0=Local, 1=Hybrid, 2=Full Cloud) with explicit model select
 
 ---
 
-## 15. Message Reference
+## 15. Rich Media Messages
+
+Dragon can render rich content from LLM responses (code blocks, tables, image URLs) as JPEG images and serve them to Tab5 for inline display. Media detection runs after `llm_done` in both ConvEngine and TinkerClaw code paths.
+
+### 15.1 media (Dragon -> Tab5)
+
+Sent when a code block, table, or image URL in the LLM response has been rendered as an image.
+
+```json
+{
+  "type": "media",
+  "media_type": "image",
+  "url": "/api/media/a1b2c3d4",
+  "width": 660,
+  "height": 420,
+  "alt": "Code: python"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | `"media"` |
+| `media_type` | string | `"image"` (rendered code/table/downloaded image). |
+| `url` | string | Relative path to fetch the media file (GET /api/media/{id}). |
+| `width` | int | Image width in pixels (max 660). |
+| `height` | int | Image height in pixels (variable). |
+| `alt` | string | Accessibility description (e.g. `"Code: python"`, `"Table"`, `"Image"`). |
+
+**When sent:** After `llm_done`, once the MediaPipeline has rendered the content. Up to 3 media items per response.
+
+**Tab5 behavior on receive:** Fetch the image from the URL and display it inline in the chat bubble below the AI text.
+
+### 15.2 card (Dragon -> Tab5)
+
+Rich card with optional image, title, subtitle, and description.
+
+```json
+{
+  "type": "card",
+  "title": "Weather in Dublin",
+  "subtitle": "14°C, Partly Cloudy",
+  "image_url": "/api/media/e5f6g7h8",
+  "description": "Wind: 12 km/h NW. Humidity: 78%."
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | `"card"` |
+| `title` | string | Card title. |
+| `subtitle` | string | Optional. Secondary text. |
+| `image_url` | string | Optional. Relative path to card image. |
+| `description` | string | Optional. Body text. |
+
+**When sent:** When the LLM response contains structured data suitable for card display.
+
+**Tab5 behavior on receive:** Render a styled card in the chat UI.
+
+### 15.3 audio_clip (Dragon -> Tab5)
+
+Audio player card for non-TTS audio content.
+
+```json
+{
+  "type": "audio_clip",
+  "url": "/api/media/i9j0k1l2",
+  "duration_s": 12.5,
+  "label": "Voice memo"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | `"audio_clip"` |
+| `url` | string | Relative path to audio file (WAV). |
+| `duration_s` | float | Duration in seconds. |
+| `label` | string | Display label for the audio player. |
+
+**When sent:** When the response includes an audio file that should be played on demand (not auto-played like TTS).
+
+**Tab5 behavior on receive:** Show an audio player widget. User taps to play.
+
+### 15.4 text_update (Dragon -> Tab5)
+
+Replaces the text in the last AI chat bubble. Used after code blocks have been rendered as images — the raw markdown code is stripped from the text.
+
+```json
+{
+  "type": "text_update",
+  "text": "Here is the solution:\n\n(see image above)\n\nLet me know if you need changes."
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | `"text_update"` |
+| `text` | string | Replacement text for the last AI bubble (code blocks stripped). |
+
+**When sent:** After `media` messages, when `strip_rendered_content()` has removed rendered code blocks or tables from the response text.
+
+**Tab5 behavior on receive:** Replace the text content of the most recent AI chat bubble with the new text.
+
+### 15.5 user_media (Tab5 -> Dragon)
+
+User sends a camera photo for multimodal LLM analysis.
+
+```json
+{
+  "type": "user_media",
+  "media_id": "m3n4o5p6",
+  "media_type": "image",
+  "text": "What is this plant?"
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | `"user_media"` |
+| `media_id` | string | ID from a prior `POST /api/media/upload` response. |
+| `media_type` | string | `"image"` (camera photo). |
+| `text` | string | Optional. User's question about the image. |
+
+**When sent:** After Tab5 captures a photo and uploads it via `POST /api/media/upload`, it sends this message with the returned `media_id` and an optional text prompt.
+
+**Dragon behavior on receive:**
+1. Loads the image from MediaStore using `media_id`.
+2. Passes the image + text to the LLM for multimodal analysis.
+3. Streams the response as normal (`llm` tokens → `llm_done` → optional TTS).
+
+### 15.6 REST Endpoints for Media
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/media/{id}` | Serve rendered media file (JPEG/PNG/WAV). Response includes `Cache-Control: max-age=3600`. Returns 404 if media_id not found or expired. |
+| POST | `/api/media/upload` | Accept BMP/JPEG from Tab5 camera. Converts to JPEG, resizes to max 660px width via Pillow. Returns `{"media_id":"..."}`. |
+
+### 15.7 MediaPipeline Flow
+
+```
+LLM response text
+       |
+       v
+process_response()
+       |
+       +-- Regex scan for:
+       |     ```lang...```  (code blocks)
+       |     |col|col|      (markdown tables)
+       |     https://...jpg (image URLs)
+       |
+       +-- Code blocks → Pygments ImageFormatter (dark theme) → JPEG
+       +-- Tables → Pillow styled grid (orange headers, dark bg) → JPEG
+       +-- Image URLs → aiohttp download → resize 660px max → JPEG q80
+       |
+       +-- All stored in MediaStore (/home/radxa/media/)
+       +-- Max 3 media items per response
+       |
+       v
+Send media/card/audio_clip messages to Tab5
+       |
+       v
+strip_rendered_content() → text_update message
+```
+
+---
+
+## 16. Message Reference
 
 ### All Messages: Tab5 -> Dragon
 
@@ -1124,6 +1290,7 @@ Direct integer mode (0=Local, 1=Hybrid, 2=Full Cloud) with explicit model select
 | `clear` | `{"type":"clear"}` | Clear history | `session_start` (new session) |
 | `ping` | `{"type":"ping"}` | Every 15s during PROCESSING/SPEAKING | `pong` |
 | `config_update` | `{"type":"config_update","cloud_mode":true}` | Cloud mode toggle | `config_update` (confirmation) |
+| `user_media` | `{"type":"user_media","media_id":"...","media_type":"image","text":"..."}` | Camera photo for multimodal LLM | `llm` -> `llm_done` -> optional TTS |
 
 ### All Messages: Dragon -> Tab5
 
@@ -1143,3 +1310,7 @@ Direct integer mode (0=Local, 1=Hybrid, 2=Full Cloud) with explicit model select
 | `tool_call` | `{"type":"tool_call","tool":"web_search","args":{"query":"..."}}` | During LLM tool execution | Display tool activity indicator |
 | `tool_result` | `{"type":"tool_result","tool":"web_search","result":{...},"execution_ms":234}` | After tool execution completes | Display tool result, update UI |
 | `dictation_summary` | `{"type":"dictation_summary","title":"...","summary":"..."}` | After dictation post-processing | Store title/summary, update UI |
+| `media` | `{"type":"media","media_type":"image","url":"/api/media/{id}","width":660,"height":N,"alt":"Code: python"}` | After llm_done (rendered code/table/image) | Fetch image, display inline in chat |
+| `card` | `{"type":"card","title":"...","subtitle":"...","image_url":"...","description":"..."}` | Rich content display | Render styled card in chat UI |
+| `audio_clip` | `{"type":"audio_clip","url":"...","duration_s":N,"label":"..."}` | Non-TTS audio content | Show audio player widget |
+| `text_update` | `{"type":"text_update","text":"..."}` | After media rendered, code stripped from text | Replace last AI bubble text |

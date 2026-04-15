@@ -4,6 +4,7 @@ Sends base64-encoded WAV audio to OpenRouter's gpt-audio-mini model
 for transcription via the chat completions API.
 """
 
+import asyncio
 import base64
 import io
 import logging
@@ -82,7 +83,12 @@ class OpenRouterSTTBackend(STTBackend):
                 if resp.status != 200:
                     err = await resp.text()
                     logger.error("OpenRouter STT error %d: %s", resp.status, err[:300])
-                    return ""
+                    # P19: Raise on HTTP errors so pipeline fallback triggers.
+                    # Previously returned "" which swallowed the error and
+                    # prevented the pipeline from falling back to local STT.
+                    raise RuntimeError(
+                        f"OpenRouter STT HTTP {resp.status}: {err[:200]}"
+                    )
                 data = await resp.json()
                 # Defensive parsing — OpenRouter format may vary
                 choices = data.get("choices", [])
@@ -96,9 +102,18 @@ class OpenRouterSTTBackend(STTBackend):
                 self._last_usage = usage
                 logger.info("OpenRouter STT: '%s' (tokens: %s)", text[:80], usage)
                 return text
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as e:
+            # P19: Re-raise connection/timeout/HTTP errors so the pipeline's
+            # fallback logic in _process_utterance can catch them and retry
+            # with local STT (Moonshine). The audio_data is still available
+            # in the pipeline's local variable — no replay buffer needed.
+            logger.error("OpenRouter STT request failed (will trigger fallback): %s", e)
+            raise
         except Exception as e:
-            logger.error("OpenRouter STT request failed: %s", e)
-            return ""
+            # Unexpected errors (JSON parse, etc.) — still raise so pipeline
+            # can decide, but log at a different level for triage.
+            logger.error("OpenRouter STT unexpected error: %s", e)
+            raise
 
     async def shutdown(self) -> None:
         if self._session and not self._session.closed:

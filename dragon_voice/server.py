@@ -1400,6 +1400,21 @@ class VoiceServer:
                         len(response_text), response_text[:80])
             if not ws.closed:
                 await ws.send_json({"type": "llm_done", "llm_ms": 0, "text": response_text})
+
+            # Rich media detection for TinkerClaw responses too
+            if full_response and self._media_pipeline:
+                try:
+                    media_events = await self._media_pipeline.process_response(
+                        response_text, session_id
+                    )
+                    for event in media_events:
+                        if not ws.closed:
+                            await ws.send_json(event)
+                    if media_events:
+                        logger.info("Sent %d media events for TinkerClaw response", len(media_events))
+                except Exception as e:
+                    logger.warning("TinkerClaw media detection failed: %s", e)
+
             return
 
         try:

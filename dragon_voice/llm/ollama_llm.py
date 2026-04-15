@@ -38,7 +38,7 @@ class OllamaBackend(LLMBackend):
     async def initialize(self) -> None:
         """Verify Ollama is reachable and the model is available."""
         self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=180, sock_read=60)
+            timeout=aiohttp.ClientTimeout(total=300, sock_read=120)
         )
 
         logger.info(
@@ -120,7 +120,7 @@ class OllamaBackend(LLMBackend):
                     f"{self._base_url}/api/chat",
                     json=payload,
                 )
-                resp = await asyncio.wait_for(resp_ctx.__aenter__(), timeout=120)
+                resp = await asyncio.wait_for(resp_ctx.__aenter__(), timeout=300)
                 try:
                     if resp.status != 200:
                         error_text = await resp.text()
@@ -148,8 +148,8 @@ class OllamaBackend(LLMBackend):
                     await resp_ctx.__aexit__(None, None, None)
 
             except asyncio.TimeoutError:
-                logger.error("Ollama generation timed out after 120s")
-                yield "[Ollama timeout after 120s]"
+                logger.error("Ollama generation timed out after 300s")
+                yield "[Ollama timeout after 300s]"
                 return
             except aiohttp.ClientError as e:
                 logger.error("Ollama request failed: %s", e)
@@ -187,7 +187,7 @@ class OllamaBackend(LLMBackend):
                 f"{self._base_url}/api/chat",
                 json=payload,
             )
-            resp = await asyncio.wait_for(resp_ctx.__aenter__(), timeout=120)
+            resp = await asyncio.wait_for(resp_ctx.__aenter__(), timeout=300)
             try:
                 if resp.status != 200:
                     error_text = await resp.text()
@@ -214,8 +214,8 @@ class OllamaBackend(LLMBackend):
                 await resp_ctx.__aexit__(None, None, None)
 
         except asyncio.TimeoutError:
-            logger.error("Ollama generation timed out after 120s")
-            yield "[Ollama timeout after 120s]"
+            logger.error("Ollama generation timed out after 300s")
+            yield "[Ollama timeout after 300s]"
         except aiohttp.ClientError as e:
             logger.error("Ollama request failed: %s", e)
             yield f"[Connection error: {e}]"

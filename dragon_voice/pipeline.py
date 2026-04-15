@@ -222,14 +222,24 @@ class VoicePipeline:
         )
 
     async def _process_with_timeout(self, audio_data: bytes) -> None:
-        """Run _process_utterance with a 180s safety timeout."""
+        """Run _process_utterance with a mode-aware safety timeout.
+
+        Local mode (ollama/npu_genie): 300s (5 min) — slow ARM64 CPU + tool-calling chains.
+        Cloud/Hybrid (openrouter): 60s — cloud LLM is fast, timeout means real failure.
+        TinkerClaw: 300s (5 min) — agentic chains with tool execution.
+        """
+        backend = self._config.llm.backend
+        if backend in ("ollama", "npu_genie", "lmstudio", "tinkerclaw"):
+            timeout = 300
+        else:
+            timeout = 60
         try:
-            await asyncio.wait_for(self._process_utterance(audio_data), timeout=180)
+            await asyncio.wait_for(self._process_utterance(audio_data), timeout=timeout)
         except asyncio.TimeoutError:
-            logger.error("Pipeline processing timed out after 180s")
+            logger.error("Pipeline processing timed out after %ds (backend=%s)", timeout, backend)
             self._processing = False
             try:
-                await self._on_event({"type": "error", "message": "Processing timed out"})
+                await self._on_event({"type": "error", "message": f"Processing timed out after {timeout}s"})
                 # Send tts_end so Tab5 doesn't hang
                 if self._tts_started:
                     await self._on_event({"type": "tts_end", "tts_ms": 0})

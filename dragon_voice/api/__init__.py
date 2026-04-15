@@ -12,6 +12,7 @@ from dragon_voice.api.messages import MessageRoutes
 from dragon_voice.api.devices import DeviceRoutes
 from dragon_voice.api.config_routes import ConfigRoutes
 from dragon_voice.api.events import EventRoutes
+from dragon_voice.api.media_routes import MediaRoutes
 from dragon_voice.api.synthesize import SynthesizeRoutes
 from dragon_voice.api.completions import CompletionRoutes
 from dragon_voice.api.system import SystemRoutes
@@ -30,6 +31,7 @@ def setup_all_routes(
     get_active_connections=None,
     tool_registry=None,
     memory_service=None,
+    media_store=None,
 ) -> None:
     """Register all API route modules on the aiohttp app.
 
@@ -45,6 +47,10 @@ def setup_all_routes(
     # Media endpoints (TTS synthesis, STT transcription, OTA)
     if voice_config:
         SynthesizeRoutes(voice_config).register(app)
+
+    # Media file serving + camera upload (Task 2)
+    if media_store:
+        MediaRoutes(media_store).register(app)
 
     # Direct LLM completion
     CompletionRoutes(conversation).register(app)

@@ -22,6 +22,8 @@ import aiohttp
 from aiohttp import web, WSMsgType
 
 from dragon_voice.api import setup_all_routes
+from dragon_voice.media.store import MediaStore
+from dragon_voice.media.pipeline import MediaPipeline
 from dragon_voice.config import (
     VoiceConfig, config_to_dict, load_config,
     SYSTEM_PROMPT_LOCAL, SYSTEM_PROMPT_HYBRID, SYSTEM_PROMPT_CLOUD,
@@ -75,6 +77,11 @@ class VoiceServer:
         self._message_store: Optional[MessageStore] = None
         self._conversation: Optional[ConversationEngine] = None
         self._notes_svc = None
+
+        # Media handling (rich media detection + user image uploads)
+        self._media_store = MediaStore()
+        self._media_pipeline = MediaPipeline(self._media_store)
+        self._media_cleanup_task: Optional[asyncio.Task] = None
 
     def create_app(self) -> web.Application:
         """Create and configure the aiohttp application."""
@@ -265,6 +272,7 @@ class VoiceServer:
             get_active_connections=lambda: len(self._active_connections),
             tool_registry=self._tool_registry,
             memory_service=self._memory_service,
+            media_store=self._media_store,
         )
 
         # Notes API routes
@@ -320,6 +328,9 @@ class VoiceServer:
                 self._periodic_purge(retention_days)
             )
 
+        # Media cleanup (hourly, removes expired uploads)
+        self._media_cleanup_task = asyncio.create_task(self._media_cleanup_loop())
+
         # Start periodic memory monitor (A04)
         self._memory_monitor_task = asyncio.create_task(self._memory_monitor())
         rss = self._get_rss_mb()
@@ -342,6 +353,15 @@ class VoiceServer:
                 )
             except Exception as e:
                 logger.warning("Periodic purge failed: %s", e)
+
+    async def _media_cleanup_loop(self):
+        """Remove expired media uploads every hour."""
+        while True:
+            await asyncio.sleep(3600)
+            try:
+                await self._media_store.cleanup()
+            except Exception as e:
+                logger.warning("Media cleanup error: %s", e)
 
     @staticmethod
     def _get_rss_mb() -> float:
@@ -482,6 +502,7 @@ class VoiceServer:
                                     conn.get("_on_event"),
                                     conversation_engine=self._conversation,
                                     session_id=conn.get("session_id", ""),
+                                    media_pipeline=self._media_pipeline,
                                 )
                                 await pipeline.initialize()
                                 conn["pipeline"] = pipeline
@@ -943,6 +964,10 @@ class VoiceServer:
                         async with conn_lock:  # US-P10: serialize with voice
                             await self._handle_text(ws, conn_state, cmd)
 
+                    elif cmd_type == "user_media":
+                        async with conn_lock:
+                            await self._handle_user_media(ws, conn_state, cmd)
+
                     elif cmd_type == "record_start" or cmd_type == "record_stop":
                         # Superseded by dictation mode (start with mode=dictate)
                         logger.info("Connection %s: %s (use mode=dictate instead)", ws_id, cmd_type)
@@ -1297,6 +1322,7 @@ class VoiceServer:
             conn_config, on_audio, on_event,
             conversation_engine=self._conversation,
             session_id=session_id,
+            media_pipeline=self._media_pipeline,
         )
         try:
             await pipeline.initialize()
@@ -1395,6 +1421,18 @@ class VoiceServer:
             if not ws.closed:
                 await ws.send_json({"type": "llm_done", "llm_ms": 0})
 
+            # Rich media detection — scan response for image/chart/map references
+            if full_response:
+                try:
+                    media_events = await self._media_pipeline.process_response(
+                        response_text, session_id
+                    )
+                    for event in media_events:
+                        if not ws.closed:
+                            await ws.send_json(event)
+                except Exception as e:
+                    logger.warning("Media detection failed: %s", e)
+
             # Synthesize TTS for the text response (only if response_mode != match_input)
             # match_input = text in, text out. always_speak = always TTS.
             pipeline = conn_state.get("pipeline")
@@ -1447,6 +1485,77 @@ class VoiceServer:
             if not ws.closed:
                 await ws.send_json({"type": "error", "code": "llm_failed",
                                     "message": "Text processing failed"})
+
+    async def _handle_user_media(self, ws, conn_state, cmd):
+        """Handle image/audio uploaded by Tab5 for multimodal LLM analysis."""
+        import base64
+        media_id = cmd.get("media_id", "")
+        text = cmd.get("text", "What's in this image?")
+        session_id = conn_state.get("session_id", "")
+        conn_config = conn_state.get("config", self._config)
+
+        image_path = await self._media_store.get_path(media_id)
+        if not image_path:
+            if not ws.closed:
+                await ws.send_json({"type": "error", "message": "Image not found"})
+            return
+
+        backend = conn_config.llm.backend
+        if backend == "ollama" and "vision" not in conn_config.llm.ollama_model:
+            if not ws.closed:
+                await ws.send_json({
+                    "type": "error",
+                    "message": "Image analysis needs Cloud or TinkerClaw mode"
+                })
+            return
+
+        with open(image_path, "rb") as f:
+            image_b64 = base64.b64encode(f.read()).decode()
+
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                {"type": "text", "text": text},
+            ]
+        }]
+
+        full_response = []
+        llm = conn_state.get("conversation")
+        if llm and hasattr(llm, '_llm'):
+            llm_backend = llm._llm
+        else:
+            llm_backend = None
+
+        if not llm_backend:
+            if not ws.closed:
+                await ws.send_json({"type": "error", "message": "No LLM available"})
+            return
+
+        try:
+            async for token in llm_backend.generate_stream_with_messages(messages):
+                full_response.append(token)
+                if not ws.closed:
+                    await ws.send_json({"type": "llm", "text": token})
+        except Exception as e:
+            logger.error("user_media LLM failed: %s", e)
+            if not ws.closed:
+                await ws.send_json({"type": "error", "message": str(e)})
+            return
+
+        if not ws.closed:
+            await ws.send_json({"type": "llm_done", "llm_ms": 0})
+
+        if full_response and self._message_store:
+            try:
+                await self._message_store.add_message(
+                    session_id=session_id,
+                    role="assistant",
+                    content="".join(full_response),
+                    input_mode="vision",
+                )
+            except Exception as e:
+                logger.warning("Failed to store vision response: %s", e)
 
     async def _handle_disconnect(self, conn_state: dict) -> None:
         """Handle WebSocket disconnect: pause session, mark device offline."""

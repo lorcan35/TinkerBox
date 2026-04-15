@@ -63,6 +63,7 @@ class VoicePipeline:
         on_event: Callable[[dict], Awaitable[None]],
         conversation_engine=None,
         session_id: str = "",
+        media_pipeline=None,
     ) -> None:
         """Initialize the pipeline.
 
@@ -76,12 +77,14 @@ class VoicePipeline:
                                If provided, LLM calls go through the engine
                                (which stores messages in DB for context).
             session_id: Active session ID (required if conversation_engine is set).
+            media_pipeline: Optional MediaPipeline for rich media detection.
         """
         self._config = config
         self._on_audio = on_audio
         self._on_event = on_event
         self._conversation_engine = conversation_engine
         self._session_id = session_id
+        self._media_pipeline = media_pipeline
 
         self._stt: Optional[STTBackend] = None
         self._tts: Optional[TTSBackend] = None
@@ -558,6 +561,17 @@ class VoicePipeline:
             llm_ms = (time.monotonic() - t0) * 1000
             logger.info("LLM (%.0fms): %s", llm_ms, full_response[:80])
             await self._on_event({"type": "llm_done", "llm_ms": round(llm_ms)})
+
+            # Rich media detection on full response
+            if self._media_pipeline and full_response:
+                try:
+                    media_events = await self._media_pipeline.process_response(
+                        full_response, self._session_id or ""
+                    )
+                    for event in media_events:
+                        await self._on_event(event)
+                except Exception as e:
+                    logger.warning("Voice media detection failed: %s", e)
 
             # Send tts_end once after all sentences are done
             if self._tts_started and not self._cancelled:

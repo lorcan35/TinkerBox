@@ -1,5 +1,6 @@
 aiohttp>=3.9.0
 Pillow>=10.0.0
+Pygments>=2.17.0
 zeroconf>=0.131.0
 pyyaml>=6.0
 numpy>=1.24

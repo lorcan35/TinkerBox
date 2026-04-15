@@ -938,7 +938,7 @@ class VoiceServer:
                         if old_sid and self._session_mgr:
                             await self._session_mgr.end_session(old_sid)
                             session, _ = await self._session_mgr.create_session(
-                                device_id=device_id, type="conversation"
+                                device_id=device_id, session_type="conversation"
                             )
                             conn_state["session_id"] = session["id"]
                             logger.info("Connection %s: history cleared, new session %s",
@@ -1412,6 +1412,9 @@ class VoiceServer:
                             await ws.send_json(event)
                     if media_events:
                         logger.info("Sent %d media events for TinkerClaw response", len(media_events))
+                        cleaned = self._media_pipeline.strip_rendered_content(response_text, media_events)
+                        if cleaned != response_text and not ws.closed:
+                            await ws.send_json({"type": "text_update", "text": cleaned})
                 except Exception as e:
                     logger.warning("TinkerClaw media detection failed: %s", e)
 
@@ -1445,6 +1448,10 @@ class VoiceServer:
                     for event in media_events:
                         if not ws.closed:
                             await ws.send_json(event)
+                    if media_events:
+                        cleaned = self._media_pipeline.strip_rendered_content(response_text, media_events)
+                        if cleaned != response_text and not ws.closed:
+                            await ws.send_json({"type": "text_update", "text": cleaned})
                 except Exception as e:
                     logger.warning("Media detection failed: %s", e)
 

@@ -196,6 +196,22 @@ class MediaPipeline:
             self._session = aiohttp.ClientSession()
         return self._session
 
+    def strip_rendered_content(self, text: str, events: list[dict]) -> str:
+        """Remove code blocks and image URLs from text that were rendered as media.
+
+        Called after media events are sent so the raw markdown doesn't appear
+        as duplicate text alongside the rendered images.
+        """
+        import re
+        cleaned = text
+        for match in _RE_CODE_BLOCK.finditer(text):
+            cleaned = cleaned.replace(match.group(0), "")
+        for match in _RE_IMAGE_URL.finditer(text):
+            cleaned = cleaned.replace(match.group(0), "")
+        # Clean up excessive whitespace left behind
+        cleaned = re.sub(r'\n{3,}', '\n\n', cleaned).strip()
+        return cleaned
+
     async def close(self) -> None:
         """Close the underlying HTTP session if open."""
         if self._session and not self._session.closed:
@@ -218,11 +234,12 @@ def _render_code_pygments(code: str, language: str) -> bytes:
         lexer = TextLexer(stripall=True)
 
     formatter = ImageFormatter(
-        style="monokai",
+        style="native",
         font_name="DejaVu Sans Mono",
         font_size=14,
         line_numbers=False,
-        image_pad=12,
+        line_pad=6,
+        image_pad=20,
     )
     result = highlight(code, lexer, formatter)
     return result  # PNG bytes

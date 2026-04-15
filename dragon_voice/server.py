@@ -355,12 +355,42 @@ class VoiceServer:
             pass
         return 0.0
 
+    @staticmethod
+    def _get_cpu_temp() -> float:
+        """Read CPU temperature from thermal zone sysfs (DQ03).
+
+        Tries thermal_zone0 first (common on QCS6490), then scans all
+        thermal zones for the highest reading.  Returns 0.0 on failure.
+        """
+        # Try thermal_zone0 first (fastest path)
+        try:
+            with open('/sys/class/thermal/thermal_zone0/temp') as f:
+                temp_mc = int(f.read().strip())
+                return temp_mc / 1000.0
+        except Exception:
+            pass
+
+        # Fallback: scan all thermal zones, return the highest
+        import glob
+        max_temp = 0.0
+        for path in glob.glob('/sys/devices/virtual/thermal/thermal_zone*/temp'):
+            try:
+                with open(path) as f:
+                    temp_mc = int(f.read().strip())
+                    t = temp_mc / 1000.0
+                    if t > max_temp:
+                        max_temp = t
+            except Exception:
+                continue
+        return max_temp
+
     async def _memory_monitor(self) -> None:
         """Periodic memory check every 5 minutes (A04).
 
-        - Log RSS at INFO level
+        - Log RSS and CPU temperature at INFO level
         - If RSS > warn threshold: force gc.collect() and log WARNING
         - If RSS > critical threshold after GC: gracefully restart all pipelines
+        - DQ03: Log CPU temperature warnings at 80°C and errors at 90°C
         """
         while True:
             await asyncio.sleep(300)  # 5 minutes
@@ -369,6 +399,9 @@ class VoiceServer:
                 continue
 
             active = len(self._active_connections)
+
+            # CPU temperature monitoring (DQ03): detect thermal throttling
+            temp_c = self._get_cpu_temp()
 
             # FD count monitoring (DQ08): detect file descriptor exhaustion
             try:
@@ -380,9 +413,23 @@ class VoiceServer:
                 fd_pct = 0.0
 
             logger.info(
-                "Memory monitor: RSS=%.0f MB, connections=%d, FDs=%d/%d (%.0f%%)",
-                rss, active, fd_count, fd_limit, fd_pct,
+                "Memory monitor: RSS=%.0f MB, temp=%.1f°C, connections=%d, FDs=%d/%d (%.0f%%)",
+                rss, temp_c, active, fd_count, fd_limit, fd_pct,
             )
+
+            # DQ03: Thermal warnings — monitoring only, no throttling
+            if temp_c >= 90:
+                logger.error(
+                    "Memory monitor: CPU temp %.1f°C exceeds 90°C — "
+                    "risk of eMMC degradation and component damage!",
+                    temp_c,
+                )
+            elif temp_c >= 80:
+                logger.warning(
+                    "Memory monitor: CPU temp %.1f°C exceeds 80°C — "
+                    "Gold cores likely throttled from 2.7GHz",
+                    temp_c,
+                )
 
             if fd_pct >= 80:
                 logger.warning(

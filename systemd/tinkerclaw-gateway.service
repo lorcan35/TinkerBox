@@ -16,7 +16,7 @@ Wants=ollama.service
 Type=simple
 User=radxa
 WorkingDirectory=/home/radxa/tinkerclaw
-ExecStart=/usr/bin/node dist/index.js gateway --port 18789
+ExecStart=/usr/bin/node --max-old-space-size=512 dist/index.js gateway --port 18789
 Restart=on-failure
 RestartSec=5
 Environment=NODE_ENV=production

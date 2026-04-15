@@ -120,6 +120,7 @@ class TinkerClawBackend(LLMBackend):
 
                 saw_done = False
                 token_count = 0
+                consecutive_errors = 0  # P11: detect HTML error pages from proxy
 
                 async for line in resp.content:
                     line = line.decode("utf-8", errors="replace").strip()
@@ -133,7 +134,17 @@ class TinkerClawBackend(LLMBackend):
 
                     try:
                         chunk = json.loads(data_str)
+                        consecutive_errors = 0  # Reset on successful parse
                     except json.JSONDecodeError:
+                        consecutive_errors += 1
+                        if consecutive_errors >= 5:
+                            logger.error(
+                                "P11: %d consecutive JSON parse failures — "
+                                "probable HTML error page from proxy. Last line: %s",
+                                consecutive_errors, data_str[:200],
+                            )
+                            yield "Sorry, the connection returned an error page instead of a response. Please try again."
+                            return
                         continue
 
                     choices = chunk.get("choices", [])

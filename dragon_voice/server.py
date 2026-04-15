@@ -13,6 +13,8 @@ import copy
 import gc
 import json
 import logging
+import os
+import resource
 import time
 from typing import Optional
 
@@ -63,6 +65,9 @@ class VoiceServer:
         self._stt_name = config.stt.backend
         self._tts_name = config.tts.backend
         self._llm_name = config.llm.backend
+
+        # Shared aiohttp client session for dashboard proxy (DQ08: avoids per-request FD churn)
+        self._proxy_session: Optional[aiohttp.ClientSession] = None
 
         # Foundation modules (initialized in on_startup)
         self._db: Optional[Database] = None
@@ -144,26 +149,28 @@ class VoiceServer:
             target += f"?{request.query_string}"
 
         try:
-            import aiohttp as _aiohttp
-            timeout = _aiohttp.ClientTimeout(total=30)
-            async with _aiohttp.ClientSession(timeout=timeout) as session:
-                method = request.method
-                headers = {k: v for k, v in request.headers.items()
-                           if k.lower() not in ("host", "content-length", "transfer-encoding")}
-                body = await request.read() if request.can_read_body else None
+            session = self._proxy_session
+            if session is None or session.closed:
+                session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
+                self._proxy_session = session
 
-                async with session.request(method, target, headers=headers, data=body) as resp:
-                    response = web.StreamResponse(
-                        status=resp.status,
-                        headers={k: v for k, v in resp.headers.items()
-                                 if k.lower() not in ("transfer-encoding", "content-encoding")},
-                    )
-                    response.content_type = resp.content_type
-                    await response.prepare(request)
-                    async for chunk in resp.content.iter_any():
-                        await response.write(chunk)
-                    await response.write_eof()
-                    return response
+            method = request.method
+            headers = {k: v for k, v in request.headers.items()
+                       if k.lower() not in ("host", "content-length", "transfer-encoding")}
+            body = await request.read() if request.can_read_body else None
+
+            async with session.request(method, target, headers=headers, data=body) as resp:
+                response = web.StreamResponse(
+                    status=resp.status,
+                    headers={k: v for k, v in resp.headers.items()
+                             if k.lower() not in ("transfer-encoding", "content-encoding")},
+                )
+                response.content_type = resp.content_type
+                await response.prepare(request)
+                async for chunk in resp.content.iter_any():
+                    await response.write(chunk)
+                await response.write_eof()
+                return response
         except Exception as e:
             logger.warning("Dashboard proxy failed: %s", e)
             return web.json_response(
@@ -176,6 +183,11 @@ class VoiceServer:
     async def _on_startup(self, app: web.Application) -> None:
         """Initialize foundation modules on server start."""
         logger.info("Initializing foundation modules...")
+
+        # Shared client session for dashboard proxy (DQ08)
+        self._proxy_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=30)
+        )
 
         # Database
         self._db = Database()
@@ -357,7 +369,26 @@ class VoiceServer:
                 continue
 
             active = len(self._active_connections)
-            logger.info("Memory monitor: RSS=%.0f MB, connections=%d", rss, active)
+
+            # FD count monitoring (DQ08): detect file descriptor exhaustion
+            try:
+                fd_count = len(os.listdir(f'/proc/{os.getpid()}/fd'))
+                fd_limit = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+                fd_pct = (fd_count / fd_limit * 100) if fd_limit > 0 else 0
+            except Exception:
+                fd_count = fd_limit = 0
+                fd_pct = 0.0
+
+            logger.info(
+                "Memory monitor: RSS=%.0f MB, connections=%d, FDs=%d/%d (%.0f%%)",
+                rss, active, fd_count, fd_limit, fd_pct,
+            )
+
+            if fd_pct >= 80:
+                logger.warning(
+                    "Memory monitor: FD usage at %.0f%% (%d/%d) — risk of exhaustion!",
+                    fd_pct, fd_count, fd_limit,
+                )
 
             if rss > self._mem_warn_mb:
                 logger.warning(
@@ -430,6 +461,10 @@ class VoiceServer:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._active_connections.clear()
+
+        # Close shared proxy session (DQ08)
+        if self._proxy_session and not self._proxy_session.closed:
+            await self._proxy_session.close()
 
         # Shut down foundation
         if self._notes_svc:

@@ -44,6 +44,10 @@ _HALLUCINATION_STOPS = re.compile(
 # VAD constants
 _SILENCE_THRESHOLD = 500  # RMS amplitude below this = silence (int16 range)
 
+# P06: Max audio buffer size — 5 minutes at 16kHz 16-bit mono = 9.6MB.
+# Prevents unbounded memory growth from long dictation sessions or stuck clients.
+MAX_AUDIO_BUFFER = 5 * 60 * 16000 * 2  # 9,600,000 bytes
+
 
 class VoicePipeline:
     """Orchestrates the full STT -> LLM -> TTS voice pipeline.
@@ -98,6 +102,7 @@ class VoicePipeline:
         self._tts_started = False
         self._tts_total_ms = 0.0
         self._process_task: Optional[asyncio.Task] = None
+        self._post_process_task: Optional[asyncio.Task] = None  # DQ22: track post-processing task
 
         # Dictation mode state
         self._dictation_mode = False
@@ -141,12 +146,26 @@ class VoicePipeline:
         if self._dictation_mode:
             # Dictation: buffer in segment buffer, no Dragon-side VAD.
             # Tab5 sends {"type":"segment"} markers when it detects pauses.
+            # P06: enforce buffer cap on segment buffer too
+            if len(self._segment_buffer) + len(audio_bytes) > MAX_AUDIO_BUFFER:
+                logger.warning(
+                    "P06: segment buffer full (%d bytes), dropping audio",
+                    len(self._segment_buffer),
+                )
+                return
             self._segment_buffer.extend(audio_bytes)
             return
 
         if self._processing:
             return
 
+        # P06: enforce buffer cap to prevent unbounded memory growth
+        if len(self._audio_buffer) + len(audio_bytes) > MAX_AUDIO_BUFFER:
+            logger.warning(
+                "P06: audio buffer full (%d bytes), dropping audio",
+                len(self._audio_buffer),
+            )
+            return
         self._audio_buffer.extend(audio_bytes)
 
         if not self._config.audio.vad_enabled:
@@ -191,6 +210,10 @@ class VoicePipeline:
             return
 
         audio_data = bytes(self._audio_buffer)
+        logger.info(
+            "Processing audio buffer: %d bytes (%.1fs at 16kHz)",
+            len(audio_data), len(audio_data) / 32000,
+        )
         self._audio_buffer.clear()
 
         self._is_speaking = False
@@ -223,6 +246,10 @@ class VoicePipeline:
                 await self._process_task
             except asyncio.CancelledError:
                 pass
+        # DQ22: cancel lingering post-process task
+        if self._post_process_task and not self._post_process_task.done():
+            self._post_process_task.cancel()
+            self._post_process_task = None
         # Kill any in-flight Piper TTS subprocesses (US-P24)
         if self._tts and hasattr(self._tts, "kill_active_procs"):
             self._tts.kill_active_procs()
@@ -310,10 +337,24 @@ class VoicePipeline:
         self._dictation_mode = False
 
         # Post-process: generate title + summary via LLM (async, non-blocking)
+        # DQ22: store the task so it can be cancelled on shutdown/cancel
         if full_text.strip() and len(full_text) > 20:
-            asyncio.ensure_future(self._post_process_dictation(full_text))
+            self._post_process_task = asyncio.ensure_future(
+                self._post_process_dictation(full_text)
+            )
+            # Prevent "Task exception was never retrieved" warnings
+            self._post_process_task.add_done_callback(self._on_post_process_done)
 
         return full_text
+
+    @staticmethod
+    def _on_post_process_done(task: asyncio.Task) -> None:
+        """Callback to suppress 'Task exception was never retrieved' (DQ22)."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            logger.warning("Dictation post-processing task failed: %s", exc)
 
     async def _post_process_dictation(self, transcript: str) -> None:
         """Generate title + summary for completed dictation via LLM."""
@@ -486,14 +527,19 @@ class VoicePipeline:
                             # Last fragment is incomplete — keep buffering
                             remainder = sentence
                     sentence_buffer = remainder
-                # Local mode: flush on clause boundary (comma/semicolon/colon/dash)
-                # when buffer has 20+ chars. Starts TTS 1-2s earlier on slow models.
-                elif (self._config.llm.backend in ("ollama", "npu_genie", "lmstudio")
-                      and len(sentence_buffer) >= 20
-                      and _CLAUSE_END.search(sentence_buffer)):
-                    if sentence_buffer.strip():
-                        await self._synthesize_and_send(sentence_buffer.strip())
-                    sentence_buffer = ""
+                # Clause-level flushing: flush on comma/semicolon/colon/dash
+                # when buffer reaches a minimum length. Threshold is mode-aware:
+                #  - Local backends (low latency): 20 chars — start TTS early
+                #  - Cloud/hybrid backends (bursty tokens): 60 chars — buffer
+                #    a full sentence-length clause to smooth over latency spikes
+                #    and avoid choppy playback (P08)
+                elif _CLAUSE_END.search(sentence_buffer):
+                    is_local = self._config.llm.backend in ("ollama", "npu_genie", "lmstudio")
+                    clause_min_chars = 20 if is_local else 60
+                    if len(sentence_buffer) >= clause_min_chars:
+                        if sentence_buffer.strip():
+                            await self._synthesize_and_send(sentence_buffer.strip())
+                        sentence_buffer = ""
 
             # Flush remaining text
             if sentence_buffer.strip() and not self._cancelled:

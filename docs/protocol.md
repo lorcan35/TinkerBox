@@ -1314,3 +1314,279 @@ strip_rendered_content() → text_update message
 | `card` | `{"type":"card","title":"...","subtitle":"...","image_url":"...","description":"..."}` | Rich content display | Render styled card in chat UI |
 | `audio_clip` | `{"type":"audio_clip","url":"...","duration_s":N,"label":"..."}` | Non-TTS audio content | Show audio player widget |
 | `text_update` | `{"type":"text_update","text":"..."}` | After media rendered, code stripped from text | Replace last AI bubble text |
+
+---
+
+## 17. Widget Platform Messages (v1, April 2026)
+
+**Added with Widget Platform v1.** Extends the rich-media pipeline (§15) with
+a typed skill-surface vocabulary. Skills on Dragon emit typed widget state;
+devices render it opinionatedly.
+
+See TinkerTab `docs/WIDGETS.md` for the full design spec, rendering contract,
+and authoring guide. This section is the on-the-wire protocol only.
+
+### 17.1 Overview
+
+Six widget types. Messages are backward-compatible additions — existing
+clients that don't recognize a `widget_*` type simply ignore it.
+
+| Direction | Type | Purpose |
+|---|---|---|
+| Dragon → Tab5 | `widget_live` | Create or replace the one-at-a-time live widget |
+| Dragon → Tab5 | `widget_live_update` | Partial update to current live widget |
+| Dragon → Tab5 | `widget_live_dismiss` | Remove live widget (home returns to idle) |
+| Dragon → Tab5 | `widget_card` | Push a card into the activity stream / chat |
+| Dragon → Tab5 | `widget_list` | Show a pick-one-of-N modal |
+| Dragon → Tab5 | `widget_chart` | Show a data shape (spark / bar / gauge) |
+| Dragon → Tab5 | `widget_media` | Image + caption (alias of §15 `media` with skill_id) |
+| Dragon → Tab5 | `widget_prompt` | Ask one question with typed input |
+| Dragon → Tab5 | `widget_dismiss` | Dismiss any non-live widget by card_id |
+| Tab5 → Dragon | `widget_action` | User tapped action or answered prompt |
+| Tab5 → Dragon | `widget_capability` | Advertise supported widgets / icons (optional) |
+
+### 17.2 Live widget — `widget_live`
+
+```json
+{
+  "type": "widget_live",
+  "skill_id": "timesense.pomodoro",
+  "card_id": "ts_25",
+  "title": "Deep work",
+  "body": "25:00 remaining",
+  "icon": "briefcase",
+  "tone": "calm",
+  "progress": 0.0,
+  "action": {"label": "PAUSE", "event": "ts.pause"},
+  "priority": 80,
+  "expires_ms": 1500000
+}
+```
+
+**Slots:**
+- `skill_id` — required; dotted namespace (owner.skill)
+- `card_id` — required; stable across updates
+- `title` — required; ≤32 chars; renders as serif display on Tab5
+- `body` — required; ≤80 chars; wraps max 2 lines
+- `icon` — optional; one of 16 v1 built-in ids (see TinkerTab `docs/WIDGETS.md` §6)
+- `tone` — required; one of `calm|active|approaching|urgent|done`
+- `progress` — optional; 0.0–1.0; drives orb ring + size
+- `action` — optional; single tappable action
+- `priority` — optional (default 50); 0–100; brain sorts by priority × age
+- `expires_ms` — optional; TTL from push; auto-dismiss after
+
+**Tone → Tab5 rendering:** see TinkerTab `docs/WIDGETS.md` §3.1 mapping table.
+
+### 17.3 Live update — `widget_live_update`
+
+Partial. Only send slots that changed.
+
+```json
+{
+  "type": "widget_live_update",
+  "card_id": "ts_25",
+  "body": "23:58 remaining",
+  "progress": 0.08,
+  "tone": "active"
+}
+```
+
+Tab5 merges into its local widget_store entry. If `card_id` is unknown
+(maybe the dismiss race landed first), Tab5 drops silently.
+
+### 17.4 Live dismiss — `widget_live_dismiss`
+
+```json
+{"type": "widget_live_dismiss", "card_id": "ts_25"}
+```
+
+Tab5 marks the widget inactive. If this was the highest-priority active live
+widget, home returns to idle or promotes the next-highest.
+
+### 17.5 Card — `widget_card`
+
+Moment-in-conversation notification or tappable completion. Lands in chat
+stream (via existing `chat_msg_view.c` card renderer, extended with optional
+action).
+
+```json
+{
+  "type": "widget_card",
+  "skill_id": "timesense.pomodoro",
+  "card_id": "ts_done_25",
+  "title": "Done",
+  "body": "25 min · well run",
+  "tone": "success",
+  "icon": "check",
+  "action": {"label": "START ANOTHER", "event": "ts.start_next"}
+}
+```
+
+**Slots:**
+- `skill_id`, `card_id` — as live
+- `title` — ≤32 chars
+- `body` — ≤200 chars
+- `tone` — `info|success|alert`
+- `icon` — optional
+- `image_url` — optional hero image
+- `action` — optional single action
+
+### 17.6 List — `widget_list`
+
+```json
+{
+  "type": "widget_list",
+  "skill_id": "cooking.recipe",
+  "card_id": "pick_recipe_1",
+  "title": "Pick a recipe",
+  "items": [
+    {"id": "carbonara", "title": "Carbonara", "subtitle": "25 min · pantry"},
+    {"id": "ramen",     "title": "Ramen",     "subtitle": "20 min · noodles"},
+    {"id": "tacos",     "title": "Tacos",     "subtitle": "30 min · beef"}
+  ],
+  "on_select": "cooking.chose_recipe"
+}
+```
+
+Tap row → `widget_action` with `{event: on_select, payload: {id: ...}}`.
+
+### 17.7 Chart — `widget_chart`
+
+```json
+{
+  "type": "widget_chart",
+  "skill_id": "health.mood",
+  "card_id": "mood_week",
+  "title": "Mood this week",
+  "kind": "spark",
+  "series": [0.4, 0.5, 0.6, 0.7, 0.6, 0.8, 0.75],
+  "unit": "score",
+  "range": {"min": 0.0, "max": 1.0}
+}
+```
+
+**Kinds:**
+- `spark` — one-line chart, height ~80px on Tab5
+- `bar` — vertical bar grid
+- `gauge` — single-value arc
+
+Devices that don't implement `chart` (per capability) get a `widget_card`
+fallback with a text body (`"avg: 0.62, trending up"`) synthesized by the
+brain-side `SurfaceManager`.
+
+### 17.8 Media — `widget_media`
+
+Alias of §15 `media` with a `skill_id` added so actions can route back to the
+owning skill. Same JPEG fetch + TJPGD decode path.
+
+### 17.9 Prompt — `widget_prompt`
+
+```json
+{
+  "type": "widget_prompt",
+  "skill_id": "fitness.logger",
+  "card_id": "log_reps_1",
+  "question": "How many reps?",
+  "input": {"kind": "number", "placeholder": "e.g. 12"},
+  "on_answer": "fitness.record_reps"
+}
+```
+
+**Input kinds:**
+- `text` — opens keyboard
+- `number` — opens number keyboard
+- `choice` — shows list (`items` array required)
+- `confirm` — yes/no; voice-only; no keyboard
+
+### 17.10 Dismiss — `widget_dismiss`
+
+Generic dismissal for any non-live widget by card_id.
+
+```json
+{"type": "widget_dismiss", "card_id": "mood_week"}
+```
+
+### 17.11 Action — `widget_action` (Tab5 → Dragon)
+
+Emitted when user taps an action or answers a prompt.
+
+```json
+{
+  "type": "widget_action",
+  "card_id": "ts_25",
+  "event": "ts.pause"
+}
+```
+
+With payload (from prompt answer or list selection):
+
+```json
+{
+  "type": "widget_action",
+  "card_id": "log_reps_1",
+  "event": "fitness.record_reps",
+  "payload": {"value": 12}
+}
+```
+
+Dragon's `widget_action_router` dispatches to the owning skill's
+`on_action(event, payload)` handler. Errors → `widget_card` with `tone=alert`.
+
+### 17.12 Capability advertisement — `widget_capability` (Tab5 → Dragon)
+
+Optional. Extends the existing `register` frame. Sent at registration or on
+firmware upgrade.
+
+```json
+{
+  "type": "widget_capability",
+  "widgets": ["live", "card", "list", "media", "prompt"],
+  "icons": ["clock","briefcase","laundry","coffee","book","car","pot",
+            "person","droplet","check","alert","sun","moon","cloud",
+            "calendar","star"],
+  "render_mode": "client",
+  "screen": {"w": 720, "h": 1280, "fmt": "rgb565", "touch": true},
+  "input": {"mic": true, "keyboard": true, "imu": true, "camera": true}
+}
+```
+
+Brain stores this per session. Missing = assume full capability (Tab5
+default). Used by `SurfaceManager` to downgrade before emission.
+
+### 17.13 Error handling
+
+- **Unknown widget type** — client ignores, logs "unknown widget type: X".
+- **Unknown icon** — client renders without icon (blank top-right slot).
+- **Unknown tone** — treat as `active`.
+- **Malformed JSON** — client drops, logs.
+- **`widget_action` without matching card_id on Dragon** — logged, dropped.
+
+### 17.14 Backward compatibility
+
+All widget_* messages are new. Devices that don't know them are unchanged.
+Existing rich-media `media`, `card`, `audio_clip` continue to work as-is;
+widget_card is its superset (adds action).
+
+**When to prefer widget_* vs existing:**
+- `widget_card` is preferred for **skill-emitted** cards (has skill_id +
+  action); the old `card` is kept for chat-embedded LLM responses (code
+  blocks, tool results).
+- `widget_media` extends `media` with `skill_id`; use for skill-sourced
+  images.
+
+### 17.15 Message type reference (additions to §16)
+
+| Type | Direction | Required Fields | Since |
+|---|---|---|---|
+| `widget_live` | D→T | `skill_id`, `card_id`, `title`, `body`, `tone` | v1 |
+| `widget_live_update` | D→T | `card_id` | v1 |
+| `widget_live_dismiss` | D→T | `card_id` | v1 |
+| `widget_card` | D→T | `skill_id`, `card_id`, `title`, `body`, `tone` | v1 |
+| `widget_list` | D→T | `skill_id`, `card_id`, `title`, `items`, `on_select` | v1 |
+| `widget_chart` | D→T | `skill_id`, `card_id`, `title`, `kind`, `series` | v1 |
+| `widget_media` | D→T | `skill_id`, `url`, `alt` | v1 |
+| `widget_prompt` | D→T | `skill_id`, `card_id`, `question`, `input`, `on_answer` | v1 |
+| `widget_dismiss` | D→T | `card_id` | v1 |
+| `widget_action` | T→D | `card_id`, `event` | v1 |
+| `widget_capability` | T→D | `widgets`, `render_mode` | v1 |
+

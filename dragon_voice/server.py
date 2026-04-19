@@ -702,6 +702,46 @@ class VoiceServer:
 
     # --------------------------------------------------------------- WebSocket
 
+    @staticmethod
+    async def _safe_send_json(ws: web.WebSocketResponse, msg: dict) -> bool:
+        """Non-raising ws.send_json — returns True on success.
+
+        aiohttp raises ConnectionResetError (and bare Exception in some
+        paths) when the transport is mid-close. Handlers that call
+        send_json without guarding see the whole register/event flow
+        fail and the session gets paused even though the WS is simply
+        about to reconnect (refs #31). Use this helper everywhere.
+
+        Returns False silently if the WS is closed or the send fails;
+        callers should treat that as "client will reconnect and we'll
+        replay on the next session_start" — not a fatal error.
+        """
+        if ws.closed:
+            return False
+        try:
+            await ws.send_json(msg)
+            return True
+        except (ConnectionResetError, RuntimeError, asyncio.CancelledError):
+            # aiohttp uses RuntimeError("closing transport") on some paths
+            return False
+        except Exception as e:
+            logger.debug("_safe_send_json suppressed: %s", e)
+            return False
+
+    @staticmethod
+    async def _safe_send_bytes(ws: web.WebSocketResponse, data: bytes) -> bool:
+        """Non-raising ws.send_bytes — returns True on success. Same rationale as _safe_send_json."""
+        if ws.closed:
+            return False
+        try:
+            await ws.send_bytes(data)
+            return True
+        except (ConnectionResetError, RuntimeError, asyncio.CancelledError):
+            return False
+        except Exception as e:
+            logger.debug("_safe_send_bytes suppressed: %s", e)
+            return False
+
     async def _handle_ws_voice(self, request: web.Request) -> web.WebSocketResponse:
         """Main voice WebSocket endpoint.
 
@@ -1280,26 +1320,28 @@ class VoiceServer:
             conn_state["on_tool_call"] = _on_tool_call
             conn_state["on_tool_result"] = _on_tool_result
 
-        # Send session_start IMMEDIATELY — before slow pipeline init
-        # Tab5 will timeout if we don't respond quickly
-        try:
-            await ws.send_json({
-                "type": "session_start",
-                "session_id": session_id,
-                "device_id": device_id,
-                "resumed": resumed,
-                "message_count": session.get("message_count", 0),
-                "config": {
-                    "stt": conn_config.stt.backend,
-                    "tts": conn_config.tts.backend,
-                    "llm": conn_config.llm.backend,
-                    "tts_sample_rate": conn_config.audio.input_sample_rate,
-                    "response_mode": "match_input",
-                    "system_prompt": conn_config.llm.system_prompt,
-                },
-            })
-        except Exception as e:
-            logger.warning("Failed to send session_start to %s: %s (client may have disconnected)", ws_id, e)
+        # Send session_start IMMEDIATELY — before slow pipeline init.
+        # Use _safe_send_json so a transient transport close (the Tab5
+        # register-before-receive-task-running race, refs #31 + TT #76)
+        # doesn't propagate an exception up to the WS handler and force
+        # a session pause. If the send drops, the client will reconnect
+        # shortly and we'll replay session_start on the next handshake.
+        if not await self._safe_send_json(ws, {
+            "type": "session_start",
+            "session_id": session_id,
+            "device_id": device_id,
+            "resumed": resumed,
+            "message_count": session.get("message_count", 0),
+            "config": {
+                "stt": conn_config.stt.backend,
+                "tts": conn_config.tts.backend,
+                "llm": conn_config.llm.backend,
+                "tts_sample_rate": conn_config.audio.input_sample_rate,
+                "response_mode": "match_input",
+                "system_prompt": conn_config.llm.system_prompt,
+            },
+        }):
+            logger.info("session_start send dropped on %s — client likely reconnecting", ws_id)
             return
 
         logger.info(

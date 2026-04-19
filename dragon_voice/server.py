@@ -229,9 +229,13 @@ class VoiceServer:
             self._tool_registry.register(DateTimeTool())
 
             # Memory tools need memory_service
-            from dragon_voice.tools.memory_tools import StoreFactTool, RecallFactsTool
+            from dragon_voice.tools.memory_tools import (
+                StoreFactTool, RecallFactsTool, ForgetFactTool,
+            )
             self._tool_registry.register(StoreFactTool(self._memory_service))
             self._tool_registry.register(RecallFactsTool(self._memory_service))
+            # v4·D Gauntlet G9: two-step confirm-gated forget_fact tool.
+            self._tool_registry.register(ForgetFactTool(self._memory_service))
 
             # Tier 1 tools
             from dragon_voice.tools.timer_tool import TimerTool

@@ -59,9 +59,17 @@ class VoiceServer:
         self._purge_task: Optional[asyncio.Task] = None
         self._memory_monitor_task: Optional[asyncio.Task] = None
 
-        # Memory thresholds (MB) — Dragon has 8GB total, Ollama ~1.5GB, TinkerClaw ~300MB
-        self._mem_warn_mb = 2048   # Force GC above this
-        self._mem_crit_mb = 3072   # Restart pipeline above this (after GC)
+        # Memory thresholds (MB). Dragon has 8 GB total. Steady-state RSS
+        # includes Moonshine ONNX (~2.5 GB mmap) + Piper (~300 MB) + Ollama
+        # (~1.5 GB) + TinkerClaw (~300 MB). The old 3072 MB critical threshold
+        # fired on legitimate steady state, triggering a pipeline restart
+        # that REloaded Moonshine/Piper without releasing the prior mmap
+        # (onnxruntime arenas survive pipeline.shutdown + gc.collect until
+        # the singleton refactor in fix 5 of #29 lands). Result: RSS climbed
+        # 60 -> 1444 -> 2085 -> 3054 -> 3657 MB in 25 min of normal use.
+        # Raise ceilings so the monitor only fires on an actual runaway.
+        self._mem_warn_mb = 3072   # Force GC above this
+        self._mem_crit_mb = 4096   # Restart pipeline above this (after GC)
 
         # Backend names for status page
         self._stt_name = config.stt.backend

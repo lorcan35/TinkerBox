@@ -833,16 +833,16 @@ class VoiceServer:
                         break
                     continue
 
-                # Response timeout: Tab5 sends pings every 8s.  If we haven't
-                # received ANY message in 30s the connection is dead.
-                silence = time.monotonic() - _last_client_msg_time
-                if silence > 30:
-                    logger.warning("Keepalive: no client message for %.0fs, closing WS %s", silence, ws_id)
-                    try:
-                        await ws.close()
-                    except Exception:
-                        pass
-                    break
+                # NOTE: The old 30s "no client message" silence check was removed.
+                # Tab5 migrated to esp_websocket_client (voice.c commit 3af34b0) which
+                # uses WS-level PING/PONG control frames at 15s interval. Control
+                # frames do NOT update _last_client_msg_time (aiohttp handles them
+                # internally and they never surface to the message loop), so the
+                # silence check produced a 30-45s false-positive close every cycle.
+                # Liveness is now detected by: (1) WS-level ping/pong timeout on
+                # Tab5 side (45s), (2) this task's send-failure counter above
+                # (3 consecutive send failures), and (3) TCP RST propagation.
+                # _last_client_msg_time is left as-is for potential future use.
 
         _keepalive_task = asyncio.create_task(_ws_keepalive())
 

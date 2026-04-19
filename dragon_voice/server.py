@@ -256,6 +256,14 @@ class VoiceServer:
         except Exception as e:
             logger.warning("Agentic modules not available: %s", e)
 
+        # v4·D Phase 4g stability fix (audit P0 #1): instantiate the
+        # SurfaceManager so Tab5 widget_action events have somewhere to
+        # land.  Previously server.py imported nothing from surfaces/,
+        # and every Tab5 widget tap logged "Unknown command" and died.
+        from dragon_voice.surfaces import SurfaceManager
+        self._surface_mgr = SurfaceManager()
+        logger.info("SurfaceManager initialized")
+
         # Conversation engine (shared LLM backend for text/API input)
         self._conversation = ConversationEngine(
             self._db, self._message_store, self._config.llm,
@@ -1262,6 +1270,26 @@ class VoiceServer:
                             except Exception:
                                 logger.exception("cap_downgrade alert failed")
 
+                    elif cmd_type == "widget_action":
+                        # v4·D Phase 4g (audit P0 fix): Tab5 fires this
+                        # when the user taps a prompt choice / live action
+                        # button / list row.  Before this branch existed,
+                        # every interactive widget tap was silently
+                        # dropped into the "Unknown command" logger.
+                        sid = conn_state.get("session_id")
+                        cid = cmd.get("card_id")
+                        ev  = cmd.get("event")
+                        payload = cmd.get("payload") or {}
+                        logger.info("widget_action: session=%s card=%s event=%s",
+                                    sid, cid, ev)
+                        if sid and cid and ev and self._surface_mgr is not None:
+                            try:
+                                await self._surface_mgr.handle_action(
+                                    sid, cid, ev, payload,
+                                )
+                            except Exception:
+                                logger.exception("widget_action dispatch failed")
+
                     elif cmd_type == "config_ack":
                         logger.debug("Connection %s: config_ack %s", ws_id, cmd.get("applied"))
 
@@ -1369,6 +1397,16 @@ class VoiceServer:
         conn_state["device_id"] = device_id
         conn_state["registered"] = True
         conn_state["response_mode"] = "always_speak"  # voice device gets TTS
+
+        # v4·D Phase 4g: register this connection's surface with the
+        # shared SurfaceManager.  Skills dispatch widget_* emissions
+        # through here and widget_action events route back via
+        # handle_action().
+        if self._surface_mgr is not None:
+            async def _surface_send(msg: dict):
+                if not ws.closed:
+                    await ws.send_json(msg)
+            await self._surface_mgr.register_session(session_id, _surface_send)
 
         # Store tool event callbacks per-connection (NOT on shared conversation engine)
         if self._tool_registry:
@@ -1759,6 +1797,14 @@ class VoiceServer:
         device_id = conn_state.get("device_id")
         ws_id = conn_state.get("ws_id")
         pipeline = conn_state.get("pipeline")
+
+        # v4·D Phase 4g: unregister the session's surface so skills that
+        # kept a reference to it start seeing dropped sends explicitly.
+        if session_id and self._surface_mgr is not None:
+            try:
+                await self._surface_mgr.unregister_session(session_id)
+            except Exception:
+                logger.debug("surface unregister failed")
 
         try:
             # Pause session (not end — it can be resumed)

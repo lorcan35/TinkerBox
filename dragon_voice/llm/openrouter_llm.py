@@ -295,9 +295,16 @@ def price_for_model(model: str, prompt_tokens: int, completion_tokens: int) -> i
     """Compute cost in MILS (1000ths of a USD cent) for a given model + usage.
 
     Returns an integer so it round-trips cleanly through JSON WS messages.
-    Unknown models use the conservative default table entry.
+    Unknown cloud models use the conservative default table entry.  LOCAL
+    models (ollama, npu_genie, etc) return 0 -- we detect them by the
+    absence of a "vendor/" prefix which all OpenRouter-hosted IDs carry.
     """
     if not model:
+        return 0
+    # Local models (qwen3:1.7b, llama3.2, etc.) have no slash and run
+    # on-device at zero marginal USD cost.  Short-circuit before any
+    # pricing lookup so we never report phantom cloud rates for them.
+    if "/" not in model:
         return 0
     entry = _PRICING_MILS_PER_M.get(model) or _PRICING_MILS_PER_M["_default"]
     # Compute as (tokens * mils_per_M) // 1_000_000 to stay integer.

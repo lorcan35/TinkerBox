@@ -528,7 +528,7 @@ class VoiceServer:
         if self._purge_task and not self._purge_task.done():
             self._purge_task.cancel()
 
-        # Shut down pipelines
+        # Shut down pipelines (does NOT release STT/TTS singletons — see fix 5 of #29)
         tasks = []
         for ws_id, conn in list(self._active_connections.items()):
             pipeline = conn.get("pipeline")
@@ -537,6 +537,17 @@ class VoiceServer:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._active_connections.clear()
+
+        # Release process-wide STT + TTS singletons explicitly on final exit.
+        # During the server's lifetime the singletons stay loaded across
+        # every pipeline rebuild; only here do we let the ONNX mmaps free.
+        try:
+            from dragon_voice.stt import shutdown_stt_singleton
+            from dragon_voice.tts import shutdown_tts_singleton
+            await shutdown_stt_singleton()
+            await shutdown_tts_singleton()
+        except Exception:
+            logger.exception("Singleton shutdown raised — continuing exit")
 
         # Close shared proxy session (DQ08)
         if self._proxy_session and not self._proxy_session.closed:

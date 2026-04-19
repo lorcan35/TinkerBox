@@ -15,8 +15,8 @@ from typing import Callable, Awaitable, Optional
 import numpy as np
 
 from dragon_voice.config import VoiceConfig
-from dragon_voice.stt import create_stt, STTBackend
-from dragon_voice.tts import create_tts, TTSBackend
+from dragon_voice.stt import get_stt_singleton, STTBackend
+from dragon_voice.tts import get_tts_singleton, TTSBackend
 from dragon_voice.llm import create_llm, LLMBackend
 
 logger = logging.getLogger(__name__)
@@ -113,19 +113,29 @@ class VoicePipeline:
         self._dictation_segments: list[str] = []
 
     async def initialize(self) -> None:
-        """Create and initialize all backends."""
+        """Attach to process-wide STT/TTS singletons; build pipeline-local LLM.
+
+        Fix 5 of #29: STT + TTS are expensive (~2.5 GB ONNX mmap each) and
+        were reloaded every time a pipeline was torn down + rebuilt by the
+        memory monitor or a mode-switch. The reload stacked mmap arenas
+        and leaked RSS. Now the first call loads the model process-wide;
+        subsequent calls with the same config reuse it; different config
+        evicts + loads the new one cleanly.
+
+        LLM backends remain pipeline-local because they're cheap (HTTP
+        clients) and each session may target a different model.
+        """
         logger.info("Initializing voice pipeline...")
 
-        self._stt = create_stt(self._config.stt)
-        self._tts = create_tts(self._config.tts)
-        self._llm = create_llm(self._config.llm)
+        # STT/TTS via singletons — no reload if already loaded for this cfg.
+        stt_task = asyncio.create_task(get_stt_singleton(self._config.stt))
+        tts_task = asyncio.create_task(get_tts_singleton(self._config.tts))
 
-        # Initialize in parallel
-        await asyncio.gather(
-            self._stt.initialize(),
-            self._tts.initialize(),
-            self._llm.initialize(),
-        )
+        # LLM is pipeline-local; cheap to (re)build.
+        self._llm = create_llm(self._config.llm)
+        await asyncio.gather(stt_task, tts_task, self._llm.initialize())
+        self._stt = stt_task.result()
+        self._tts = tts_task.result()
 
         logger.info(
             "Pipeline ready — STT=%s, TTS=%s, LLM=%s",
@@ -434,14 +444,15 @@ class VoicePipeline:
             except (Exception, asyncio.TimeoutError) as stt_err:
                 if self._config.stt.backend == "openrouter":
                     logger.error("Cloud STT failed: %s — falling back to local", stt_err)
-                    from dragon_voice.stt import create_stt
+                    # Use the singleton so we share the already-loaded Moonshine
+                    # model with any other session in local mode. No reload.
+                    from dragon_voice.stt import get_stt_singleton
                     from dragon_voice.config import STTConfig
-                    fallback = create_stt(STTConfig(backend="moonshine"))
-                    await fallback.initialize()
+                    fallback = await get_stt_singleton(STTConfig(backend="moonshine"))
                     transcript = await fallback.transcribe(
                         audio_data, self._config.audio.input_sample_rate
                     )
-                    await fallback.shutdown()
+                    # Do NOT shutdown — singleton stays loaded for next call.
                     # Notify Tab5: auto-disable cloud mode
                     await self._on_event({
                         "type": "config_update",
@@ -642,12 +653,11 @@ class VoicePipeline:
             except (Exception, asyncio.TimeoutError) as tts_err:
                 if self._config.tts.backend == "openrouter":
                     logger.error("Cloud TTS failed: %s — falling back to local", tts_err)
-                    from dragon_voice.tts import create_tts
+                    from dragon_voice.tts import get_tts_singleton
                     from dragon_voice.config import TTSConfig
-                    fallback = create_tts(TTSConfig(backend="piper"))
-                    await fallback.initialize()
+                    fallback = await get_tts_singleton(TTSConfig(backend="piper"))
                     audio_bytes = await fallback.synthesize(text)
-                    await fallback.shutdown()
+                    # Do NOT shutdown — singleton stays loaded for next call.
                     await self._on_event({
                         "type": "config_update",
                         "error": "Cloud TTS unavailable, reverted to local",
@@ -745,26 +755,26 @@ class VoicePipeline:
 
             tasks = []
 
+            # Fix 5 of #29: STT/TTS backend swap goes through the singleton
+            # layer. get_stt_singleton/get_tts_singleton evicts the prior
+            # singleton cleanly (releases its mmap arena via fix 6's
+            # del + gc.collect) and loads the new one. No pipeline-local
+            # shutdown call — that would be a no-op now anyway.
+
             # Check if STT backend changed
             if (
                 config.stt.backend != old_config.stt.backend
                 or config.stt.model != old_config.stt.model
             ):
                 logger.info("Swapping STT: %s -> %s", old_config.stt.backend, config.stt.backend)
-                if self._stt:
-                    await self._stt.shutdown()
-                self._stt = create_stt(config.stt)
-                tasks.append(self._stt.initialize())
+                tasks.append(get_stt_singleton(config.stt))
 
             # Check if TTS backend changed
             if config.tts.backend != old_config.tts.backend:
                 logger.info("Swapping TTS: %s -> %s", old_config.tts.backend, config.tts.backend)
-                if self._tts:
-                    await self._tts.shutdown()
-                self._tts = create_tts(config.tts)
-                tasks.append(self._tts.initialize())
+                tasks.append(get_tts_singleton(config.tts))
 
-            # Check if LLM backend changed
+            # LLM remains pipeline-local — no singleton layer.
             if (
                 config.llm.backend != old_config.llm.backend
                 or config.llm.ollama_model != old_config.llm.ollama_model
@@ -776,7 +786,15 @@ class VoicePipeline:
                 tasks.append(self._llm.initialize())
 
             if tasks:
-                await asyncio.gather(*tasks)
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                # If STT/TTS tasks returned backends, latch them. Any exceptions
+                # get raised here so the swap fails loudly rather than silently.
+                for r in results:
+                    if isinstance(r, Exception):
+                        raise r
+                # Re-query singletons for current refs (cheap — already cached).
+                self._stt = await get_stt_singleton(config.stt)
+                self._tts = await get_tts_singleton(config.tts)
                 logger.info("Backend swap complete")
         finally:
             # US-P01: Re-enable audio ingestion after swap completes (or fails)
@@ -803,15 +821,26 @@ class VoicePipeline:
         return self._processing
 
     async def shutdown(self) -> None:
-        """Shut down all backends."""
+        """Tear down this pipeline — but NOT the shared STT/TTS singletons.
+
+        Fix 5 of #29: STT and TTS are process-wide singletons (see
+        dragon_voice/stt/__init__.py + dragon_voice/tts/__init__.py).
+        Shutting them down here would defeat the whole point — the next
+        pipeline would have to reload the ~2.5 GB Moonshine arena, which
+        was the source of the RSS leak. Only shut down the pipeline-local
+        LLM (which is cheap — HTTP client) and drop our refs.
+
+        The singletons are released exactly once, at process shutdown,
+        by server.py calling shutdown_stt_singleton + shutdown_tts_singleton.
+        """
         await self.cancel()
-        tasks = []
-        if self._stt:
-            tasks.append(self._stt.shutdown())
-        if self._tts:
-            tasks.append(self._tts.shutdown())
         if self._llm:
-            tasks.append(self._llm.shutdown())
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        logger.info("Voice pipeline shut down")
+            try:
+                await self._llm.shutdown()
+            except Exception:
+                logger.exception("LLM shutdown raised")
+        # Drop refs but don't shut down — singletons keep the model alive.
+        self._stt = None
+        self._tts = None
+        self._llm = None
+        logger.info("Voice pipeline shut down (STT/TTS singletons preserved)")

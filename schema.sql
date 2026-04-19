@@ -51,6 +51,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     config        TEXT NOT NULL DEFAULT '{}',     -- JSON: session-level config (llm model, temperature, etc.)
     metadata      TEXT NOT NULL DEFAULT '{}',     -- JSON: arbitrary session data (skill context, tags, etc.)
     message_count INTEGER NOT NULL DEFAULT 0,    -- denormalized for fast listing
+    voice_mode    INTEGER NOT NULL DEFAULT 0,    -- 0=local, 1=hybrid, 2=cloud, 3=tinkerclaw (chat v4·C mode-per-session)
+    llm_model     TEXT NOT NULL DEFAULT '',     -- LLM model for this session (e.g. "anthropic/claude-3.5-haiku")
     created_at    REAL NOT NULL,
     last_active_at REAL NOT NULL,
     ended_at      REAL,                          -- NULL until ended

@@ -97,8 +97,14 @@ class SessionManager:
         session_type: str = "conversation",
         system_prompt: str = "",
         config: Optional[dict] = None,
+        voice_mode: int = 0,
+        llm_model: str = "",
     ) -> dict:
-        """Create a new session and log the event."""
+        """Create a new session and log the event.
+
+        ``voice_mode`` (0-3) and ``llm_model`` persist the chat v4·C
+        mode fingerprint onto the session row (refs #27).
+        """
         session_id = _generate_session_id()
         session = await self._db.create_session(
             session_id=session_id,
@@ -106,15 +112,38 @@ class SessionManager:
             session_type=session_type,
             system_prompt=system_prompt,
             config=config,
+            voice_mode=voice_mode,
+            llm_model=llm_model,
         )
         await self._db.add_event(
             "session.created",
             session_id=session_id,
             device_id=device_id,
-            data={"type": session_type},
+            data={
+                "type": session_type,
+                "voice_mode": int(voice_mode),
+                "llm_model": str(llm_model or ""),
+            },
         )
-        logger.info("Session created: %s (device=%s, type=%s)", session_id, device_id, session_type)
+        logger.info(
+            "Session created: %s (device=%s, type=%s, voice_mode=%d, llm_model=%s)",
+            session_id, device_id, session_type, int(voice_mode), llm_model,
+        )
         return session
+
+    async def update_session(self, session_id: str, **kwargs) -> Optional[dict]:
+        """Update session fields and return the refreshed row.
+
+        Passes through to :meth:`Database.update_session`; allowed fields
+        are ``title``, ``system_prompt``, ``metadata``, ``config``,
+        ``voice_mode``, ``llm_model``. Returns ``None`` if the session
+        does not exist.
+        """
+        session = await self._db.get_session(session_id)
+        if not session:
+            return None
+        await self._db.update_session(session_id, **kwargs)
+        return await self._db.get_session(session_id)
 
     async def get_session(self, session_id: str) -> Optional[dict]:
         """Fetch a session by ID."""
@@ -197,6 +226,8 @@ class SessionManager:
         session_type: str = "conversation",
         system_prompt: str = "",
         config: Optional[dict] = None,
+        voice_mode: int = 0,
+        llm_model: str = "",
     ) -> tuple[dict, bool]:
         """Get an existing session or create a new one.
 
@@ -217,6 +248,8 @@ class SessionManager:
             session_type=session_type,
             system_prompt=system_prompt,
             config=config,
+            voice_mode=voice_mode,
+            llm_model=llm_model,
         )
         return session, False
 

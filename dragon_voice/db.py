@@ -275,6 +275,14 @@ class Database:
 
     # ── Sessions ───────────────────────────────────────────────────────
 
+    # Explicit column list for sessions SELECTs. Never use `SELECT *` so
+    # schema drift (e.g. new columns added via migration on an older DB
+    # build) surfaces as a query-time error instead of a silent mismatch.
+    _SESSION_COLUMNS = (
+        "id, device_id, type, status, title, system_prompt, config, metadata, "
+        "message_count, voice_mode, llm_model, created_at, last_active_at, ended_at"
+    )
+
     async def create_session(
         self,
         session_id: str,
@@ -282,24 +290,37 @@ class Database:
         session_type: str = "conversation",
         system_prompt: str = "",
         config: Optional[dict] = None,
+        voice_mode: int = 0,
+        llm_model: str = "",
     ) -> dict:
-        """Create a new session. Returns the session row as dict."""
+        """Create a new session. Returns the session row as dict.
+
+        ``voice_mode`` (0-3) and ``llm_model`` persist the active chat v4·C
+        mode onto the session row so the conversation-drawer can show its
+        fingerprint and the pipeline can restore it on resume.
+        """
         now = time.time()
         await self.conn.execute(
             """
             INSERT INTO sessions (id, device_id, type, status, system_prompt, config,
+                                  voice_mode, llm_model,
                                   created_at, last_active_at)
-            VALUES (?, ?, ?, 'active', ?, ?, ?, ?)
+            VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
             """,
             (session_id, device_id, session_type, system_prompt,
-             json.dumps(config or {}), now, now),
+             json.dumps(config or {}),
+             int(voice_mode), str(llm_model or ""),
+             now, now),
         )
         await self.conn.commit()
         return await self.get_session(session_id)
 
     async def get_session(self, session_id: str) -> Optional[dict]:
         """Fetch a session by ID."""
-        cursor = await self.conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,))
+        cursor = await self.conn.execute(
+            f"SELECT {self._SESSION_COLUMNS} FROM sessions WHERE id = ?",
+            (session_id,),
+        )
         row = await cursor.fetchone()
         return dict(row) if row else None
 
@@ -322,7 +343,10 @@ class Database:
             params.append(status)
 
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        query = f"SELECT * FROM sessions {where} ORDER BY last_active_at DESC LIMIT ? OFFSET ?"
+        query = (
+            f"SELECT {self._SESSION_COLUMNS} FROM sessions {where} "
+            f"ORDER BY last_active_at DESC LIMIT ? OFFSET ?"
+        )
         params.extend([limit, offset])
 
         cursor = await self.conn.execute(query, params)
@@ -363,8 +387,13 @@ class Database:
         await self.conn.commit()
 
     async def update_session(self, session_id: str, **kwargs) -> None:
-        """Update session fields. Allowed: title, system_prompt, metadata, config."""
-        allowed = {"title", "system_prompt", "metadata", "config"}
+        """Update session fields.
+
+        Allowed: ``title``, ``system_prompt``, ``metadata``, ``config``,
+        ``voice_mode``, ``llm_model``.
+        """
+        allowed = {"title", "system_prompt", "metadata", "config",
+                   "voice_mode", "llm_model"}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
             return
@@ -372,8 +401,15 @@ class Database:
         sets = []
         params = []
         for k, v in updates.items():
+            if k in ("metadata", "config"):
+                params.append(json.dumps(v))
+            elif k == "voice_mode":
+                params.append(int(v))
+            elif k == "llm_model":
+                params.append(str(v or ""))
+            else:
+                params.append(v)
             sets.append(f"{k} = ?")
-            params.append(json.dumps(v) if k in ("metadata", "config") else v)
         sets.append("last_active_at = ?")
         params.append(now)
         params.append(session_id)
@@ -386,8 +422,8 @@ class Database:
         """Find active/paused sessions inactive beyond the timeout."""
         cutoff = time.time() - timeout_seconds
         cursor = await self.conn.execute(
-            """
-            SELECT * FROM sessions
+            f"""
+            SELECT {self._SESSION_COLUMNS} FROM sessions
             WHERE status IN ('active', 'paused') AND last_active_at < ?
             ORDER BY last_active_at ASC
             """,

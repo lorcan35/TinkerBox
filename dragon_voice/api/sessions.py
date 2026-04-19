@@ -44,15 +44,33 @@ class SessionRoutes:
         return paginated_response(sessions, limit, offset)
 
     async def create_session(self, request: web.Request) -> web.Response:
-        """POST /api/v1/sessions"""
+        """POST /api/v1/sessions
+
+        Chat v4·C (refs #27): accepts optional ``voice_mode`` (0-3) and
+        ``llm_model`` (str, max 128 chars) so each session carries its
+        own mode fingerprint.
+        """
         body, err = await parse_json_body(request)
         if err:
             return err
+
+        voice_mode = body.get("voice_mode", 0)
+        try:
+            voice_mode = int(voice_mode)
+        except (TypeError, ValueError):
+            return json_error("voice_mode must be an integer 0-3")
+        if not 0 <= voice_mode <= 3:
+            return json_error("voice_mode must be 0-3")
+
+        llm_model = str(body.get("llm_model", ""))[:128]
+
         session = await self._session_mgr.create_session(
             device_id=body.get("device_id"),
             session_type=body.get("type", "conversation"),
             system_prompt=body.get("system_prompt", ""),
             config=body.get("config"),
+            voice_mode=voice_mode,
+            llm_model=llm_model,
         )
         return web.json_response(session, status=201)
 
@@ -96,7 +114,12 @@ class SessionRoutes:
         return web.json_response({"status": "paused", "session_id": session_id})
 
     async def update_session(self, request: web.Request) -> web.Response:
-        """PATCH /api/v1/sessions/{session_id} — update title/system_prompt/metadata/config"""
+        """PATCH /api/v1/sessions/{session_id} — update session mode/meta.
+
+        Chat v4·C (refs #27): accepts ``voice_mode`` (0-3) and
+        ``llm_model`` (str, max 128 chars) alongside the existing
+        title/system_prompt/metadata/config patch fields.
+        """
         session_id = request.match_info["session_id"]
         session = await self._session_mgr.get_session(session_id)
         if not session:
@@ -106,10 +129,27 @@ class SessionRoutes:
         if err:
             return err
 
-        allowed = {"title", "system_prompt", "metadata", "config"}
+        allowed = {"title", "system_prompt", "metadata", "config",
+                   "voice_mode", "llm_model"}
         updates = {k: v for k, v in body.items() if k in allowed}
         if not updates:
-            return json_error("No valid fields to update (allowed: title, system_prompt, metadata, config)")
+            return json_error(
+                "No valid fields to update "
+                "(allowed: title, system_prompt, metadata, config, "
+                "voice_mode, llm_model)"
+            )
+
+        if "voice_mode" in updates:
+            try:
+                vm = int(updates["voice_mode"])
+            except (TypeError, ValueError):
+                return json_error("voice_mode must be an integer 0-3")
+            if not 0 <= vm <= 3:
+                return json_error("voice_mode must be 0-3")
+            updates["voice_mode"] = vm
+
+        if "llm_model" in updates:
+            updates["llm_model"] = str(updates["llm_model"])[:128]
 
         await self._db.update_session(session_id, **updates)
         updated = await self._session_mgr.get_session(session_id)

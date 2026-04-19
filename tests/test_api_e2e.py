@@ -292,6 +292,61 @@ async def tier2_multi_step(t: TestRunner):
 
         await t.post(f"/api/v1/sessions/{sid}/end")
 
+    # MS9: Chat v4·C — create session with voice_mode + llm_model (refs #27)
+    async def ms9_create_session_with_mode():
+        s, body = await t.post("/api/v1/sessions", {
+            "type": "conversation",
+            "voice_mode": 2,
+            "llm_model": "anthropic/claude-3.5-haiku",
+        })
+        assert s == 201, f"Create: {s} {body}"
+        sid = body["id"]
+        assert body["voice_mode"] == 2, f"voice_mode missing: {body}"
+        assert body["llm_model"] == "anthropic/claude-3.5-haiku", f"llm_model missing: {body}"
+
+        # Round-trip via GET by id
+        s, body = await t.get(f"/api/v1/sessions/{sid}")
+        assert s == 200
+        assert body["voice_mode"] == 2
+        assert body["llm_model"] == "anthropic/claude-3.5-haiku"
+
+        # List surfaces it too
+        s, body = await t.get("/api/v1/sessions?limit=50")
+        assert s == 200
+        match = next((x for x in body["items"] if x["id"] == sid), None)
+        assert match is not None, "session not in list"
+        assert match["voice_mode"] == 2
+        assert match["llm_model"] == "anthropic/claude-3.5-haiku"
+
+        await t.post(f"/api/v1/sessions/{sid}/end")
+
+    # MS10: Chat v4·C — PATCH session voice_mode + llm_model (refs #27)
+    async def ms10_patch_session_mode():
+        s, body = await t.post("/api/v1/sessions", {"type": "conversation"})
+        sid = body["id"]
+        assert body["voice_mode"] == 0
+        assert body["llm_model"] == ""
+
+        # PATCH to cloud mode
+        s, body = await t.patch(f"/api/v1/sessions/{sid}", {
+            "voice_mode": 2,
+            "llm_model": "openai/gpt-4o-mini",
+        })
+        assert s == 200, f"PATCH: {s} {body}"
+        assert body["voice_mode"] == 2
+        assert body["llm_model"] == "openai/gpt-4o-mini"
+
+        # Verify persisted
+        s, body = await t.get(f"/api/v1/sessions/{sid}")
+        assert body["voice_mode"] == 2
+        assert body["llm_model"] == "openai/gpt-4o-mini"
+
+        # Reject out-of-range voice_mode
+        s, body = await t.patch(f"/api/v1/sessions/{sid}", {"voice_mode": 9})
+        assert s == 400, f"expected 400 for voice_mode=9, got {s}"
+
+        await t.post(f"/api/v1/sessions/{sid}/end")
+
     # MS4: Memory store → search → delete
     async def ms4_memory_crud():
         # Store
@@ -392,6 +447,8 @@ async def tier2_multi_step(t: TestRunner):
         ("MS6: Config set→get→delete", ms6_config_crud),
         ("MS7: Device name update→restore", ms7_device_update),
         ("MS8: Message purge on session", ms8_message_purge),
+        ("MS9: Session voice_mode + llm_model on create (#27)", ms9_create_session_with_mode),
+        ("MS10: Session voice_mode + llm_model PATCH (#27)", ms10_patch_session_mode),
     ]:
         await t.run_test(name, fn)
 

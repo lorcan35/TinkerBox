@@ -1243,6 +1243,21 @@ class VoiceServer:
                                 except Exception:
                                     logger.exception("vision_capability emit failed")
 
+                            # v4·D Gauntlet G7-F: speak a short alert when the
+                            # Tab5 auto-downgrades because the daily cap was
+                            # hit.  The Tab5 tags its config_update with
+                            # reason="cap_downgrade" so the user hears why
+                            # their next turn is free even with the screen off.
+                            try:
+                                if cmd.get("reason") == "cap_downgrade":
+                                    pipeline = conn_state.get("pipeline")
+                                    if pipeline and hasattr(pipeline, "speak_system"):
+                                        asyncio.create_task(pipeline.speak_system(
+                                            "Daily budget cap reached. Switched back to local mode."
+                                        ))
+                            except Exception:
+                                logger.exception("cap_downgrade alert failed")
+
                     elif cmd_type == "config_ack":
                         logger.debug("Connection %s: config_ack %s", ws_id, cmd.get("applied"))
 

@@ -652,6 +652,34 @@ class VoicePipeline:
             except Exception:
                 pass  # Cost tracking is best-effort
 
+    async def speak_system(self, text: str) -> None:
+        """Speak a short system message (not stored in conversation history).
+
+        Used by the server for out-of-band alerts like budget auto-downgrade
+        (Gauntlet G7-F) where the user needs to hear what happened even with
+        the screen off.  Delivered through the live TTS path so it respects
+        the currently-selected voice (Piper / OpenRouter) and inherits the
+        existing pacing + resampling.
+        """
+        if not text or not self._tts:
+            return
+        prev_started = self._tts_started
+        try:
+            await self._synthesize_and_send(text)
+        except Exception:
+            logger.exception("speak_system failed: %s", text[:40])
+        finally:
+            # Close the utterance so the Tab5 flushes its ring buffer.
+            if self._tts_started and not prev_started:
+                try:
+                    await self._on_event({
+                        "type": "tts_end",
+                        "tts_ms": round(self._tts_total_ms),
+                    })
+                except Exception:
+                    pass
+                self._tts_started = False
+
     async def _synthesize_and_send(self, text: str) -> None:
         """Synthesize a sentence, resample to 16kHz, and stream paced to client.
 

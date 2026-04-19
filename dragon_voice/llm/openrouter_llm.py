@@ -31,6 +31,7 @@ class OpenRouterBackend(LLMBackend):
         self._session: aiohttp.ClientSession | None = None
         self._conversation: list[dict] = []
         self._lock = asyncio.Lock()
+        self._idempotency_key: str = ""
         # Phase 3 cost tracking. Populated from the last SSE chunk of each
         # stream (OpenAI / OpenRouter emit usage totals in the tail chunk
         # when stream_options.include_usage=true). Read by pipeline.py to
@@ -109,11 +110,20 @@ class OpenRouterBackend(LLMBackend):
             self._last_usage = {}
             self._last_retried = False
             self._last_retry_reason = ""
+            # v4·D Gauntlet G10 fix: fresh idempotency key per OUTER turn.
+            # Intentional retries (429, context_trim) reuse it so
+            # OpenRouter dedupes.  Unintentional retries (aiohttp's TCP
+            # retransmit wrap-around on flaky networks) ALSO reuse it --
+            # the whole point is that a single logical LLM call produces
+            # a single billable response, regardless of transport shenanigans.
+            import uuid as _uuid
+            self._idempotency_key = str(_uuid.uuid4())
 
         try:
             async with self._session.post(
                 f"{self._base_url}/chat/completions",
                 json=payload,
+                headers={"Idempotency-Key": self._idempotency_key},
             ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()

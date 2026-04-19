@@ -1546,6 +1546,43 @@ class VoiceServer:
 
             logger.info("Text response on session %s: %s", session_id, response_text[:80])
 
+            # Phase 3 per-turn receipt for text-path turns. Voice-path
+            # receipts are emitted from pipeline._process_utterance; the
+            # text path reaches the LLM via ConversationEngine directly
+            # and bypasses pipeline entirely, so we emit here too.
+            try:
+                convo = conn_state.get("conversation") or self._conversation
+                cur_llm = getattr(convo, "_llm", None)
+                if cur_llm is not None and hasattr(cur_llm, "get_last_usage"):
+                    usage = cur_llm.get_last_usage()
+                    if usage and usage.get("total_tokens"):
+                        from dragon_voice.llm.openrouter_llm import price_for_model
+                        cost_mils = price_for_model(
+                            usage["model"],
+                            usage.get("prompt_tokens", 0),
+                            usage.get("completion_tokens", 0),
+                        )
+                        if not ws.closed:
+                            await ws.send_json({
+                                "type":              "receipt",
+                                "stage":             "llm",
+                                "model":             usage["model"],
+                                "prompt_tokens":     usage.get("prompt_tokens", 0),
+                                "completion_tokens": usage.get("completion_tokens", 0),
+                                "total_tokens":      usage.get("total_tokens", 0),
+                                "cost_mils":         cost_mils,
+                            })
+                        logger.info(
+                            "Receipt emitted (text): model=%s tok=%d+%d=%d cost_mils=%d",
+                            usage["model"],
+                            usage.get("prompt_tokens", 0),
+                            usage.get("completion_tokens", 0),
+                            usage.get("total_tokens", 0),
+                            cost_mils,
+                        )
+            except Exception:
+                logger.exception("Text-path receipt emit failed")
+
         except Exception:
             logger.exception("Text processing error on session %s", session_id)
             if not ws.closed:

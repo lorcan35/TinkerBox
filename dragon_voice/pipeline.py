@@ -562,6 +562,35 @@ class VoicePipeline:
             logger.info("LLM (%.0fms): %s", llm_ms, full_response[:80])
             await self._on_event({"type": "llm_done", "llm_ms": round(llm_ms)})
 
+            # Phase 3 per-turn receipt. Only emit when the LLM is the
+            # OpenRouter backend (it's the only backend where we can
+            # charge real money); local (ollama, npu_genie) turns are
+            # free and don't need a receipt.  If the LLM exposes
+            # get_last_usage() we compute cost from the pricing table.
+            try:
+                if hasattr(self._llm, "get_last_usage"):
+                    usage = self._llm.get_last_usage()
+                    if usage and usage.get("total_tokens"):
+                        from dragon_voice.llm.openrouter_llm import price_for_model
+                        cost_mils = price_for_model(
+                            usage["model"],
+                            usage.get("prompt_tokens", 0),
+                            usage.get("completion_tokens", 0),
+                        )
+                        await self._on_event({
+                            "type": "receipt",
+                            "stage": "llm",
+                            "model": usage["model"],
+                            "prompt_tokens":     usage.get("prompt_tokens", 0),
+                            "completion_tokens": usage.get("completion_tokens", 0),
+                            "total_tokens":      usage.get("total_tokens", 0),
+                            "cost_mils":         cost_mils,   # 1000ths of a USD cent
+                            "llm_ms":            round(llm_ms),
+                        })
+            except Exception as e:
+                # Never let receipt emission break the turn
+                logger.warning("Receipt emit failed: %s", e)
+
             # Rich media detection on full response
             if self._media_pipeline and full_response:
                 try:

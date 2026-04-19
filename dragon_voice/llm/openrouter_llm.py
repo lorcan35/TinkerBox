@@ -31,6 +31,11 @@ class OpenRouterBackend(LLMBackend):
         self._session: aiohttp.ClientSession | None = None
         self._conversation: list[dict] = []
         self._lock = asyncio.Lock()
+        # Phase 3 cost tracking. Populated from the last SSE chunk of each
+        # stream (OpenAI / OpenRouter emit usage totals in the tail chunk
+        # when stream_options.include_usage=true). Read by pipeline.py to
+        # compute per-turn cost for receipt emission.
+        self._last_usage: dict = {}
 
     async def initialize(self) -> None:
         """Verify API key is set and connectivity is available."""
@@ -85,9 +90,13 @@ class OpenRouterBackend(LLMBackend):
             "model": self._model,
             "messages": messages,
             "stream": True,
+            "stream_options": {"include_usage": True},  # tail chunk carries totals
             "max_tokens": self._config.max_tokens,
             "temperature": self._config.temperature,
         }
+        # Reset last usage on every new turn so stale figures from the
+        # previous turn don't leak into the receipt.
+        self._last_usage = {}
 
         try:
             async with self._session.post(
@@ -164,6 +173,19 @@ class OpenRouterBackend(LLMBackend):
                             return
                         continue
 
+                    # Usage tail chunk: choices=[] + usage={...} present.
+                    # Capture and move on -- yield nothing (no user-visible
+                    # text).  Must come before the choices[] guard below or
+                    # this chunk gets silently skipped.
+                    usage = chunk.get("usage")
+                    if usage:
+                        self._last_usage = {
+                            "model": self._model,
+                            "prompt_tokens":     int(usage.get("prompt_tokens", 0)),
+                            "completion_tokens": int(usage.get("completion_tokens", 0)),
+                            "total_tokens":      int(usage.get("total_tokens", 0)),
+                        }
+
                     choices = chunk.get("choices", [])
                     if not choices:
                         continue
@@ -176,6 +198,15 @@ class OpenRouterBackend(LLMBackend):
         except aiohttp.ClientError as e:
             logger.error("OpenRouter request failed: %s", e)
             yield f"[Connection error: {e}]"
+
+    def get_last_usage(self) -> dict:
+        """Return usage dict from the most recent streamed turn.
+
+        Keys (when populated): model, prompt_tokens, completion_tokens, total_tokens.
+        Returns {} if no turn has run or the tail chunk lacked usage (e.g.
+        the stream was aborted before the final SSE event).
+        """
+        return dict(self._last_usage)
 
     async def generate_stream(
         self, prompt: str, system_prompt: str = ""
@@ -235,3 +266,41 @@ class OpenRouterBackend(LLMBackend):
     @property
     def name(self) -> str:
         return f"OpenRouter ({self._model})"
+
+
+# ── Pricing table (Phase 3) ───────────────────────────────────────────
+# Values are in MILS per 1M tokens ($USD * 1000 * 1000).  Storing in mils
+# keeps integer math accurate at 0.0001 USD precision.  Multiplying by
+# token_count / 1_000_000 gives cost in mils.  Display side (Tab5) divides
+# by 1000 for cents or 100000 for dollars.
+#
+# Prices match OpenRouter's listed rates as of April 2026.  Update in one
+# place when they change.  Unknown models fall through to a conservative
+# default so a pricing surprise never zeroes out the receipt.
+_PRICING_MILS_PER_M = {
+    # OpenAI
+    "openai/gpt-4o":             {"in":   2500000, "out":  10000000},
+    "openai/gpt-4o-mini":        {"in":    150000, "out":    600000},
+    "openai/gpt-audio-mini":     {"in":    300000, "out":   1200000},
+    # Anthropic
+    "anthropic/claude-sonnet-4-20250514": {"in": 3000000, "out": 15000000},
+    "anthropic/claude-3-haiku":  {"in":    250000, "out":   1250000},
+    "anthropic/claude-3.5-haiku":{"in":    800000, "out":   4000000},
+    # Fallback for anything unknown -- $2/$8 per M tokens, slightly high on purpose
+    "_default":                  {"in":   2000000, "out":   8000000},
+}
+
+
+def price_for_model(model: str, prompt_tokens: int, completion_tokens: int) -> int:
+    """Compute cost in MILS (1000ths of a USD cent) for a given model + usage.
+
+    Returns an integer so it round-trips cleanly through JSON WS messages.
+    Unknown models use the conservative default table entry.
+    """
+    if not model:
+        return 0
+    entry = _PRICING_MILS_PER_M.get(model) or _PRICING_MILS_PER_M["_default"]
+    # Compute as (tokens * mils_per_M) // 1_000_000 to stay integer.
+    cost_in  = (int(prompt_tokens)     * entry["in"])  // 1_000_000
+    cost_out = (int(completion_tokens) * entry["out"]) // 1_000_000
+    return cost_in + cost_out

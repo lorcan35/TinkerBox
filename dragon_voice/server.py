@@ -1199,6 +1199,50 @@ class VoiceServer:
                                     },
                                 })
 
+                                # v4·D Phase 4b vision capability advertisement.
+                                # Tab5's camera screen renders a "VISION · <model>
+                                # READY" chip based on this.  A model is
+                                # vision-capable when:
+                                #   1. cloud mode (2) + OpenRouter model matches
+                                #      a known vision id (gpt-4o, sonnet, etc)
+                                #   2. OR local mode (0) using ollama and the
+                                #      ollama_model name contains "vision"
+                                #      or "llava"
+                                # Per-frame cost estimates are rough mils-per-
+                                # frame for the Tab5 1280x720 capture sent as
+                                # a ~60 KB JPEG (= ~1500 image tokens at most
+                                # vendors).
+                                try:
+                                    vm = conn_config.llm.openrouter_model.lower() \
+                                        if voice_mode == 2 else ""
+                                    om = conn_config.llm.ollama_model.lower() \
+                                        if voice_mode == 0 else ""
+                                    vision_model = ""
+                                    per_frame_mils = 0
+                                    if voice_mode == 2:
+                                        if "gpt-4o" in vm:
+                                            vision_model = active_model
+                                            per_frame_mils = 1200  # ~$0.012/frame
+                                        elif "sonnet" in vm:
+                                            vision_model = active_model
+                                            per_frame_mils = 4500  # ~$0.045/frame
+                                        elif "haiku" in vm:
+                                            # Haiku 3.5 supports vision per OR
+                                            vision_model = active_model
+                                            per_frame_mils = 400
+                                    elif voice_mode == 0:
+                                        if "vision" in om or "llava" in om:
+                                            vision_model = active_model
+                                            per_frame_mils = 0  # local = free
+                                    await ws.send_json({
+                                        "type":           "vision_capability",
+                                        "can_see":        bool(vision_model),
+                                        "model":          vision_model,
+                                        "per_frame_mils": per_frame_mils,
+                                    })
+                                except Exception:
+                                    logger.exception("vision_capability emit failed")
+
                     elif cmd_type == "config_ack":
                         logger.debug("Connection %s: config_ack %s", ws_id, cmd.get("applied"))
 

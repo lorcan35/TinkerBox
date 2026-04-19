@@ -94,6 +94,54 @@ class Tab5Surface:
         self._live_cards.add(cid)
         return cid
 
+    # ── widget_list ──────────────────────────────────────────────
+    async def list_(
+        self,
+        *,
+        title: str,
+        items: list[dict],
+        priority: int = 50,
+        tone: str = "info",
+        card_id: Optional[str] = None,
+        skill_id: Optional[str] = None,
+    ) -> str:
+        """Emit a ranked list widget to the Tab5 home live-slot.
+
+        items: up to 5 dicts shaped {"text": str, "value": str}.  Extra
+        items are silently dropped (Tab5 renders top 3 anyway, but the
+        store keeps up to 5 for scroll-later).
+
+        Tab5 renders this as a title + numbered rows on the home slot,
+        growing the card height to ~168 px.  Competes with widget_live
+        on the same priority queue.
+
+        v4·D Phase 4c (TinkerTab widget.h supports type=LIST).
+        """
+        sid = skill_id or self._skill_id
+        cid = card_id or _gen_card_id(sid)
+        # Truncate per-item strings to Tab5's widget.h field widths so
+        # over-long entries don't get silently cut at the parser.
+        safe_items = []
+        for it in items[:5]:
+            if not isinstance(it, dict):
+                continue
+            safe_items.append({
+                "text":  str(it.get("text",  ""))[:79],
+                "value": str(it.get("value", ""))[:15],
+            })
+        msg: dict = {
+            "type": "widget_list",
+            "skill_id": sid,
+            "card_id": cid,
+            "title": title[:63],
+            "tone": tone,
+            "priority": max(0, min(100, int(priority))),
+            "items": safe_items,
+        }
+        await self._safe_send(msg, describe=f"list {sid}/{cid}")
+        self._live_cards.add(cid)
+        return cid
+
     async def live_update(
         self,
         card_id: str,

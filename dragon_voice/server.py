@@ -1358,8 +1358,35 @@ class VoiceServer:
                     await ws.send_json({"type": "tool_call", "tool": call["tool"], "args": call["args"]})
 
             async def _on_tool_result(result):
-                if not ws.closed:
-                    await ws.send_json({"type": "tool_result", **result})
+                if ws.closed:
+                    return
+                await ws.send_json({"type": "tool_result", **result})
+                # v4·D Phase 4c: auto-emit widget_list for web_search results
+                # so the Tab5 home live-slot surfaces the top hits without
+                # the LLM having to orchestrate a widget call itself.
+                try:
+                    if result.get("tool") == "web_search":
+                        payload = result.get("result") or {}
+                        hits = payload.get("results") or []
+                        query = payload.get("query", "")
+                        items = []
+                        for r in hits[:5]:
+                            t = str(r.get("title") or r.get("snippet") or "")[:79]
+                            if not t:
+                                continue
+                            items.append({"text": t, "value": ""})
+                        if items:
+                            await ws.send_json({
+                                "type": "widget_list",
+                                "skill_id": "web_search",
+                                "card_id": f"ws_{session_id[:8]}",
+                                "title": (query[:60] or "Web results"),
+                                "tone": "info",
+                                "priority": 70,
+                                "items": items,
+                            })
+                except Exception:
+                    logger.debug("widget_list auto-emit failed", exc_info=True)
 
             conn_state["on_tool_call"] = _on_tool_call
             conn_state["on_tool_result"] = _on_tool_result

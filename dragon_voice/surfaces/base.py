@@ -179,6 +179,86 @@ class Tab5Surface:
                 )
             self._live_cards.clear()
 
+    # ── widget_media ─────────────────────────────────────────────
+    async def media(
+        self,
+        *,
+        url: str,
+        alt: str = "",
+        title: str = "",
+        body: str = "",
+        tone: str = "info",
+        priority: int = 60,
+        card_id: Optional[str] = None,
+        skill_id: Optional[str] = None,
+    ) -> str:
+        """Emit a media widget (image + caption) to the Tab5 live-slot.
+
+        Skills shipping photos, screenshots, or chart thumbnails use this
+        surface.  `url` should be fetchable from the Tab5 (either Dragon
+        /api/media/* or a LAN-reachable origin).  v4·D Phase 4g.
+        """
+        sid = skill_id or self._skill_id
+        cid = card_id or _gen_card_id(sid)
+        msg: dict = {
+            "type": "widget_media",
+            "skill_id": sid,
+            "card_id": cid,
+            "url": url,
+            "tone": tone,
+            "priority": max(0, min(100, int(priority))),
+        }
+        if alt:   msg["alt"]   = alt[:95]
+        if title: msg["title"] = title[:63]
+        if body:  msg["body"]  = body[:255]
+        await self._safe_send(msg, describe=f"media {sid}/{cid}")
+        self._live_cards.add(cid)
+        return cid
+
+    # ── widget_prompt ────────────────────────────────────────────
+    async def prompt(
+        self,
+        *,
+        title: str,
+        choices: list[tuple],
+        body: str = "",
+        tone: str = "active",
+        priority: int = 70,
+        card_id: Optional[str] = None,
+        skill_id: Optional[str] = None,
+    ) -> str:
+        """Emit a prompt widget (title + up to 3 button choices).
+
+        `choices` is a list of (text, event) tuples.  Tab5 renders each
+        as a row; tapping fires widget_action carrying the matching
+        event.  Skill is expected to pre-register the event handler via
+        SurfaceManager.register_action.  v4·D Phase 4g.
+        """
+        sid = skill_id or self._skill_id
+        cid = card_id or _gen_card_id(sid)
+        safe = []
+        for c in choices[:3]:
+            if not isinstance(c, (list, tuple)) or len(c) < 2:
+                continue
+            txt, ev = c[0], c[1]
+            safe.append({
+                "text":  str(txt)[:47],
+                "event": str(ev)[:47],
+            })
+        msg: dict = {
+            "type": "widget_prompt",
+            "skill_id": sid,
+            "card_id": cid,
+            "title": title[:63],
+            "tone": tone,
+            "priority": max(0, min(100, int(priority))),
+            "choices": safe,
+        }
+        if body: msg["body"] = body[:255]
+        await self._safe_send(msg, describe=f"prompt {sid}/{cid}")
+        self._live_cards.add(cid)
+        return cid
+
     # ── widget_card ──────────────────────────────────────────────
     async def card(
         self,

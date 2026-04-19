@@ -316,6 +316,11 @@ _PRICING_MILS_PER_M = {
     "anthropic/claude-sonnet-4-20250514": {"in": 3000000, "out": 15000000},
     "anthropic/claude-3-haiku":  {"in":    250000, "out":   1250000},
     "anthropic/claude-3.5-haiku":{"in":    800000, "out":   4000000},
+    # Google / Gemini Flash family (2026-04-20 OpenRouter listing)
+    "google/gemini-3-flash-preview":   {"in":  500000, "out": 3000000},
+    "google/gemini-2.5-flash":         {"in":  300000, "out": 2500000},
+    "google/gemini-2.5-flash-lite":    {"in":  100000, "out":  400000},
+    "google/gemini-2.0-flash-001":     {"in":  100000, "out":  400000},
     # Fallback for anything unknown -- $2/$8 per M tokens, slightly high on purpose
     "_default":                  {"in":   2000000, "out":   8000000},
 }

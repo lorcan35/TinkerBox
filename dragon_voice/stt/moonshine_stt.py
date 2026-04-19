@@ -122,10 +122,26 @@ class MoonshineBackend(STTBackend):
         return text
 
     async def shutdown(self) -> None:
+        """Release the Transcriber + its onnxruntime InferenceSession.
+
+        The Transcriber wraps onnxruntime sessions that mmap the ~2.5 GB
+        model file. Simply dropping the reference isn't enough — the
+        onnxruntime C extension holds its own arenas that only release
+        when the Python wrapper is GC'd. We del + gc.collect explicitly
+        so a pipeline restart doesn't stack two copies of the arena
+        (which was the visible RSS leak in #29 pre-singleton).
+
+        Harmless no-op when called before initialize or twice. """
         if self._transcriber is not None:
-            self._transcriber.close()
+            try:
+                self._transcriber.close()
+            except Exception:
+                logger.exception("Moonshine transcriber.close() raised — proceeding to del")
             self._transcriber = None
-        logger.info("Moonshine backend shut down")
+        self._model_arch = None
+        import gc
+        gc.collect()
+        logger.info("Moonshine backend shut down (transcriber released, gc run)")
 
     @property
     def name(self) -> str:

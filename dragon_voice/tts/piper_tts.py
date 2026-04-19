@@ -247,9 +247,28 @@ class PiperBackend(TTSBackend):
             logger.info("Killed %d in-flight Piper processes", killed)
 
     async def shutdown(self) -> None:
+        """Release the Piper voice model + any in-flight subprocesses.
+
+        When using the piper-tts Python package the _voice object wraps
+        an onnxruntime.InferenceSession with a mmap-backed model arena
+        (~300 MB). Dropping the reference isn't enough — the C extension
+        keeps the arena alive until Python GC runs, so a pipeline restart
+        would stack two copies of the model before the first was freed.
+        del + gc.collect lets the runtime actually release the mmap. """
         self.kill_active_procs()
-        self._voice = None
-        logger.info("Piper TTS shut down")
+        if self._voice is not None:
+            try:
+                # Best-effort: piper-tts Python wrapper doesn't define
+                # close(), but some onnxruntime sessions offer __del__.
+                del self._voice
+            except Exception:
+                logger.exception("Piper voice del raised — proceeding")
+            self._voice = None
+        self._binary_path = None
+        self._model_path = None
+        import gc
+        gc.collect()
+        logger.info("Piper TTS shut down (voice released, gc run)")
 
     @property
     def sample_rate(self) -> int:

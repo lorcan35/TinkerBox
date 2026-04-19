@@ -36,6 +36,13 @@ class OpenRouterBackend(LLMBackend):
         # when stream_options.include_usage=true). Read by pipeline.py to
         # compute per-turn cost for receipt emission.
         self._last_usage: dict = {}
+        # v4·D Gauntlet G2 fix: flag when the last turn went through a
+        # context-trim retry (429 or context_length_exceeded).  pipeline
+        # picks this up and stamps the receipt with retried=true so the
+        # chat bubble can render a "RETRIED" chip.  Cleared at the top of
+        # every new _stream_messages call.
+        self._last_retried: bool = False
+        self._last_retry_reason: str = ""
 
     async def initialize(self) -> None:
         """Verify API key is set and connectivity is available."""
@@ -94,9 +101,14 @@ class OpenRouterBackend(LLMBackend):
             "max_tokens": self._config.max_tokens,
             "temperature": self._config.temperature,
         }
-        # Reset last usage on every new turn so stale figures from the
-        # previous turn don't leak into the receipt.
-        self._last_usage = {}
+        # Reset last usage + retry flags on every new turn so stale
+        # figures from the previous turn don't leak into the receipt.
+        # Preserve the flags through recursive retries though -- only
+        # reset on the OUTER call (_retried is false).
+        if not _retried:
+            self._last_usage = {}
+            self._last_retried = False
+            self._last_retry_reason = ""
 
         try:
             async with self._session.post(
@@ -123,6 +135,8 @@ class OpenRouterBackend(LLMBackend):
                             wait_secs,
                         )
                         await asyncio.sleep(wait_secs)
+                        self._last_retried = True
+                        self._last_retry_reason = "rate_limit"
                         async for token in self._stream_messages(messages, _retried=True):
                             yield token
                         return
@@ -140,6 +154,8 @@ class OpenRouterBackend(LLMBackend):
                         from dragon_voice.messages import estimate_tokens
                         current = sum(estimate_tokens(m.get("content", "")) for m in messages)
                         trimmed = trim_context_to_budget(messages, current // 2)
+                        self._last_retried = True
+                        self._last_retry_reason = "context_trim"
                         async for token in self._stream_messages(trimmed, _retried=True):
                             yield token
                         return
@@ -206,7 +222,11 @@ class OpenRouterBackend(LLMBackend):
         Returns {} if no turn has run or the tail chunk lacked usage (e.g.
         the stream was aborted before the final SSE event).
         """
-        return dict(self._last_usage)
+        u = dict(self._last_usage)
+        if self._last_retried:
+            u["retried"] = True
+            u["retry_reason"] = self._last_retry_reason
+        return u
 
     async def generate_stream(
         self, prompt: str, system_prompt: str = ""

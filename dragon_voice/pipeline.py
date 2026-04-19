@@ -584,8 +584,13 @@ class VoicePipeline:
                             "prompt_tokens":     usage.get("prompt_tokens", 0),
                             "completion_tokens": usage.get("completion_tokens", 0),
                             "total_tokens":      usage.get("total_tokens", 0),
-                            "cost_mils":         cost_mils,   # 1000ths of a USD cent
+                            "cost_mils":         cost_mils,
                             "llm_ms":            round(llm_ms),
+                            # v4·D Gauntlet G2: surface retries so the chat
+                            # bubble can stamp a "retried" chip instead of
+                            # silently presenting a possibly-degraded reply.
+                            "retried":           bool(usage.get("retried", False)),
+                            "retry_reason":      usage.get("retry_reason", ""),
                         })
             except Exception as e:
                 # Never let receipt emission break the turn

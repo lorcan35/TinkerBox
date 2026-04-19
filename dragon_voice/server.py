@@ -1615,6 +1615,9 @@ class VoiceServer:
                                 "completion_tokens": usage.get("completion_tokens", 0),
                                 "total_tokens":      usage.get("total_tokens", 0),
                                 "cost_mils":         cost_mils,
+                                # v4·D Gauntlet G2 surface retries
+                                "retried":           bool(usage.get("retried", False)),
+                                "retry_reason":      usage.get("retry_reason", ""),
                             })
                         logger.info(
                             "Receipt emitted (text): model=%s tok=%d+%d=%d cost_mils=%d",

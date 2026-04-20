@@ -1811,11 +1811,20 @@ class VoiceServer:
             # surface the engine name so transparency-per-bubble still
             # holds.
             if not ws.closed:
-                tc_model = getattr(llm, "name", "tinkerclaw")
-                # Prefer the gateway-reported model id (e.g. minimax/MiniMax-M2.5)
+                # Wave 8 audit #2 (A4/F3/J12): the first-turn fallback was
+                # the bare string "tinkerclaw" which shows up in chat
+                # bubbles as a generic stamp until the gateway populates
+                # `_model`. Fall back to the LLMConfig default
+                # ("minimax/MiniMax-M2.5") when both `name` and `_model`
+                # are empty so the first bubble stamp is still honest.
                 inner = getattr(llm, "_model", "") or ""
-                if inner:
-                    tc_model = inner
+                conf_default = getattr(conn_cfg.llm, "tinkerclaw_model", "") or ""
+                tc_model = (
+                    inner
+                    or getattr(llm, "name", None)
+                    or conf_default
+                    or "minimax/MiniMax-M2.5"
+                )
                 try:
                     await ws.send_json({
                         "type": "receipt",

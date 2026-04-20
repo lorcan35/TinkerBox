@@ -78,14 +78,28 @@ class SurfaceManager:
         event: str,
         payload: Optional[dict] = None,
     ) -> None:
-        """Route incoming widget_action to the owning skill's handler."""
+        """Route incoming widget_action to the owning skill's handler.
+
+        Wave 8 audit B6/K3 fix: when no handler is registered for a card
+        we now dismiss the card so the user's tap has an observable
+        effect (previously it was a silent log, making the platform look
+        broken for any skill that forgot to call register_action).
+        TimeSense and the /debug/widget_prompt endpoint register handlers
+        explicitly and take this path; drive-by skills get the default
+        dismiss below so taps never feel dead.
+        """
         state = self._sessions.get(session_id)
         if not state:
             log.warning("widget_action for unknown session=%s", session_id)
             return
         handler = state.action_handlers.get(card_id)
         if not handler:
-            log.info("widget_action no handler: card=%s event=%s", card_id, event)
+            log.info("widget_action no handler: card=%s event=%s — "
+                     "dispatching default dismiss (B6/K3)", card_id, event)
+            try:
+                await state.surface.dismiss(card_id)
+            except Exception:
+                log.exception("widget_action default dismiss failed for card=%s", card_id)
             return
         try:
             await handler(event, payload or {})

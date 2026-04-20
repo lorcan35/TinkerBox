@@ -94,6 +94,7 @@ class VoiceServer:
         app.router.add_get("/", self._handle_status)
         app.router.add_get("/health", self._handle_health)
         app.router.add_post("/debug/widget_chart", self._debug_widget_chart)
+        app.router.add_post("/debug/widget_prompt", self._debug_widget_prompt)
         app.router.add_get("/api/config", self._handle_get_config)
         app.router.add_post("/api/config", self._handle_set_config)
 
@@ -656,6 +657,48 @@ class VoiceServer:
             except Exception as e:
                 logger.warning("debug chart emit failed for %s: %s", sid, e)
         return web.json_response({"emitted": count, "values": values})
+
+    async def _debug_widget_prompt(self, request: web.Request) -> web.Response:
+        """POST /debug/widget_prompt -- audit B6/K3 evidence.
+        Emits a widget_prompt on every registered Tab5Surface AND
+        registers a handler so tap round-trips back to Dragon.
+        Body: {title, body, choices: [[text, event], ...]}."""
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        title = data.get("title", "Confirm?")
+        body = data.get("body", "")
+        choices_raw = data.get("choices", [["Yes", "audit_yes"], ["No", "audit_no"]])
+        choices = []
+        for c in choices_raw[:3]:
+            if isinstance(c, (list, tuple)) and len(c) >= 2:
+                choices.append((str(c[0]), str(c[1])))
+        if self._surface_mgr is None:
+            return web.json_response({"error": "surface_mgr not ready"}, status=503)
+        count = 0
+        for sid, state in list(self._surface_mgr._sessions.items()):
+            try:
+                card_id = f"audit_prompt_{sid[:6]}"
+                async def _handle(event: str, payload: dict, _sid=sid, _cid=card_id) -> None:
+                    logger.info("audit widget_prompt tapped: session=%s event=%s payload=%s",
+                                _sid, event, payload)
+                    # Dismiss the card so the tap has an observable effect.
+                    try:
+                        await state.surface.dismiss(_cid)
+                    except Exception:
+                        pass
+                    self._surface_mgr.unregister_action(_sid, _cid)
+                self._surface_mgr.register_action(sid, card_id, _handle)
+                await state.surface.prompt(
+                    title=title, body=body, choices=choices,
+                    skill_id="audit", card_id=card_id,
+                )
+                count += 1
+            except Exception as e:
+                logger.warning("debug prompt emit failed for %s: %s", sid, e)
+        return web.json_response({"emitted": count, "choices": choices})
+
 
     async def _handle_get_config(self, request: web.Request) -> web.Response:
         """Return current config with secrets redacted."""

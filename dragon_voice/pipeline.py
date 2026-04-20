@@ -490,6 +490,24 @@ class VoicePipeline:
             logger.info("STT (%.0fms): %s", stt_ms, transcript)
             await self._on_event({"type": "stt", "text": transcript, "stt_ms": round(stt_ms)})
 
+            # Audit F4 (2026-04-20): emit STT receipt so Tab5's per-turn
+            # transparency + budget tracker can see which STT backend ran
+            # and how long it took.  Cost_mils=0 for local Moonshine;
+            # OpenRouter STT cost would need per-audio-second pricing
+            # which the STT class doesn't currently expose — stub at 0
+            # and let the cloud-STT path surface its own charge later.
+            try:
+                _stt_backend = self._config.stt.backend or "stt"
+                await self._on_event({
+                    "type": "receipt",
+                    "stage": "stt",
+                    "model": _stt_backend,
+                    "stt_ms": round(stt_ms),
+                    "cost_mils": 0,
+                })
+            except Exception as _e:
+                logger.debug("STT receipt emit failed: %s", _e)
+
             if self._cancelled:
                 return
 
@@ -668,6 +686,23 @@ class VoicePipeline:
                     "tts_ms": round(self._tts_total_ms),
                 })
                 self._tts_started = False
+
+            # Audit F5 (2026-04-20): emit TTS receipt so per-turn chat
+            # bubbles can stamp the speech backend + time.  cost_mils=0
+            # for local Piper; OpenRouter TTS cost left at 0 (same
+            # rationale as the STT receipt).
+            if self._tts_total_ms > 0:
+                try:
+                    _tts_backend = self._config.tts.backend or "tts"
+                    await self._on_event({
+                        "type": "receipt",
+                        "stage": "tts",
+                        "model": _tts_backend,
+                        "tts_ms": round(self._tts_total_ms),
+                        "cost_mils": 0,
+                    })
+                except Exception as _e:
+                    logger.debug("TTS receipt emit failed: %s", _e)
 
             # Trim in-memory history on legacy path only
             if not self._conversation_engine and hasattr(self._llm, "trim_history"):

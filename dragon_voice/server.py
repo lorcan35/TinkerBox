@@ -263,6 +263,19 @@ class VoiceServer:
         from dragon_voice.surfaces import SurfaceManager
         self._surface_mgr = SurfaceManager()
         logger.info("SurfaceManager initialized")
+        # Audit P0 #1 (2026-04-20): register TimesenseTool - the reference
+        # widget-emitting skill.  Must be registered AFTER surface_mgr init
+        # (it takes the surface manager as constructor arg).  TimerTool and
+        # TimesenseTool have distinct names (timer vs timesense_timer) so
+        # both coexist; LLM picks based on description.
+        if self._tool_registry is not None:
+            try:
+                from dragon_voice.tools.timesense_tool import TimesenseTool
+                self._tool_registry.register(TimesenseTool(self._surface_mgr))
+                logger.info("TimesenseTool registered (widget emitter)")
+            except Exception as e:
+                logger.warning("TimesenseTool registration failed: %s", e)
+
 
         # Conversation engine (shared LLM backend for text/API input)
         self._conversation = ConversationEngine(
@@ -1752,6 +1765,19 @@ class VoiceServer:
 
                     if not ws.closed:
                         await ws.send_json({"type": "tts_end", "tts_ms": round(tts_ms)})
+                        # Audit F5 (2026-04-20): TTS receipt for text-path
+                        # synthesis so chat bubbles surface the TTS backend
+                        # that spoke the reply.
+                        try:
+                            await ws.send_json({
+                                "type": "receipt",
+                                "stage": "tts",
+                                "model": tts_backend,
+                                "tts_ms": round(tts_ms),
+                                "cost_mils": 0,
+                            })
+                        except Exception:
+                            pass
                 except Exception:
                     logger.exception("TTS for text input failed")
                     # Always send tts_end so Tab5 doesn't hang in SPEAKING

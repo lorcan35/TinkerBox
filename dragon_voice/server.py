@@ -781,11 +781,22 @@ class VoiceServer:
             logger.warning("Connection limit reached (%d), rejecting", self._max_connections)
             return web.Response(text="Too many connections", status=503)
 
+        # v4·D connectivity audit -- ROOT CAUSE FIX #3.
+        #
+        # Enable aiohttp's built-in WS heartbeat at 30 s with a 60 s
+        # pong-wait window.  Previously heartbeat=None meant the
+        # server never sent WS-level pings -- dead sockets could only
+        # be detected by a failed send.  With heartbeat enabled, aiohttp
+        # emits a PING every `heartbeat` seconds and closes the
+        # connection if the peer hasn't replied within `receive_timeout`.
+        # Paired with Tab5's new TCP-level keepalive, both sides now
+        # notice a half-open socket in well under 60 s instead of
+        # waiting for the app layer to try a write and fail.
         ws = web.WebSocketResponse(
-            max_msg_size=10 * 1024 * 1024,  # 10MB max message
-            heartbeat=None,  # DISABLED: although ESP-IDF v5.4.3 auto-PONGs, the latency through
-            # ngrok (200-500ms) plus SSL overhead causes spurious timeouts. Keepalive handled
-            # by _ws_keepalive task (20s ws.ping) + Tab5 JSON pings (8s).
+            max_msg_size=10 * 1024 * 1024,
+            heartbeat=30.0,
+            receive_timeout=60.0,
+            autoping=True,
         )
         await ws.prepare(request)
 

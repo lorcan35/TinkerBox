@@ -95,6 +95,8 @@ class VoiceServer:
         app.router.add_get("/health", self._handle_health)
         app.router.add_post("/debug/widget_chart", self._debug_widget_chart)
         app.router.add_post("/debug/widget_prompt", self._debug_widget_prompt)
+        app.router.add_post("/debug/widget_card", self._debug_widget_card)
+        app.router.add_post("/debug/widget_media", self._debug_widget_media)
         app.router.add_get("/api/config", self._handle_get_config)
         app.router.add_post("/api/config", self._handle_set_config)
 
@@ -698,6 +700,60 @@ class VoiceServer:
             except Exception as e:
                 logger.warning("debug prompt emit failed for %s: %s", sid, e)
         return web.json_response({"emitted": count, "choices": choices})
+
+    async def _debug_widget_card(self, request: web.Request) -> web.Response:
+        """POST /debug/widget_card -- audit B2 evidence.
+        Emits a widget_card on every registered Tab5Surface. Cards go
+        to chat (not home). Body: {title, body, tone}."""
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        title = data.get("title", "Workshop draft ready")
+        body = data.get("body", "Two edits queued from yesterday. Review before 10:30.")
+        tone = data.get("tone", "info")
+        if self._surface_mgr is None:
+            return web.json_response({"error": "surface_mgr not ready"}, status=503)
+        count = 0
+        for sid, state in list(self._surface_mgr._sessions.items()):
+            try:
+                await state.surface.card(title=title, body=body, tone=tone,
+                                          skill_id="audit",
+                                          card_id="audit_card_" + sid[:6])
+                count += 1
+            except Exception as e:
+                logger.warning("debug card emit failed for %s: %s", sid, e)
+        return web.json_response({"emitted": count})
+
+    async def _debug_widget_media(self, request: web.Request) -> web.Response:
+        """POST /debug/widget_media -- audit B5 evidence.
+        Emits widget_media pointing at a previously uploaded image.
+        Body: {url, width, height, alt}."""
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        url = data.get("url", "")
+        width = int(data.get("width", 480))
+        height = int(data.get("height", 300))
+        alt = data.get("alt", "Audit media")
+        if not url:
+            return web.json_response({"error": "url required"}, status=400)
+        if self._surface_mgr is None:
+            return web.json_response({"error": "surface_mgr not ready"}, status=503)
+        count = 0
+        for sid, state in list(self._surface_mgr._sessions.items()):
+            try:
+                await state.surface.media(url=url, alt=alt,
+                                          title="Audit media",
+                                          skill_id="audit",
+                                          card_id="audit_media_" + sid[:6])
+                count += 1
+            except Exception as e:
+                logger.warning("debug media emit failed for %s: %s", sid, e)
+        return web.json_response({"emitted": count, "url": url})
+
+
 
 
     async def _handle_get_config(self, request: web.Request) -> web.Response:

@@ -36,9 +36,30 @@ class MemoryService:
         self._ollama_url = ollama_url
         self._embed_model = embed_model
         self._embed_dim: int = 0  # set after first embedding call
+        # Audit K2 (2026-04-20): sqlite-vec backend. _use_vec flips true
+        # once the vec0 extension loads + the vec virtual table exists.
+        # Falls back to Python-loop cosine when unavailable.
+        self._use_vec: bool = False
+        self._vec_created: bool = False
 
     async def initialize(self) -> None:
         """Create memory tables if they don't exist."""
+        # Try to load sqlite-vec for fast ANN search. Python-loop cosine
+        # fallback kicks in if this fails. aiosqlite exposes
+        # enable_load_extension + load_extension as coroutines that run on
+        # the DB worker thread (so the extension ends up attached to the
+        # right connection).
+        try:
+            import sqlite_vec
+            await self._db.conn.enable_load_extension(True)
+            await self._db.conn.load_extension(sqlite_vec.loadable_path())
+            await self._db.conn.enable_load_extension(False)
+            self._use_vec = True
+            logger.info("sqlite-vec loaded OK; vector search enabled")
+        except Exception as e:
+            self._use_vec = False
+            logger.warning("sqlite-vec unavailable (%s) — falling back to "
+                           "Python-loop cosine", e)
         await self._db.conn.executescript("""
             CREATE TABLE IF NOT EXISTS memory_facts (
                 id          TEXT PRIMARY KEY,
@@ -117,6 +138,24 @@ class MemoryService:
 
     # ── Facts ──
 
+
+    async def _ensure_vec_table(self) -> None:
+        """Create memory_facts_vec virtual table on first store (once we
+        know the embedding dimension). Idempotent."""
+        if self._vec_created or not self._use_vec or self._embed_dim == 0:
+            return
+        try:
+            await self._db.conn.execute(
+                f"CREATE VIRTUAL TABLE IF NOT EXISTS memory_facts_vec "
+                f"USING vec0(id TEXT PRIMARY KEY, embedding FLOAT[{self._embed_dim}])"
+            )
+            await self._db.conn.commit()
+            self._vec_created = True
+            logger.info("memory_facts_vec created (dim=%d)", self._embed_dim)
+        except Exception as e:
+            logger.warning("vec virtual table create failed: %s", e)
+            self._use_vec = False
+
     async def store_fact(self, content: str, source: str = "conversation",
                          session_id: Optional[str] = None) -> dict:
         """Store a fact with embedding."""
@@ -129,6 +168,16 @@ class MemoryService:
                VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (fact_id, content, source, session_id, embedding, now, now),
         )
+        # Mirror into vec virtual table for fast search (K2).
+        await self._ensure_vec_table()
+        if self._use_vec and self._vec_created and embedding:
+            try:
+                await self._db.conn.execute(
+                    "INSERT INTO memory_facts_vec (id, embedding) VALUES (?, ?)",
+                    (fact_id, embedding),
+                )
+            except Exception as e:
+                logger.debug("vec insert failed: %s", e)
         await self._db.conn.commit()
         logger.info("Fact stored: %s (%s)", fact_id, content[:50])
         return {"id": fact_id, "content": content, "source": source, "created_at": now}
@@ -147,12 +196,47 @@ class MemoryService:
         cursor = await self._db.conn.execute(
             "DELETE FROM memory_facts WHERE id = ?", (fact_id,)
         )
+        if self._use_vec and self._vec_created:
+            try:
+                await self._db.conn.execute(
+                    "DELETE FROM memory_facts_vec WHERE id = ?", (fact_id,)
+                )
+            except Exception as e:
+                logger.debug("vec delete failed: %s", e)
         await self._db.conn.commit()
         return cursor.rowcount > 0
 
     async def search_facts(self, query: str, limit: int = 5) -> list[dict]:
         """Search facts by semantic similarity."""
         query_emb = await self._get_embedding(query)
+
+        # Fast path: sqlite-vec ANN over memory_facts_vec.
+        if (self._use_vec and self._vec_created and query_emb):
+            try:
+                vec_cursor = await self._db.conn.execute(
+                    """SELECT v.id, v.distance, f.content, f.source, f.session_id, f.created_at
+                       FROM memory_facts_vec v
+                       JOIN memory_facts f ON f.id = v.id
+                       WHERE v.embedding MATCH ?
+                         AND k = ?
+                       ORDER BY v.distance ASC""",
+                    (query_emb, limit),
+                )
+                rows = await vec_cursor.fetchall()
+                out = []
+                for row in rows:
+                    d = dict(row)
+                    # Convert cosine distance to similarity-ish score for
+                    # API parity with the fallback path.
+                    out.append({
+                        "id": d["id"], "content": d["content"],
+                        "source": d["source"], "session_id": d["session_id"],
+                        "created_at": d["created_at"],
+                        "score": 1.0 - float(d["distance"]),
+                    })
+                return out
+            except Exception as e:
+                logger.warning("vec search failed, falling back to Python-loop: %s", e)
 
         cursor = await self._db.conn.execute(
             "SELECT id, content, source, session_id, embedding, created_at FROM memory_facts"

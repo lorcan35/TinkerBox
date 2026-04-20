@@ -365,6 +365,13 @@ class VoicePipeline:
         # Post-process: generate title + summary via LLM (async, non-blocking)
         # DQ22: store the task so it can be cancelled on shutdown/cancel
         if full_text.strip() and len(full_text) > 20:
+            # v4·D audit P1 fix: cancel any prior post-process task before
+            # overwriting the handle.  Two rapid finish_dictation calls
+            # previously leaked the first task -- it kept running while
+            # the second task raced it to write title/summary.
+            prev = self._post_process_task
+            if prev and not prev.done():
+                prev.cancel()
             self._post_process_task = asyncio.ensure_future(
                 self._post_process_dictation(full_text)
             )

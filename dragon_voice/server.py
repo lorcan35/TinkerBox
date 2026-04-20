@@ -1433,17 +1433,24 @@ class VoiceServer:
         # shared SurfaceManager.  Skills dispatch widget_* emissions
         # through here and widget_action events route back via
         # handle_action().
+        # v4·D audit P1: route surface + tool-event sends through the
+        # _safe_send_json helper so a transient close mid-widget-emit
+        # doesn't bubble into the WS handler and tear the session down.
         if self._surface_mgr is not None:
             async def _surface_send(msg: dict):
                 if not ws.closed:
-                    await ws.send_json(msg)
+                    await self._safe_send_json(ws, msg)
             await self._surface_mgr.register_session(session_id, _surface_send)
 
         # Store tool event callbacks per-connection (NOT on shared conversation engine)
         if self._tool_registry:
             async def _on_tool_call(call):
                 if not ws.closed:
-                    await ws.send_json({"type": "tool_call", "tool": call["tool"], "args": call["args"]})
+                    await self._safe_send_json(ws, {
+                        "type": "tool_call",
+                        "tool": call["tool"],
+                        "args": call["args"],
+                    })
 
             async def _on_tool_result(result):
                 if ws.closed:
@@ -1667,8 +1674,17 @@ class VoiceServer:
                 try:
                     await ws.send_json({"type": "tts_start"})
                     t0 = time.monotonic()
+                    # v4·D audit P1: mode-aware TTS synth budget.  Piper
+                    # can take 15-25 s on Q6A ARM64 for a 200-word reply;
+                    # cloud gpt-audio-mini is fast but still needs a
+                    # cushion when OpenRouter edge adds latency.  The
+                    # hardcoded 30 s was too tight in practice for local
+                    # and wasteful for cloud.
+                    tts_backend = (conn_cfg.tts.backend if conn_cfg else "piper")
+                    tts_timeout = 90 if tts_backend != "openrouter" else 30
                     audio_bytes = await asyncio.wait_for(
-                        pipeline._tts.synthesize(response_text), timeout=30
+                        pipeline._tts.synthesize(response_text),
+                        timeout=tts_timeout,
                     )
                     tts_ms = (time.monotonic() - t0) * 1000
 

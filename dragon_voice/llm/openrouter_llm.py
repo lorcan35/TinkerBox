@@ -91,8 +91,26 @@ class OpenRouterBackend(LLMBackend):
         and waits before retrying once (A20). This handles thundering-herd
         scenarios where Dragon and TinkerClaw share an OpenRouter API key.
         """
-        if self._session is None or self._session.closed:
+        # v4·D audit P2 fix: initialize() makes a blocking HTTPS call
+        # to /models to validate the API key.  On every recursive SSE
+        # failure that hits this branch (session closed mid-stream) we
+        # were re-pinging OpenRouter from inside the hot path.  Only
+        # re-init when genuinely missing; on closed-after-init just
+        # rebuild the aiohttp session without re-validating the key.
+        if self._session is None:
             await self.initialize()
+        elif self._session.closed:
+            # Rebuild the aiohttp session without re-validating the API
+            # key against /models (initialize() does that expensively).
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=120, sock_read=60),
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                    "HTTP-Referer": "https://tinkerclaw.local",
+                    "X-Title": "TinkerClaw Dragon Voice",
+                },
+            )
 
         payload = {
             "model": self._model,
@@ -357,7 +375,12 @@ def price_for_model(model: str, prompt_tokens: int, completion_tokens: int) -> i
     if "/" not in model:
         return 0
     entry = _PRICING_MILS_PER_M.get(model) or _PRICING_MILS_PER_M["_default"]
-    # Compute as (tokens * mils_per_M) // 1_000_000 to stay integer.
-    cost_in  = (int(prompt_tokens)     * entry["in"])  // 1_000_000
-    cost_out = (int(completion_tokens) * entry["out"]) // 1_000_000
+    # v4·D audit P1 fix: ceil-division so a tiny turn never floors to
+    # zero mils.  Previously a 2-token Haiku turn computed to 0 mils
+    # via floor-div, silently undercounting the daily spend.  With
+    # ceil-div, any billable turn costs at least 1 mil.
+    in_num  = int(prompt_tokens)     * entry["in"]
+    out_num = int(completion_tokens) * entry["out"]
+    cost_in  = (in_num  + 999_999) // 1_000_000 if in_num  > 0 else 0
+    cost_out = (out_num + 999_999) // 1_000_000 if out_num > 0 else 0
     return cost_in + cost_out

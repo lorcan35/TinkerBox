@@ -62,20 +62,53 @@ class ToolRegistry:
         Looks for <tool>name</tool><args>{"key": "value"}</args> patterns.
         Tolerant of small model quirks (stray >, missing </args>, etc).
         Returns list of {"tool": name, "args": dict}.
+
+        v4·D audit P2 fix: the regex `{.*?}` is non-greedy and will
+        truncate at the first `}` it encounters -- a nested JSON value
+        like {"filter": {"k": "v"}} lost its outer closer.  We now
+        balance braces manually after the regex anchors the position.
         """
-        # Try strict pattern first, then loose fallback
-        matches = TOOL_PATTERN.findall(text)
-        if not matches:
-            matches = TOOL_PATTERN_LOOSE.findall(text)
+        import re as _re
         calls = []
-        for name, args_str in matches:
-            # Clean up common small-model quirks
-            args_str = args_str.strip().rstrip(">").strip()
+        # Find each <tool>NAME</tool><args> anchor, then walk forward
+        # balancing {} so we capture the full JSON object.
+        anchor = _re.compile(r'<tool>(\w+)</tool>\s*<args>\s*', _re.DOTALL)
+        for m in anchor.finditer(text):
+            name = m.group(1)
+            i = m.end()
+            if i >= len(text) or text[i] != '{':
+                continue
+            depth = 0
+            in_str = False
+            esc = False
+            end = -1
+            for j in range(i, len(text)):
+                ch = text[j]
+                if in_str:
+                    if esc:      esc = False
+                    elif ch == '\\':
+                                 esc = True
+                    elif ch == '"':
+                                 in_str = False
+                    continue
+                if ch == '"':
+                    in_str = True
+                elif ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end = j + 1
+                        break
+            if end < 0:
+                continue
+            args_str = text[i:end].strip()
             try:
                 args = json.loads(args_str)
                 calls.append({"tool": name, "args": args})
             except json.JSONDecodeError:
-                logger.warning("Failed to parse tool args for %s: %s", name, args_str[:100])
+                logger.warning("Failed to parse tool args for %s: %s",
+                               name, args_str[:100])
         return calls
 
     def has_tool_call(self, text: str) -> bool:

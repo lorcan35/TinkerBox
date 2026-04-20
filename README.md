@@ -808,7 +808,17 @@ pytest tests/test_resume_live.py -v
 
 # Full end-to-end suite
 python3 tests/e2e_full_suite.py
+
+# Audit wave 6 WS-level regressions (D5 tool-XML strip + D6 media order)
+python3 tests/audit/test_d5_d6_ws.py
 ```
+
+The audit probe connects directly to `/ws/voice`, bypasses Tab5, and asserts
+two contract invariants: (1) the `llm` token stream never leaks
+`<tool>...</tool>` markup to the client, (2) on code-block responses the
+`text_update` event arrives BEFORE the `media` event so clients can
+deterministically replace the raw-markdown bubble. See
+`tests/audit/test_d5_d6_ws.py` for the full contract.
 
 ### Test Dependencies
 

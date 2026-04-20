@@ -1566,6 +1566,45 @@ class VoiceServer:
             device_id, session_id, resumed, ws_id,
         )
 
+        # Audit C8/K15 (2026-04-20): on resume, replay the tail of the
+        # message history so Tab5 chat can rehydrate its local store.
+        # Previously session_start carried only message_count and Tab5
+        # had to fetch via REST (which it never did) -- so a reconnect
+        # lost the conversation from the user's view even though it was
+        # on disk. Cap at 20 messages (most recent) to keep the WS frame
+        # small; Tab5 can still fetch full history via
+        # /api/v1/sessions/{id}/messages.
+        if resumed and self._message_store is not None:
+            try:
+                msgs = await self._message_store.get_messages(
+                    session_id, limit=20, offset=0
+                )
+                # Return the LAST 20 (get_messages returns ascending, so
+                # slice the tail).
+                tail = msgs[-20:] if len(msgs) > 20 else msgs
+                items = []
+                for m in tail:
+                    role = m.get("role")
+                    content = m.get("content")
+                    if not role or not content:
+                        continue
+                    items.append({
+                        "role": role,
+                        "content": content,
+                        "timestamp": m.get("created_at"),
+                    })
+                if items and not await self._safe_send_json(ws, {
+                    "type": "session_messages",
+                    "session_id": session_id,
+                    "items": items,
+                }):
+                    logger.info("session_messages replay dropped on %s", ws_id)
+                else:
+                    logger.info("Replayed %d messages for session %s",
+                                len(items), session_id)
+            except Exception as e:
+                logger.warning("session_messages replay failed: %s", e)
+
         # Reset conn_config to local defaults before pipeline init.
         # Tab5 will immediately send config_update with its actual mode,
         # so this avoids initializing cloud backends only to swap them out.

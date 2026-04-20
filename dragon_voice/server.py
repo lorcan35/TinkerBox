@@ -807,8 +807,8 @@ class VoiceServer:
         # waiting for the app layer to try a write and fail.
         ws = web.WebSocketResponse(
             max_msg_size=10 * 1024 * 1024,
-            heartbeat=30.0,
-            receive_timeout=60.0,
+            heartbeat=60.0,
+            receive_timeout=120.0,
             autoping=True,
         )
         await ws.prepare(request)
@@ -1143,11 +1143,14 @@ class VoiceServer:
                                     logger.info("TinkerClaw gateway health OK at %s", tc_url)
                                 except Exception as tc_err:
                                     logger.error("TinkerClaw gateway not reachable: %s", tc_err)
+                                    # Audit G5 (2026-04-20): revert to Local so Tab5 doesn't
+                                    # sit wedged on mode 3 showing an error. Matches the
+                                    # OpenRouter-key-missing path below.
                                     if not ws.closed:
                                         await ws.send_json({
                                             "type": "config_update",
                                             "error": "TinkerClaw gateway is not reachable",
-                                            "voice_mode": voice_mode,
+                                            "voice_mode": 0,
                                         })
                                     continue
 
@@ -1707,6 +1710,8 @@ class VoiceServer:
                     media_events = await self._media_pipeline.process_response(
                         response_text, session_id
                     )
+                    logger.info("MediaPipeline: %d event(s) for response len=%d",
+                                len(media_events), len(response_text))
                     for event in media_events:
                         if not ws.closed:
                             await ws.send_json(event)

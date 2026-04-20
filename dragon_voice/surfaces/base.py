@@ -292,6 +292,46 @@ class Tab5Surface:
         await self._safe_send(msg, describe=f"card {sid}/{cid}")
         return cid
 
+    # ── widget_chart ─────────────────────────────────────────────
+    async def chart(
+        self,
+        *,
+        title: str,
+        values: list[float],
+        body: str = "",
+        tone: str = "info",
+        chart_max: float = 0.0,
+        priority: int = 60,
+        card_id: Optional[str] = None,
+        skill_id: Optional[str] = None,
+    ) -> str:
+        """Emit a bar/line chart widget (up to 12 points).
+
+        Audit B5/B13 (2026-04-20): the chart emitter was missing from
+        Tab5Surface, so no skill could ever produce a widget_chart — the
+        parser existed on Tab5 with no upstream source. values[] is sent
+        as-is; Tab5 normalizes against chart_max for bar heights (0 =
+        auto-scale to max of values).
+        """
+        sid = skill_id or self._skill_id
+        cid = card_id or _gen_card_id(sid)
+        pts = [float(v) for v in values[:12]]
+        msg: dict = {
+            "type": "widget_chart",
+            "skill_id": sid,
+            "card_id": cid,
+            "title": title[:63],
+            "tone": tone,
+            "priority": max(0, min(100, int(priority))),
+            "values": pts,
+            "max": float(chart_max),
+        }
+        if body:
+            msg["body"] = body[:255]
+        await self._safe_send(msg, describe=f"chart {sid}/{cid}")
+        self._live_cards.add(cid)
+        return cid
+
     async def dismiss(self, card_id: str) -> None:
         """Generic dismiss — used for non-live widgets."""
         await self._safe_send(

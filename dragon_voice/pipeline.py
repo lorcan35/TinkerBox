@@ -26,6 +26,19 @@ logger = logging.getLogger(__name__)
 # tasks like DB queries and HTTP requests) so they don't compete for GIL time.
 inference_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="inference")
 
+
+def shutdown_inference_executor(wait: bool = False) -> None:
+    """v4·D audit P0 fix: let the voice server shut this pool down on
+    application exit.  Previously zombie inference threads lingered on
+    uvloop teardown; `wait=False` lets us shutdown without blocking the
+    aiohttp shutdown sequence, while still releasing the worker
+    handles. """
+    try:
+        inference_executor.shutdown(wait=wait, cancel_futures=True)
+    except TypeError:
+        # Python < 3.9 doesn't support cancel_futures
+        inference_executor.shutdown(wait=wait)
+
 # Regex for sentence boundary detection
 _SENTENCE_END = re.compile(r"[.!?]\s*$")
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
@@ -434,14 +447,19 @@ class VoicePipeline:
             except (Exception, asyncio.TimeoutError) as stt_err:
                 if self._config.stt.backend == "openrouter":
                     logger.error("Cloud STT failed: %s — falling back to local", stt_err)
-                    from dragon_voice.stt import create_stt
-                    from dragon_voice.config import STTConfig
-                    fallback = create_stt(STTConfig(backend="moonshine"))
-                    await fallback.initialize()
-                    transcript = await fallback.transcribe(
+                    # v4·D audit P1 fix: cache the fallback STT instance
+                    # on the pipeline so repeated cloud failures don't
+                    # re-init Moonshine (1-3 s blocking model load) every
+                    # single time.
+                    if not getattr(self, "_fallback_stt", None):
+                        from dragon_voice.stt import create_stt
+                        from dragon_voice.config import STTConfig
+                        self._fallback_stt = create_stt(STTConfig(backend="moonshine"))
+                        await self._fallback_stt.initialize()
+                        logger.info("Pre-warmed fallback STT (moonshine) cached")
+                    transcript = await self._fallback_stt.transcribe(
                         audio_data, self._config.audio.input_sample_rate
                     )
-                    await fallback.shutdown()
                     # Notify Tab5: auto-disable cloud mode
                     await self._on_event({
                         "type": "config_update",
@@ -498,13 +516,22 @@ class VoicePipeline:
                     transcript, self._config.llm.system_prompt
                 )
 
+            # v4·D audit P1 fix: scan only the new slice per token.
+            # Previously we re-ran the regex on the full accumulated
+            # response for every token -- O(N^2) and genuinely painful on
+            # 4k-token replies.  Keep a watermark and only scan
+            # (watermark - overlap) onward; overlap = longest marker
+            # length so a marker straddling a token boundary still hits.
+            scan_watermark = 0
+            OVERLAP = 32
             async for token in llm_stream:
                 if self._cancelled:
                     return
 
-                # Check for hallucination markers in accumulated response
                 full_response += token
-                halt_match = _HALLUCINATION_STOPS.search(full_response)
+                scan_start = max(0, scan_watermark - OVERLAP)
+                halt_match = _HALLUCINATION_STOPS.search(full_response, scan_start)
+                scan_watermark = len(full_response)
                 if halt_match:
                     # Truncate at the marker — don't send the hallucinated part
                     logger.warning(
@@ -593,8 +620,28 @@ class VoicePipeline:
                             "retry_reason":      usage.get("retry_reason", ""),
                         })
             except Exception as e:
-                # Never let receipt emission break the turn
-                logger.warning("Receipt emit failed: %s", e)
+                # Never let receipt emission break the turn.  v4·D audit
+                # P0 fix: emit a MINIMAL receipt even when the usage-
+                # based path failed so the Tab5 chat bubble still gets a
+                # stamp and the day-budget accumulator still increments
+                # by 0 (harmless but consistent).
+                logger.warning("Receipt emit failed: %s -- emitting fallback", e)
+                try:
+                    fallback_model = getattr(self._llm, "name", "") or "llm"
+                    await self._on_event({
+                        "type": "receipt",
+                        "stage": "llm",
+                        "model": fallback_model,
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0,
+                        "cost_mils": 0,
+                        "llm_ms": round(llm_ms) if isinstance(llm_ms, (int, float)) else 0,
+                        "retried": False,
+                        "retry_reason": "receipt-fallback: " + type(e).__name__,
+                    })
+                except Exception:
+                    logger.debug("fallback receipt also failed", exc_info=True)
 
             # Rich media detection on full response
             if self._media_pipeline and full_response:
@@ -704,12 +751,16 @@ class VoicePipeline:
             except (Exception, asyncio.TimeoutError) as tts_err:
                 if self._config.tts.backend == "openrouter":
                     logger.error("Cloud TTS failed: %s — falling back to local", tts_err)
-                    from dragon_voice.tts import create_tts
-                    from dragon_voice.config import TTSConfig
-                    fallback = create_tts(TTSConfig(backend="piper"))
-                    await fallback.initialize()
-                    audio_bytes = await fallback.synthesize(text)
-                    await fallback.shutdown()
+                    # v4·D audit P1 fix: cache fallback Piper instance so
+                    # repeated cloud failures don't re-initialize it
+                    # (expensive cold start every time).
+                    if not getattr(self, "_fallback_tts", None):
+                        from dragon_voice.tts import create_tts
+                        from dragon_voice.config import TTSConfig
+                        self._fallback_tts = create_tts(TTSConfig(backend="piper"))
+                        await self._fallback_tts.initialize()
+                        logger.info("Pre-warmed fallback TTS (piper) cached")
+                    audio_bytes = await self._fallback_tts.synthesize(text)
                     await self._on_event({
                         "type": "config_update",
                         "error": "Cloud TTS unavailable, reverted to local",
@@ -874,6 +925,13 @@ class VoicePipeline:
             tasks.append(self._tts.shutdown())
         if self._llm:
             tasks.append(self._llm.shutdown())
+        # Pre-warmed fallback backends (from P1 STT/TTS cache fix).
+        fb_stt = getattr(self, "_fallback_stt", None)
+        fb_tts = getattr(self, "_fallback_tts", None)
+        if fb_stt: tasks.append(fb_stt.shutdown())
+        if fb_tts: tasks.append(fb_tts.shutdown())
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._fallback_stt = None
+        self._fallback_tts = None
         logger.info("Voice pipeline shut down")

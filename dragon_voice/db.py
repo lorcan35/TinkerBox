@@ -345,6 +345,30 @@ class Database:
         )
         await self.conn.commit()
 
+    async def update_session_status_if(
+        self, session_id: str, new_status: str, expected_current: str,
+    ) -> bool:
+        """v4·D audit P1: atomic CAS on session.status.
+
+        Returns True if the row was updated (i.e., status transitioned
+        new_status from expected_current), False otherwise.  Uses a
+        single UPDATE ... WHERE so two concurrent disconnects on the
+        same session can't both fire "session.paused" events.
+        """
+        now = time.time()
+        ended_at = now if new_status == "ended" else None
+        cursor = await self.conn.execute(
+            """
+            UPDATE sessions
+               SET status = ?, last_active_at = ?,
+                   ended_at = COALESCE(?, ended_at)
+             WHERE id = ? AND status = ?
+            """,
+            (new_status, now, ended_at, session_id, expected_current),
+        )
+        await self.conn.commit()
+        return cursor.rowcount > 0
+
     async def touch_session(self, session_id: str) -> None:
         """Update last_active_at timestamp."""
         now = time.time()

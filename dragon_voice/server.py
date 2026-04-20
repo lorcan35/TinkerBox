@@ -542,6 +542,15 @@ class VoiceServer:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._active_connections.clear()
 
+        # v4·D audit P0 fix: release the inference ThreadPoolExecutor so
+        # uvloop can exit cleanly.  Previously zombie threads lingered.
+        try:
+            from dragon_voice.pipeline import shutdown_inference_executor
+            shutdown_inference_executor(wait=False)
+            logger.info("Inference executor shut down")
+        except Exception:
+            logger.debug("inference executor shutdown failed", exc_info=True)
+
         # Close shared proxy session (DQ08)
         if self._proxy_session and not self._proxy_session.closed:
             await self._proxy_session.close()
@@ -873,20 +882,18 @@ class VoiceServer:
         }
         self._active_connections[ws_id] = conn_state
 
-        # Callbacks for the pipeline
+        # Callbacks for the pipeline.  v4·D audit P0 fix: route through
+        # the shared _safe_send_* helpers so transient disconnects mid-
+        # stream don't raise ConnectionResetError up into the pipeline's
+        # tight loop (which used to swallow real exceptions).
         async def on_audio(audio_bytes: bytes) -> None:
-            if not ws.closed:
-                try:
-                    await ws.send_bytes(audio_bytes)
-                except Exception:
-                    logger.warning("Failed to send audio to %s", ws_id)
+            if ws.closed:
+                return
+            await self._safe_send_bytes(ws, audio_bytes)
 
         async def on_event(event: dict) -> None:
             if not ws.closed:
-                try:
-                    await ws.send_json(event)
-                except Exception:
-                    logger.warning("Failed to send event to %s", ws_id)
+                await self._safe_send_json(ws, event)
             # Persist API usage events for cost tracking
             if event.get("type") == "api_usage" and self._db:
                 try:
@@ -1029,6 +1036,15 @@ class VoiceServer:
                         await ws.send_json({"type": "pong"})
 
                     elif cmd_type == "config_update":
+                        # v4·D audit P1: rate-limit config_update to 2/sec/conn.
+                        # A buggy skill or trigger-happy test harness could
+                        # storm mode swaps that each do heavy backend init.
+                        _now_cfg = time.monotonic()
+                        _last_cfg = conn_state.get("_last_config_update_ts", 0.0)
+                        if _now_cfg - _last_cfg < 0.5:
+                            logger.debug("config_update rate-limited on %s", ws_id)
+                            continue
+                        conn_state["_last_config_update_ts"] = _now_cfg
                         # US-P01: Acquire conn_lock to serialize with stop/text
                         # handlers. Prevents swap_backends() from running while
                         # start_processing() or finish_dictation() is in flight.
@@ -1379,6 +1395,21 @@ class VoiceServer:
             platform=cmd.get("platform", ""),
             capabilities=cmd.get("capabilities"),
         )
+
+        # v4·D audit P0 fix: expose the widget subset of client capabilities
+        # on conn_state so skills can pull it via SurfaceManager and
+        # downgrade emissions (smaller lists, lower-res media) for low-end
+        # clients.  The register frame already ships this under
+        # capabilities.widgets; pluck it out for quick lookup.
+        caps = cmd.get("capabilities") or {}
+        widget_caps = caps.get("widgets") if isinstance(caps, dict) else None
+        conn_state["widget_capabilities"] = widget_caps or {
+            "types": ["live", "card"],
+            "list_max_items": 3, "chart_max_points": 8,
+            "prompt_max_choices": 2,
+        }
+        logger.info("widget_capabilities for %s: %s",
+                    device_id, conn_state["widget_capabilities"])
         await self._db.add_event(
             "device.connected", device_id=device_id,
             data={"platform": cmd.get("platform", ""), "firmware_ver": cmd.get("firmware_ver", "")}

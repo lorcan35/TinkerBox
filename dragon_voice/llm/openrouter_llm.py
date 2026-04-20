@@ -170,7 +170,18 @@ class OpenRouterBackend(LLMBackend):
                             yield token
                         return
 
-                    yield f"[OpenRouter error: {resp.status}]"
+                    # v4·D audit P0 fix: do NOT yield the raw error
+                    # string into the token stream.  It used to end up
+                    # in conversation history AND get spoken by TTS
+                    # ("open router error 500").  Log + yield a
+                    # user-friendly fallback sentence instead.  The
+                    # retry flag lets the receipt stamp a "retried"
+                    # chip so users know something went sideways.
+                    logger.error("OpenRouter error %d: %s",
+                                 resp.status, (err_body or "")[:200])
+                    self._last_retried = True
+                    self._last_retry_reason = f"openrouter_{resp.status}"
+                    yield "Sorry, the cloud model had a hiccup. Try again?"
                     return
 
                 # Parse SSE stream
@@ -195,7 +206,9 @@ class OpenRouterBackend(LLMBackend):
                                 "probable HTML error page from proxy. Last line: %s",
                                 consecutive_errors, data_str[:200],
                             )
-                            yield "[Connection error: proxy returned an error page]"
+                            self._last_retried = True
+                            self._last_retry_reason = "proxy_html_error"
+                            yield "Sorry, the cloud proxy threw an error. Try again?"
                             return
                         continue
 
@@ -223,7 +236,9 @@ class OpenRouterBackend(LLMBackend):
 
         except aiohttp.ClientError as e:
             logger.error("OpenRouter request failed: %s", e)
-            yield f"[Connection error: {e}]"
+            self._last_retried = True
+            self._last_retry_reason = f"client_error: {type(e).__name__}"
+            yield "Sorry, I couldn't reach the cloud. Try again in a moment?"
 
     def get_last_usage(self) -> dict:
         """Return usage dict from the most recent streamed turn.

@@ -147,20 +147,33 @@ class SessionManager:
         return await self._db.get_session(session_id)
 
     async def pause_session(self, session_id: str) -> None:
-        """Pause a session (e.g., on WebSocket disconnect)."""
+        """Pause a session (e.g., on WebSocket disconnect).
+
+        v4·D audit P1: use atomic CAS-on-status so two concurrent
+        disconnects on the same session can't both write a paused
+        event.  The old read-then-write pattern dropped one of the
+        transitions silently but double-counted the event log.
+        """
         try:
-            session = await self._db.get_session(session_id)
+            updated = await self._db.update_session_status_if(
+                session_id, "paused", "active",
+            )
         except (RuntimeError, Exception):
             # Database already closed during server shutdown — safe to ignore
             return
-        if not session or session["status"] != "active":
+        if not updated:
+            # Another coro already paused it, or it's not active.
             return
 
-        await self._db.update_session_status(session_id, "paused")
+        # Separately fetch device_id for the event so the CAS stays single-row.
+        try:
+            session = await self._db.get_session(session_id)
+        except Exception:
+            session = None
         await self._db.add_event(
             "session.paused",
             session_id=session_id,
-            device_id=session.get("device_id"),
+            device_id=(session or {}).get("device_id"),
         )
         logger.info("Session paused: %s", session_id)
 

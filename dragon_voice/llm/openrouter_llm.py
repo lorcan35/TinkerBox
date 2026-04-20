@@ -112,6 +112,25 @@ class OpenRouterBackend(LLMBackend):
                 },
             )
 
+        # Audit follow-up (2026-04-20): Gemini-via-OpenRouter rejects
+        # role="tool" messages missing tool_call_id with HTTP 400
+        # ("Tool message must have either name or tool_call_id"). We
+        # don't carry a tool_call_id through the history (tools are
+        # stored as XML-tagged assistant content), so the safest cross-
+        # provider fix is to rewrite tool-role messages into user-role
+        # messages with a "(tool output) ..." prefix. Works for
+        # Anthropic, OpenAI, Gemini equally. Non-tool roles pass through.
+        sanitized = []
+        for _msg in messages:
+            if _msg.get("role") == "tool" and not _msg.get("tool_call_id"):
+                sanitized.append({
+                    "role": "user",
+                    "content": f"(tool output) {_msg.get('content', '')}",
+                })
+            else:
+                sanitized.append(_msg)
+        messages = sanitized
+
         payload = {
             "model": self._model,
             "messages": messages,

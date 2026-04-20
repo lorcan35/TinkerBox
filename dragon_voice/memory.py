@@ -94,6 +94,45 @@ class MemoryService:
             );
             CREATE INDEX IF NOT EXISTS idx_chunks_doc ON memory_chunks(document_id, chunk_index);
         """)
+
+        # K2 FTS5 keyword side of memory hybrid search. Triggers keep
+        # memory_facts_fts in sync with memory_facts without touching the
+        # app code that stores facts.
+        try:
+            await self._db.conn.executescript("""
+                CREATE VIRTUAL TABLE IF NOT EXISTS memory_facts_fts USING fts5(
+                    id UNINDEXED,
+                    content,
+                    source UNINDEXED,
+                    tokenize='porter unicode61'
+                );
+                CREATE TRIGGER IF NOT EXISTS memory_facts_ai AFTER INSERT ON memory_facts
+                BEGIN
+                    INSERT INTO memory_facts_fts(id, content, source)
+                    VALUES (new.id, new.content, new.source);
+                END;
+                CREATE TRIGGER IF NOT EXISTS memory_facts_ad AFTER DELETE ON memory_facts
+                BEGIN
+                    DELETE FROM memory_facts_fts WHERE id = old.id;
+                END;
+                CREATE TRIGGER IF NOT EXISTS memory_facts_au AFTER UPDATE ON memory_facts
+                BEGIN
+                    UPDATE memory_facts_fts
+                       SET content = new.content, source = new.source
+                     WHERE id = new.id;
+                END;
+            """)
+            await self._db.conn.execute(
+                "INSERT INTO memory_facts_fts(id, content, source) "
+                "SELECT id, content, source FROM memory_facts "
+                "WHERE id NOT IN (SELECT id FROM memory_facts_fts)"
+            )
+            await self._db.conn.commit()
+            self._use_fts5 = True
+            logger.info("FTS5 memory_facts_fts ready (keyword search enabled)")
+        except Exception as e:
+            self._use_fts5 = False
+            logger.warning("FTS5 init failed: %s -- keyword search disabled", e)
         await self._db.conn.commit()
         logger.info("MemoryService initialized (embed_model=%s)", self._embed_model)
 

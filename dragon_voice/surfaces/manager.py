@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from typing import Optional
 from typing import Any, Awaitable, Callable, Dict, Optional
 
 from .base import Tab5Surface, SendJson
@@ -35,7 +36,8 @@ class SurfaceManager:
         self._sessions: Dict[str, _SessionState] = {}
         self._lock = asyncio.Lock()
 
-    async def register_session(self, session_id: str, send: SendJson) -> Tab5Surface:
+    async def register_session(self, session_id: str, send: SendJson,
+                                  caps: Optional[dict] = None) -> Tab5Surface:
         """Called when a Tab5 WS connects. Returns the session's default surface."""
         async with self._lock:
             surface = Tab5Surface(send, skill_id="session")

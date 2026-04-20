@@ -42,11 +42,13 @@ def _gen_card_id(skill_id: str | None = None) -> str:
 class Tab5Surface:
     """Per-session facade. One instance per connected Tab5."""
 
-    def __init__(self, send_json: SendJson, skill_id: str = "unknown") -> None:
+    def __init__(self, send_json: SendJson, skill_id: str = "unknown",
+                 caps: Optional[dict] = None) -> None:
         self._send = send_json
         self._skill_id = skill_id
         # Track live card_ids emitted by this surface so we can clear() later.
         self._live_cards: set[str] = set()
+        self._caps: dict = caps or {}
 
     def for_skill(self, skill_id: str) -> "Tab5Surface":
         """Return a child surface tagged with a specific skill id. The
@@ -122,7 +124,8 @@ class Tab5Surface:
         # Truncate per-item strings to Tab5's widget.h field widths so
         # over-long entries don't get silently cut at the parser.
         safe_items = []
-        for it in items[:5]:
+        _max_items = int(self._caps.get("list_max_items", 5) or 5)
+        for it in items[:_max_items]:
             if not isinstance(it, dict):
                 continue
             safe_items.append({
@@ -237,7 +240,8 @@ class Tab5Surface:
         sid = skill_id or self._skill_id
         cid = card_id or _gen_card_id(sid)
         safe = []
-        for c in choices[:3]:
+        _max_choices = int(self._caps.get("prompt_max_choices", 3) or 3)
+        for c in choices[:_max_choices]:
             if not isinstance(c, (list, tuple)) or len(c) < 2:
                 continue
             txt, ev = c[0], c[1]
@@ -315,7 +319,8 @@ class Tab5Surface:
         """
         sid = skill_id or self._skill_id
         cid = card_id or _gen_card_id(sid)
-        pts = [float(v) for v in values[:12]]
+        _max_pts = int(self._caps.get("chart_max_points", 12) or 12)
+        pts = [float(v) for v in values[:_max_pts]]
         msg: dict = {
             "type": "widget_chart",
             "skill_id": sid,

@@ -1590,7 +1590,7 @@ class VoiceServer:
             async def _surface_send(msg: dict):
                 if not ws.closed:
                     await self._safe_send_json(ws, msg)
-            await self._surface_mgr.register_session(session_id, _surface_send)
+            await self._surface_mgr.register_session(session_id, _surface_send, caps=conn_state.get("widget_capabilities"))
 
         # Store tool event callbacks per-connection (NOT on shared conversation engine)
         if self._tool_registry:

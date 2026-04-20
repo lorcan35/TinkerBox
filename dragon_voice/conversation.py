@@ -8,6 +8,7 @@ refs #17, #18
 """
 
 import logging
+import re
 import time
 from typing import AsyncIterator, Optional
 
@@ -24,6 +25,20 @@ from dragon_voice.config import LLMConfig
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_CALLS = 3  # Prevent infinite tool-call loops
+
+# Audit D5 fix: the ToolRegistry's tolerant parser accepts `<tool>`/`</tool>`
+# + `<args>`/`</args>` with minor whitespace + stray closing chars. When we
+# fall through to "no tool call (or max reached)" and yield the buffered
+# response to the client, any raw tool XML in that text lands in the chat
+# bubble. Strip both blocks before yielding so the user never sees markup.
+_TOOL_MARKUP_RE = re.compile(
+    r"<tool>[\s\S]*?</tool>\s*<args>[\s\S]*?</args>\s*>?", re.IGNORECASE
+)
+
+
+def _strip_tool_markup(text: str) -> str:
+    """Remove `<tool>...</tool><args>...</args>` blocks from user-visible text."""
+    return _TOOL_MARKUP_RE.sub("", text)
 
 
 class ConversationEngine:
@@ -287,10 +302,16 @@ class ConversationEngine:
                     context = await self._messages.get_context(session_id)
                     continue  # Loop back for next LLM call
 
-            # No tool call (or max reached) — this is the final response
+            # No tool call (or max reached) — this is the final response.
+            # Audit D5: strip any leftover `<tool>...</tool><args>...</args>`
+            # blocks before yielding; otherwise the user sees raw XML in the
+            # chat bubble (happens when the LLM emitted tool markup after
+            # MAX_TOOL_CALLS was hit, or when has_tool_call matched but
+            # parse_tool_calls rejected the payload).
             if self._tool_registry:
-                for token in full_response:
-                    yield token
+                cleaned = _strip_tool_markup(response_text)
+                if cleaned:
+                    yield cleaned
 
             break
 

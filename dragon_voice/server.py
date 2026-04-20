@@ -93,6 +93,7 @@ class VoiceServer:
         # HTTP routes (legacy)
         app.router.add_get("/", self._handle_status)
         app.router.add_get("/health", self._handle_health)
+        app.router.add_post("/debug/widget_chart", self._debug_widget_chart)
         app.router.add_get("/api/config", self._handle_get_config)
         app.router.add_post("/api/config", self._handle_set_config)
 
@@ -632,6 +633,29 @@ class VoiceServer:
                 },
             }
         )
+
+
+    async def _debug_widget_chart(self, request: web.Request) -> web.Response:
+        """POST /debug/widget_chart -- audit B5 evidence. Emits a chart
+        widget on every registered Tab5Surface. Body: {title, values, chart_max}."""
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        title = data.get("title", "Audit chart")
+        values = data.get("values", [3, 7, 12, 9, 15, 18, 22, 16, 11, 8, 14, 20])
+        chart_max = float(data.get("chart_max", 0))
+        if self._surface_mgr is None:
+            return web.json_response({"error": "surface_mgr not ready"}, status=503)
+        count = 0
+        for sid, state in list(self._surface_mgr._sessions.items()):
+            try:
+                await state.surface.chart(title=title, values=values, chart_max=chart_max,
+                                  skill_id="audit", card_id="audit_chart_" + sid[:6])
+                count += 1
+            except Exception as e:
+                logger.warning("debug chart emit failed for %s: %s", sid, e)
+        return web.json_response({"emitted": count, "values": values})
 
     async def _handle_get_config(self, request: web.Request) -> web.Response:
         """Return current config with secrets redacted."""

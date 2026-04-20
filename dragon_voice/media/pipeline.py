@@ -149,43 +149,6 @@ class MediaPipeline:
         img_bytes = _resize_jpeg(data, TARGET_WIDTH)
         return await self._store.store(img_bytes, "jpg", session_id)
 
-    async def fetch_link_preview(self, url: str, session_id: str = "") -> Optional[dict]:
-        """Fetch *url*, parse OG tags, return a card event dict or None."""
-        import aiohttp
-
-        try:
-            session = await self._get_http_session()
-            timeout = aiohttp.ClientTimeout(total=10)
-            async with session.get(url, timeout=timeout) as resp:
-                if resp.status != 200:
-                    return None
-                html = await resp.text(errors="replace")
-        except Exception as exc:
-            logger.warning("MediaPipeline.fetch_link_preview: GET failed for %s: %s", url, exc)
-            return None
-
-        title = _og_meta(html, "og:title") or _og_meta(html, "twitter:title")
-        description = (
-            _og_meta(html, "og:description") or _og_meta(html, "twitter:description")
-        )
-        og_image = _og_meta(html, "og:image") or _og_meta(html, "twitter:image")
-
-        if not title and not description:
-            return None
-
-        card: dict = {"type": "card", "title": title or "", "subtitle": description or ""}
-
-        if og_image:
-            try:
-                thumb_id = await self.proxy_image(og_image, session_id)
-                card["image_url"] = f"/api/media/{thumb_id}"
-            except Exception as exc:
-                logger.warning(
-                    "MediaPipeline.fetch_link_preview: thumbnail proxy failed: %s", exc
-                )
-
-        return card
-
     # ── Internal helpers ─────────────────────────────────────────────────────
 
     async def _get_http_session(self):
@@ -405,24 +368,6 @@ def _resize_jpeg(img_bytes: bytes, max_width: int) -> bytes:
     img.save(buf, format="JPEG", quality=80)
     return buf.getvalue()
 
-
-def _og_meta(html: str, prop: str) -> Optional[str]:
-    """Extract the content of an OG/Twitter meta tag from raw HTML."""
-    pattern = re.compile(
-        r'<meta\s[^>]*(?:property|name)=["\']' + re.escape(prop) + r'["\'][^>]*content=["\']([^"\']+)["\']',
-        re.IGNORECASE | re.DOTALL,
-    )
-    m = pattern.search(html)
-    if m:
-        return m.group(1).strip()
-
-    # Also match content-first ordering: <meta content="..." property="og:title">
-    pattern2 = re.compile(
-        r'<meta\s[^>]*content=["\']([^"\']+)["\'][^>]*(?:property|name)=["\']' + re.escape(prop) + r'["\']',
-        re.IGNORECASE | re.DOTALL,
-    )
-    m2 = pattern2.search(html)
-    return m2.group(1).strip() if m2 else None
 
 
 def _media_event(media_id: str, alt: str) -> dict:

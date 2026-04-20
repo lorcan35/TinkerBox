@@ -26,6 +26,19 @@ logger = logging.getLogger(__name__)
 # tasks like DB queries and HTTP requests) so they don't compete for GIL time.
 inference_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="inference")
 
+
+def shutdown_inference_executor(wait: bool = False) -> None:
+    """v4·D audit P0 fix: let the voice server shut this pool down on
+    application exit.  Previously zombie inference threads lingered on
+    uvloop teardown; `wait=False` lets us shutdown without blocking the
+    aiohttp shutdown sequence, while still releasing the worker
+    handles. """
+    try:
+        inference_executor.shutdown(wait=wait, cancel_futures=True)
+    except TypeError:
+        # Python < 3.9 doesn't support cancel_futures
+        inference_executor.shutdown(wait=wait)
+
 # Regex for sentence boundary detection
 _SENTENCE_END = re.compile(r"[.!?]\s*$")
 _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
@@ -352,6 +365,13 @@ class VoicePipeline:
         # Post-process: generate title + summary via LLM (async, non-blocking)
         # DQ22: store the task so it can be cancelled on shutdown/cancel
         if full_text.strip() and len(full_text) > 20:
+            # v4·D audit P1 fix: cancel any prior post-process task before
+            # overwriting the handle.  Two rapid finish_dictation calls
+            # previously leaked the first task -- it kept running while
+            # the second task raced it to write title/summary.
+            prev = self._post_process_task
+            if prev and not prev.done():
+                prev.cancel()
             self._post_process_task = asyncio.ensure_future(
                 self._post_process_dictation(full_text)
             )
@@ -434,14 +454,19 @@ class VoicePipeline:
             except (Exception, asyncio.TimeoutError) as stt_err:
                 if self._config.stt.backend == "openrouter":
                     logger.error("Cloud STT failed: %s — falling back to local", stt_err)
-                    from dragon_voice.stt import create_stt
-                    from dragon_voice.config import STTConfig
-                    fallback = create_stt(STTConfig(backend="moonshine"))
-                    await fallback.initialize()
-                    transcript = await fallback.transcribe(
+                    # v4·D audit P1 fix: cache the fallback STT instance
+                    # on the pipeline so repeated cloud failures don't
+                    # re-init Moonshine (1-3 s blocking model load) every
+                    # single time.
+                    if not getattr(self, "_fallback_stt", None):
+                        from dragon_voice.stt import create_stt
+                        from dragon_voice.config import STTConfig
+                        self._fallback_stt = create_stt(STTConfig(backend="moonshine"))
+                        await self._fallback_stt.initialize()
+                        logger.info("Pre-warmed fallback STT (moonshine) cached")
+                    transcript = await self._fallback_stt.transcribe(
                         audio_data, self._config.audio.input_sample_rate
                     )
-                    await fallback.shutdown()
                     # Notify Tab5: auto-disable cloud mode
                     await self._on_event({
                         "type": "config_update",
@@ -464,6 +489,24 @@ class VoicePipeline:
 
             logger.info("STT (%.0fms): %s", stt_ms, transcript)
             await self._on_event({"type": "stt", "text": transcript, "stt_ms": round(stt_ms)})
+
+            # Audit F4 (2026-04-20): emit STT receipt so Tab5's per-turn
+            # transparency + budget tracker can see which STT backend ran
+            # and how long it took.  Cost_mils=0 for local Moonshine;
+            # OpenRouter STT cost would need per-audio-second pricing
+            # which the STT class doesn't currently expose — stub at 0
+            # and let the cloud-STT path surface its own charge later.
+            try:
+                _stt_backend = self._config.stt.backend or "stt"
+                await self._on_event({
+                    "type": "receipt",
+                    "stage": "stt",
+                    "model": _stt_backend,
+                    "stt_ms": round(stt_ms),
+                    "cost_mils": 0,
+                })
+            except Exception as _e:
+                logger.debug("STT receipt emit failed: %s", _e)
 
             if self._cancelled:
                 return
@@ -498,13 +541,22 @@ class VoicePipeline:
                     transcript, self._config.llm.system_prompt
                 )
 
+            # v4·D audit P1 fix: scan only the new slice per token.
+            # Previously we re-ran the regex on the full accumulated
+            # response for every token -- O(N^2) and genuinely painful on
+            # 4k-token replies.  Keep a watermark and only scan
+            # (watermark - overlap) onward; overlap = longest marker
+            # length so a marker straddling a token boundary still hits.
+            scan_watermark = 0
+            OVERLAP = 32
             async for token in llm_stream:
                 if self._cancelled:
                     return
 
-                # Check for hallucination markers in accumulated response
                 full_response += token
-                halt_match = _HALLUCINATION_STOPS.search(full_response)
+                scan_start = max(0, scan_watermark - OVERLAP)
+                halt_match = _HALLUCINATION_STOPS.search(full_response, scan_start)
+                scan_watermark = len(full_response)
                 if halt_match:
                     # Truncate at the marker — don't send the hallucinated part
                     logger.warning(
@@ -562,6 +614,60 @@ class VoicePipeline:
             logger.info("LLM (%.0fms): %s", llm_ms, full_response[:80])
             await self._on_event({"type": "llm_done", "llm_ms": round(llm_ms)})
 
+            # Phase 3 per-turn receipt. Only emit when the LLM is the
+            # OpenRouter backend (it's the only backend where we can
+            # charge real money); local (ollama, npu_genie) turns are
+            # free and don't need a receipt.  If the LLM exposes
+            # get_last_usage() we compute cost from the pricing table.
+            try:
+                if hasattr(self._llm, "get_last_usage"):
+                    usage = self._llm.get_last_usage()
+                    if usage and usage.get("total_tokens"):
+                        from dragon_voice.llm.openrouter_llm import price_for_model
+                        cost_mils = price_for_model(
+                            usage["model"],
+                            usage.get("prompt_tokens", 0),
+                            usage.get("completion_tokens", 0),
+                        )
+                        await self._on_event({
+                            "type": "receipt",
+                            "stage": "llm",
+                            "model": usage["model"],
+                            "prompt_tokens":     usage.get("prompt_tokens", 0),
+                            "completion_tokens": usage.get("completion_tokens", 0),
+                            "total_tokens":      usage.get("total_tokens", 0),
+                            "cost_mils":         cost_mils,
+                            "llm_ms":            round(llm_ms),
+                            # v4·D Gauntlet G2: surface retries so the chat
+                            # bubble can stamp a "retried" chip instead of
+                            # silently presenting a possibly-degraded reply.
+                            "retried":           bool(usage.get("retried", False)),
+                            "retry_reason":      usage.get("retry_reason", ""),
+                        })
+            except Exception as e:
+                # Never let receipt emission break the turn.  v4·D audit
+                # P0 fix: emit a MINIMAL receipt even when the usage-
+                # based path failed so the Tab5 chat bubble still gets a
+                # stamp and the day-budget accumulator still increments
+                # by 0 (harmless but consistent).
+                logger.warning("Receipt emit failed: %s -- emitting fallback", e)
+                try:
+                    fallback_model = getattr(self._llm, "name", "") or "llm"
+                    await self._on_event({
+                        "type": "receipt",
+                        "stage": "llm",
+                        "model": fallback_model,
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0,
+                        "cost_mils": 0,
+                        "llm_ms": round(llm_ms) if isinstance(llm_ms, (int, float)) else 0,
+                        "retried": False,
+                        "retry_reason": "receipt-fallback: " + type(e).__name__,
+                    })
+                except Exception:
+                    logger.debug("fallback receipt also failed", exc_info=True)
+
             # Rich media detection on full response
             if self._media_pipeline and full_response:
                 try:
@@ -580,6 +686,23 @@ class VoicePipeline:
                     "tts_ms": round(self._tts_total_ms),
                 })
                 self._tts_started = False
+
+            # Audit F5 (2026-04-20): emit TTS receipt so per-turn chat
+            # bubbles can stamp the speech backend + time.  cost_mils=0
+            # for local Piper; OpenRouter TTS cost left at 0 (same
+            # rationale as the STT receipt).
+            if self._tts_total_ms > 0:
+                try:
+                    _tts_backend = self._config.tts.backend or "tts"
+                    await self._on_event({
+                        "type": "receipt",
+                        "stage": "tts",
+                        "model": _tts_backend,
+                        "tts_ms": round(self._tts_total_ms),
+                        "cost_mils": 0,
+                    })
+                except Exception as _e:
+                    logger.debug("TTS receipt emit failed: %s", _e)
 
             # Trim in-memory history on legacy path only
             if not self._conversation_engine and hasattr(self._llm, "trim_history"):
@@ -618,6 +741,34 @@ class VoicePipeline:
             except Exception:
                 pass  # Cost tracking is best-effort
 
+    async def speak_system(self, text: str) -> None:
+        """Speak a short system message (not stored in conversation history).
+
+        Used by the server for out-of-band alerts like budget auto-downgrade
+        (Gauntlet G7-F) where the user needs to hear what happened even with
+        the screen off.  Delivered through the live TTS path so it respects
+        the currently-selected voice (Piper / OpenRouter) and inherits the
+        existing pacing + resampling.
+        """
+        if not text or not self._tts:
+            return
+        prev_started = self._tts_started
+        try:
+            await self._synthesize_and_send(text)
+        except Exception:
+            logger.exception("speak_system failed: %s", text[:40])
+        finally:
+            # Close the utterance so the Tab5 flushes its ring buffer.
+            if self._tts_started and not prev_started:
+                try:
+                    await self._on_event({
+                        "type": "tts_end",
+                        "tts_ms": round(self._tts_total_ms),
+                    })
+                except Exception:
+                    pass
+                self._tts_started = False
+
     async def _synthesize_and_send(self, text: str) -> None:
         """Synthesize a sentence, resample to 16kHz, and stream paced to client.
 
@@ -642,12 +793,16 @@ class VoicePipeline:
             except (Exception, asyncio.TimeoutError) as tts_err:
                 if self._config.tts.backend == "openrouter":
                     logger.error("Cloud TTS failed: %s — falling back to local", tts_err)
-                    from dragon_voice.tts import create_tts
-                    from dragon_voice.config import TTSConfig
-                    fallback = create_tts(TTSConfig(backend="piper"))
-                    await fallback.initialize()
-                    audio_bytes = await fallback.synthesize(text)
-                    await fallback.shutdown()
+                    # v4·D audit P1 fix: cache fallback Piper instance so
+                    # repeated cloud failures don't re-initialize it
+                    # (expensive cold start every time).
+                    if not getattr(self, "_fallback_tts", None):
+                        from dragon_voice.tts import create_tts
+                        from dragon_voice.config import TTSConfig
+                        self._fallback_tts = create_tts(TTSConfig(backend="piper"))
+                        await self._fallback_tts.initialize()
+                        logger.info("Pre-warmed fallback TTS (piper) cached")
+                    audio_bytes = await self._fallback_tts.synthesize(text)
                     await self._on_event({
                         "type": "config_update",
                         "error": "Cloud TTS unavailable, reverted to local",
@@ -812,6 +967,13 @@ class VoicePipeline:
             tasks.append(self._tts.shutdown())
         if self._llm:
             tasks.append(self._llm.shutdown())
+        # Pre-warmed fallback backends (from P1 STT/TTS cache fix).
+        fb_stt = getattr(self, "_fallback_stt", None)
+        fb_tts = getattr(self, "_fallback_tts", None)
+        if fb_stt: tasks.append(fb_stt.shutdown())
+        if fb_tts: tasks.append(fb_tts.shutdown())
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        self._fallback_stt = None
+        self._fallback_tts = None
         logger.info("Voice pipeline shut down")

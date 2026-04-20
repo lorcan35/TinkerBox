@@ -93,6 +93,10 @@ class VoiceServer:
         # HTTP routes (legacy)
         app.router.add_get("/", self._handle_status)
         app.router.add_get("/health", self._handle_health)
+        app.router.add_post("/debug/widget_chart", self._debug_widget_chart)
+        app.router.add_post("/debug/widget_prompt", self._debug_widget_prompt)
+        app.router.add_post("/debug/widget_card", self._debug_widget_card)
+        app.router.add_post("/debug/widget_media", self._debug_widget_media)
         app.router.add_get("/api/config", self._handle_get_config)
         app.router.add_post("/api/config", self._handle_set_config)
 
@@ -229,9 +233,13 @@ class VoiceServer:
             self._tool_registry.register(DateTimeTool())
 
             # Memory tools need memory_service
-            from dragon_voice.tools.memory_tools import StoreFactTool, RecallFactsTool
+            from dragon_voice.tools.memory_tools import (
+                StoreFactTool, RecallFactsTool, ForgetFactTool,
+            )
             self._tool_registry.register(StoreFactTool(self._memory_service))
             self._tool_registry.register(RecallFactsTool(self._memory_service))
+            # v4·D Gauntlet G9: two-step confirm-gated forget_fact tool.
+            self._tool_registry.register(ForgetFactTool(self._memory_service))
 
             # Tier 1 tools
             from dragon_voice.tools.timer_tool import TimerTool
@@ -251,6 +259,27 @@ class VoiceServer:
                         len(self._tool_registry.list_tools()))
         except Exception as e:
             logger.warning("Agentic modules not available: %s", e)
+
+        # v4·D Phase 4g stability fix (audit P0 #1): instantiate the
+        # SurfaceManager so Tab5 widget_action events have somewhere to
+        # land.  Previously server.py imported nothing from surfaces/,
+        # and every Tab5 widget tap logged "Unknown command" and died.
+        from dragon_voice.surfaces import SurfaceManager
+        self._surface_mgr = SurfaceManager()
+        logger.info("SurfaceManager initialized")
+        # Audit P0 #1 (2026-04-20): register TimesenseTool - the reference
+        # widget-emitting skill.  Must be registered AFTER surface_mgr init
+        # (it takes the surface manager as constructor arg).  TimerTool and
+        # TimesenseTool have distinct names (timer vs timesense_timer) so
+        # both coexist; LLM picks based on description.
+        if self._tool_registry is not None:
+            try:
+                from dragon_voice.tools.timesense_tool import TimesenseTool
+                self._tool_registry.register(TimesenseTool(self._surface_mgr))
+                logger.info("TimesenseTool registered (widget emitter)")
+            except Exception as e:
+                logger.warning("TimesenseTool registration failed: %s", e)
+
 
         # Conversation engine (shared LLM backend for text/API input)
         self._conversation = ConversationEngine(
@@ -530,6 +559,15 @@ class VoiceServer:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._active_connections.clear()
 
+        # v4·D audit P0 fix: release the inference ThreadPoolExecutor so
+        # uvloop can exit cleanly.  Previously zombie threads lingered.
+        try:
+            from dragon_voice.pipeline import shutdown_inference_executor
+            shutdown_inference_executor(wait=False)
+            logger.info("Inference executor shut down")
+        except Exception:
+            logger.debug("inference executor shutdown failed", exc_info=True)
+
         # Close shared proxy session (DQ08)
         if self._proxy_session and not self._proxy_session.closed:
             await self._proxy_session.close()
@@ -598,6 +636,125 @@ class VoiceServer:
                 },
             }
         )
+
+
+    async def _debug_widget_chart(self, request: web.Request) -> web.Response:
+        """POST /debug/widget_chart -- audit B5 evidence. Emits a chart
+        widget on every registered Tab5Surface. Body: {title, values, chart_max}."""
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        title = data.get("title", "Audit chart")
+        values = data.get("values", [3, 7, 12, 9, 15, 18, 22, 16, 11, 8, 14, 20])
+        chart_max = float(data.get("chart_max", 0))
+        if self._surface_mgr is None:
+            return web.json_response({"error": "surface_mgr not ready"}, status=503)
+        count = 0
+        for sid, state in list(self._surface_mgr._sessions.items()):
+            try:
+                await state.surface.chart(title=title, values=values, chart_max=chart_max,
+                                  skill_id="audit", card_id="audit_chart_" + sid[:6])
+                count += 1
+            except Exception as e:
+                logger.warning("debug chart emit failed for %s: %s", sid, e)
+        return web.json_response({"emitted": count, "values": values})
+
+    async def _debug_widget_prompt(self, request: web.Request) -> web.Response:
+        """POST /debug/widget_prompt -- audit B6/K3 evidence.
+        Emits a widget_prompt on every registered Tab5Surface AND
+        registers a handler so tap round-trips back to Dragon.
+        Body: {title, body, choices: [[text, event], ...]}."""
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        title = data.get("title", "Confirm?")
+        body = data.get("body", "")
+        choices_raw = data.get("choices", [["Yes", "audit_yes"], ["No", "audit_no"]])
+        choices = []
+        for c in choices_raw[:3]:
+            if isinstance(c, (list, tuple)) and len(c) >= 2:
+                choices.append((str(c[0]), str(c[1])))
+        if self._surface_mgr is None:
+            return web.json_response({"error": "surface_mgr not ready"}, status=503)
+        count = 0
+        for sid, state in list(self._surface_mgr._sessions.items()):
+            try:
+                card_id = f"audit_prompt_{sid[:6]}"
+                async def _handle(event: str, payload: dict, _sid=sid, _cid=card_id) -> None:
+                    logger.info("audit widget_prompt tapped: session=%s event=%s payload=%s",
+                                _sid, event, payload)
+                    # Dismiss the card so the tap has an observable effect.
+                    try:
+                        await state.surface.dismiss(_cid)
+                    except Exception:
+                        pass
+                    self._surface_mgr.unregister_action(_sid, _cid)
+                self._surface_mgr.register_action(sid, card_id, _handle)
+                await state.surface.prompt(
+                    title=title, body=body, choices=choices,
+                    skill_id="audit", card_id=card_id,
+                )
+                count += 1
+            except Exception as e:
+                logger.warning("debug prompt emit failed for %s: %s", sid, e)
+        return web.json_response({"emitted": count, "choices": choices})
+
+    async def _debug_widget_card(self, request: web.Request) -> web.Response:
+        """POST /debug/widget_card -- audit B2 evidence.
+        Emits a widget_card on every registered Tab5Surface. Cards go
+        to chat (not home). Body: {title, body, tone}."""
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        title = data.get("title", "Workshop draft ready")
+        body = data.get("body", "Two edits queued from yesterday. Review before 10:30.")
+        tone = data.get("tone", "info")
+        if self._surface_mgr is None:
+            return web.json_response({"error": "surface_mgr not ready"}, status=503)
+        count = 0
+        for sid, state in list(self._surface_mgr._sessions.items()):
+            try:
+                await state.surface.card(title=title, body=body, tone=tone,
+                                          skill_id="audit",
+                                          card_id="audit_card_" + sid[:6])
+                count += 1
+            except Exception as e:
+                logger.warning("debug card emit failed for %s: %s", sid, e)
+        return web.json_response({"emitted": count})
+
+    async def _debug_widget_media(self, request: web.Request) -> web.Response:
+        """POST /debug/widget_media -- audit B5 evidence.
+        Emits widget_media pointing at a previously uploaded image.
+        Body: {url, width, height, alt}."""
+        try:
+            data = await request.json()
+        except Exception:
+            data = {}
+        url = data.get("url", "")
+        width = int(data.get("width", 480))
+        height = int(data.get("height", 300))
+        alt = data.get("alt", "Audit media")
+        if not url:
+            return web.json_response({"error": "url required"}, status=400)
+        if self._surface_mgr is None:
+            return web.json_response({"error": "surface_mgr not ready"}, status=503)
+        count = 0
+        for sid, state in list(self._surface_mgr._sessions.items()):
+            try:
+                await state.surface.media(url=url, alt=alt,
+                                          title="Audit media",
+                                          skill_id="audit",
+                                          card_id="audit_media_" + sid[:6])
+                count += 1
+            except Exception as e:
+                logger.warning("debug media emit failed for %s: %s", sid, e)
+        return web.json_response({"emitted": count, "url": url})
+
+
+
 
     async def _handle_get_config(self, request: web.Request) -> web.Response:
         """Return current config with secrets redacted."""
@@ -702,6 +859,46 @@ class VoiceServer:
 
     # --------------------------------------------------------------- WebSocket
 
+    @staticmethod
+    async def _safe_send_json(ws: web.WebSocketResponse, msg: dict) -> bool:
+        """Non-raising ws.send_json — returns True on success.
+
+        aiohttp raises ConnectionResetError (and bare Exception in some
+        paths) when the transport is mid-close. Handlers that call
+        send_json without guarding see the whole register/event flow
+        fail and the session gets paused even though the WS is simply
+        about to reconnect (refs #31). Use this helper everywhere.
+
+        Returns False silently if the WS is closed or the send fails;
+        callers should treat that as "client will reconnect and we'll
+        replay on the next session_start" — not a fatal error.
+        """
+        if ws.closed:
+            return False
+        try:
+            await ws.send_json(msg)
+            return True
+        except (ConnectionResetError, RuntimeError, asyncio.CancelledError):
+            # aiohttp uses RuntimeError("closing transport") on some paths
+            return False
+        except Exception as e:
+            logger.debug("_safe_send_json suppressed: %s", e)
+            return False
+
+    @staticmethod
+    async def _safe_send_bytes(ws: web.WebSocketResponse, data: bytes) -> bool:
+        """Non-raising ws.send_bytes — returns True on success. Same rationale as _safe_send_json."""
+        if ws.closed:
+            return False
+        try:
+            await ws.send_bytes(data)
+            return True
+        except (ConnectionResetError, RuntimeError, asyncio.CancelledError):
+            return False
+        except Exception as e:
+            logger.debug("_safe_send_bytes suppressed: %s", e)
+            return False
+
     async def _handle_ws_voice(self, request: web.Request) -> web.WebSocketResponse:
         """Main voice WebSocket endpoint.
 
@@ -720,11 +917,22 @@ class VoiceServer:
             logger.warning("Connection limit reached (%d), rejecting", self._max_connections)
             return web.Response(text="Too many connections", status=503)
 
+        # v4·D connectivity audit -- ROOT CAUSE FIX #3.
+        #
+        # Enable aiohttp's built-in WS heartbeat at 30 s with a 60 s
+        # pong-wait window.  Previously heartbeat=None meant the
+        # server never sent WS-level pings -- dead sockets could only
+        # be detected by a failed send.  With heartbeat enabled, aiohttp
+        # emits a PING every `heartbeat` seconds and closes the
+        # connection if the peer hasn't replied within `receive_timeout`.
+        # Paired with Tab5's new TCP-level keepalive, both sides now
+        # notice a half-open socket in well under 60 s instead of
+        # waiting for the app layer to try a write and fail.
         ws = web.WebSocketResponse(
-            max_msg_size=10 * 1024 * 1024,  # 10MB max message
-            heartbeat=None,  # DISABLED: although ESP-IDF v5.4.3 auto-PONGs, the latency through
-            # ngrok (200-500ms) plus SSL overhead causes spurious timeouts. Keepalive handled
-            # by _ws_keepalive task (20s ws.ping) + Tab5 JSON pings (8s).
+            max_msg_size=10 * 1024 * 1024,
+            heartbeat=60.0,
+            receive_timeout=120.0,
+            autoping=True,
         )
         await ws.prepare(request)
 
@@ -793,16 +1001,16 @@ class VoiceServer:
                         break
                     continue
 
-                # Response timeout: Tab5 sends pings every 8s.  If we haven't
-                # received ANY message in 30s the connection is dead.
-                silence = time.monotonic() - _last_client_msg_time
-                if silence > 30:
-                    logger.warning("Keepalive: no client message for %.0fs, closing WS %s", silence, ws_id)
-                    try:
-                        await ws.close()
-                    except Exception:
-                        pass
-                    break
+                # NOTE: The old 30s "no client message" silence check was removed.
+                # Tab5 migrated to esp_websocket_client (voice.c commit 3af34b0) which
+                # uses WS-level PING/PONG control frames at 15s interval. Control
+                # frames do NOT update _last_client_msg_time (aiohttp handles them
+                # internally and they never surface to the message loop), so the
+                # silence check produced a 30-45s false-positive close every cycle.
+                # Liveness is now detected by: (1) WS-level ping/pong timeout on
+                # Tab5 side (45s), (2) this task's send-failure counter above
+                # (3 consecutive send failures), and (3) TCP RST propagation.
+                # _last_client_msg_time is left as-is for potential future use.
 
         _keepalive_task = asyncio.create_task(_ws_keepalive())
 
@@ -821,20 +1029,18 @@ class VoiceServer:
         }
         self._active_connections[ws_id] = conn_state
 
-        # Callbacks for the pipeline
+        # Callbacks for the pipeline.  v4·D audit P0 fix: route through
+        # the shared _safe_send_* helpers so transient disconnects mid-
+        # stream don't raise ConnectionResetError up into the pipeline's
+        # tight loop (which used to swallow real exceptions).
         async def on_audio(audio_bytes: bytes) -> None:
-            if not ws.closed:
-                try:
-                    await ws.send_bytes(audio_bytes)
-                except Exception:
-                    logger.warning("Failed to send audio to %s", ws_id)
+            if ws.closed:
+                return
+            await self._safe_send_bytes(ws, audio_bytes)
 
         async def on_event(event: dict) -> None:
             if not ws.closed:
-                try:
-                    await ws.send_json(event)
-                except Exception:
-                    logger.warning("Failed to send event to %s", ws_id)
+                await self._safe_send_json(ws, event)
             # Persist API usage events for cost tracking
             if event.get("type") == "api_usage" and self._db:
                 try:
@@ -977,6 +1183,15 @@ class VoiceServer:
                         await ws.send_json({"type": "pong"})
 
                     elif cmd_type == "config_update":
+                        # v4·D audit P1: rate-limit config_update to 2/sec/conn.
+                        # A buggy skill or trigger-happy test harness could
+                        # storm mode swaps that each do heavy backend init.
+                        _now_cfg = time.monotonic()
+                        _last_cfg = conn_state.get("_last_config_update_ts", 0.0)
+                        if _now_cfg - _last_cfg < 0.5:
+                            logger.debug("config_update rate-limited on %s", ws_id)
+                            continue
+                        conn_state["_last_config_update_ts"] = _now_cfg
                         # US-P01: Acquire conn_lock to serialize with stop/text
                         # handlers. Prevents swap_backends() from running while
                         # start_processing() or finish_dictation() is in flight.
@@ -1051,11 +1266,14 @@ class VoiceServer:
                                     logger.info("TinkerClaw gateway health OK at %s", tc_url)
                                 except Exception as tc_err:
                                     logger.error("TinkerClaw gateway not reachable: %s", tc_err)
+                                    # Audit G5 (2026-04-20): revert to Local so Tab5 doesn't
+                                    # sit wedged on mode 3 showing an error. Matches the
+                                    # OpenRouter-key-missing path below.
                                     if not ws.closed:
                                         await ws.send_json({
                                             "type": "config_update",
                                             "error": "TinkerClaw gateway is not reachable",
-                                            "voice_mode": voice_mode,
+                                            "voice_mode": 0,
                                         })
                                     continue
 
@@ -1159,6 +1377,85 @@ class VoiceServer:
                                     },
                                 })
 
+                                # v4·D Phase 4b vision capability advertisement.
+                                # Tab5's camera screen renders a "VISION · <model>
+                                # READY" chip based on this.  A model is
+                                # vision-capable when:
+                                #   1. cloud mode (2) + OpenRouter model matches
+                                #      a known vision id (gpt-4o, sonnet, etc)
+                                #   2. OR local mode (0) using ollama and the
+                                #      ollama_model name contains "vision"
+                                #      or "llava"
+                                # Per-frame cost estimates are rough mils-per-
+                                # frame for the Tab5 1280x720 capture sent as
+                                # a ~60 KB JPEG (= ~1500 image tokens at most
+                                # vendors).
+                                try:
+                                    vm = conn_config.llm.openrouter_model.lower() \
+                                        if voice_mode == 2 else ""
+                                    om = conn_config.llm.ollama_model.lower() \
+                                        if voice_mode == 0 else ""
+                                    vision_model = ""
+                                    per_frame_mils = 0
+                                    if voice_mode == 2:
+                                        if "gpt-4o" in vm:
+                                            vision_model = active_model
+                                            per_frame_mils = 1200  # ~$0.012/frame
+                                        elif "sonnet" in vm:
+                                            vision_model = active_model
+                                            per_frame_mils = 4500  # ~$0.045/frame
+                                        elif "haiku" in vm:
+                                            # Haiku 3.5 supports vision per OR
+                                            vision_model = active_model
+                                            per_frame_mils = 400
+                                    elif voice_mode == 0:
+                                        if "vision" in om or "llava" in om:
+                                            vision_model = active_model
+                                            per_frame_mils = 0  # local = free
+                                    await ws.send_json({
+                                        "type":           "vision_capability",
+                                        "can_see":        bool(vision_model),
+                                        "model":          vision_model,
+                                        "per_frame_mils": per_frame_mils,
+                                    })
+                                except Exception:
+                                    logger.exception("vision_capability emit failed")
+
+                            # v4·D Gauntlet G7-F: speak a short alert when the
+                            # Tab5 auto-downgrades because the daily cap was
+                            # hit.  The Tab5 tags its config_update with
+                            # reason="cap_downgrade" so the user hears why
+                            # their next turn is free even with the screen off.
+                            try:
+                                if cmd.get("reason") == "cap_downgrade":
+                                    pipeline = conn_state.get("pipeline")
+                                    if pipeline and hasattr(pipeline, "speak_system"):
+                                        asyncio.create_task(pipeline.speak_system(
+                                            "Daily budget cap reached. Switched back to local mode."
+                                        ))
+                            except Exception:
+                                logger.exception("cap_downgrade alert failed")
+
+                    elif cmd_type == "widget_action":
+                        # v4·D Phase 4g (audit P0 fix): Tab5 fires this
+                        # when the user taps a prompt choice / live action
+                        # button / list row.  Before this branch existed,
+                        # every interactive widget tap was silently
+                        # dropped into the "Unknown command" logger.
+                        sid = conn_state.get("session_id")
+                        cid = cmd.get("card_id")
+                        ev  = cmd.get("event")
+                        payload = cmd.get("payload") or {}
+                        logger.info("widget_action: session=%s card=%s event=%s",
+                                    sid, cid, ev)
+                        if sid and cid and ev and self._surface_mgr is not None:
+                            try:
+                                await self._surface_mgr.handle_action(
+                                    sid, cid, ev, payload,
+                                )
+                            except Exception:
+                                logger.exception("widget_action dispatch failed")
+
                     elif cmd_type == "config_ack":
                         logger.debug("Connection %s: config_ack %s", ws_id, cmd.get("applied"))
 
@@ -1248,6 +1545,21 @@ class VoiceServer:
             platform=cmd.get("platform", ""),
             capabilities=cmd.get("capabilities"),
         )
+
+        # v4·D audit P0 fix: expose the widget subset of client capabilities
+        # on conn_state so skills can pull it via SurfaceManager and
+        # downgrade emissions (smaller lists, lower-res media) for low-end
+        # clients.  The register frame already ships this under
+        # capabilities.widgets; pluck it out for quick lookup.
+        caps = cmd.get("capabilities") or {}
+        widget_caps = caps.get("widgets") if isinstance(caps, dict) else None
+        conn_state["widget_capabilities"] = widget_caps or {
+            "types": ["live", "card"],
+            "list_max_items": 3, "chart_max_points": 8,
+            "prompt_max_choices": 2,
+        }
+        logger.info("widget_capabilities for %s: %s",
+                    device_id, conn_state["widget_capabilities"])
         await self._db.add_event(
             "device.connected", device_id=device_id,
             data={"platform": cmd.get("platform", ""), "firmware_ver": cmd.get("firmware_ver", "")}
@@ -1267,45 +1579,130 @@ class VoiceServer:
         conn_state["registered"] = True
         conn_state["response_mode"] = "always_speak"  # voice device gets TTS
 
+        # v4·D Phase 4g: register this connection's surface with the
+        # shared SurfaceManager.  Skills dispatch widget_* emissions
+        # through here and widget_action events route back via
+        # handle_action().
+        # v4·D audit P1: route surface + tool-event sends through the
+        # _safe_send_json helper so a transient close mid-widget-emit
+        # doesn't bubble into the WS handler and tear the session down.
+        if self._surface_mgr is not None:
+            async def _surface_send(msg: dict):
+                if not ws.closed:
+                    await self._safe_send_json(ws, msg)
+            await self._surface_mgr.register_session(session_id, _surface_send, caps=conn_state.get("widget_capabilities"))
+
         # Store tool event callbacks per-connection (NOT on shared conversation engine)
         if self._tool_registry:
             async def _on_tool_call(call):
                 if not ws.closed:
-                    await ws.send_json({"type": "tool_call", "tool": call["tool"], "args": call["args"]})
+                    await self._safe_send_json(ws, {
+                        "type": "tool_call",
+                        "tool": call["tool"],
+                        "args": call["args"],
+                    })
 
             async def _on_tool_result(result):
-                if not ws.closed:
-                    await ws.send_json({"type": "tool_result", **result})
+                if ws.closed:
+                    return
+                await ws.send_json({"type": "tool_result", **result})
+                # v4·D Phase 4c: auto-emit widget_list for web_search results
+                # so the Tab5 home live-slot surfaces the top hits without
+                # the LLM having to orchestrate a widget call itself.
+                try:
+                    if result.get("tool") == "web_search":
+                        payload = result.get("result") or {}
+                        hits = payload.get("results") or []
+                        query = payload.get("query", "")
+                        items = []
+                        for r in hits[:5]:
+                            t = str(r.get("title") or r.get("snippet") or "")[:79]
+                            if not t:
+                                continue
+                            items.append({"text": t, "value": ""})
+                        if items:
+                            await ws.send_json({
+                                "type": "widget_list",
+                                "skill_id": "web_search",
+                                "card_id": f"ws_{session_id[:8]}",
+                                "title": (query[:60] or "Web results"),
+                                "tone": "info",
+                                "priority": 70,
+                                "items": items,
+                            })
+                except Exception:
+                    logger.debug("widget_list auto-emit failed", exc_info=True)
 
             conn_state["on_tool_call"] = _on_tool_call
             conn_state["on_tool_result"] = _on_tool_result
 
-        # Send session_start IMMEDIATELY — before slow pipeline init
-        # Tab5 will timeout if we don't respond quickly
-        try:
-            await ws.send_json({
-                "type": "session_start",
-                "session_id": session_id,
-                "device_id": device_id,
-                "resumed": resumed,
-                "message_count": session.get("message_count", 0),
-                "config": {
-                    "stt": conn_config.stt.backend,
-                    "tts": conn_config.tts.backend,
-                    "llm": conn_config.llm.backend,
-                    "tts_sample_rate": conn_config.audio.input_sample_rate,
-                    "response_mode": "match_input",
-                    "system_prompt": conn_config.llm.system_prompt,
-                },
-            })
-        except Exception as e:
-            logger.warning("Failed to send session_start to %s: %s (client may have disconnected)", ws_id, e)
+        # Send session_start IMMEDIATELY — before slow pipeline init.
+        # Use _safe_send_json so a transient transport close (the Tab5
+        # register-before-receive-task-running race, refs #31 + TT #76)
+        # doesn't propagate an exception up to the WS handler and force
+        # a session pause. If the send drops, the client will reconnect
+        # shortly and we'll replay session_start on the next handshake.
+        if not await self._safe_send_json(ws, {
+            "type": "session_start",
+            "session_id": session_id,
+            "device_id": device_id,
+            "resumed": resumed,
+            "message_count": session.get("message_count", 0),
+            "config": {
+                "stt": conn_config.stt.backend,
+                "tts": conn_config.tts.backend,
+                "llm": conn_config.llm.backend,
+                "tts_sample_rate": conn_config.audio.input_sample_rate,
+                "response_mode": "match_input",
+                "system_prompt": conn_config.llm.system_prompt,
+            },
+        }):
+            logger.info("session_start send dropped on %s — client likely reconnecting", ws_id)
             return
 
         logger.info(
             "Device %s registered on session %s (resumed=%s, ws_id=%s)",
             device_id, session_id, resumed, ws_id,
         )
+
+        # Audit C8/K15 (2026-04-20): on resume, replay the tail of the
+        # message history so Tab5 chat can rehydrate its local store.
+        # Previously session_start carried only message_count and Tab5
+        # had to fetch via REST (which it never did) -- so a reconnect
+        # lost the conversation from the user's view even though it was
+        # on disk. Cap at 20 messages (most recent) to keep the WS frame
+        # small; Tab5 can still fetch full history via
+        # /api/v1/sessions/{id}/messages.
+        if resumed and self._message_store is not None:
+            try:
+                msgs = await self._message_store.get_messages(
+                    session_id, limit=20, offset=0
+                )
+                # Return the LAST 20 (get_messages returns ascending, so
+                # slice the tail).
+                tail = msgs[-20:] if len(msgs) > 20 else msgs
+                items = []
+                for m in tail:
+                    role = m.get("role")
+                    content = m.get("content")
+                    if not role or not content:
+                        continue
+                    items.append({
+                        "role": role,
+                        "content": content,
+                        "timestamp": m.get("created_at"),
+                    })
+                if items and not await self._safe_send_json(ws, {
+                    "type": "session_messages",
+                    "session_id": session_id,
+                    "items": items,
+                }):
+                    logger.info("session_messages replay dropped on %s", ws_id)
+                else:
+                    logger.info("Replayed %d messages for session %s",
+                                len(items), session_id)
+            except Exception as e:
+                logger.warning("session_messages replay failed: %s", e)
 
         # Reset conn_config to local defaults before pipeline init.
         # Tab5 will immediately send config_update with its actual mode,
@@ -1401,6 +1798,34 @@ class VoiceServer:
             if not ws.closed:
                 await ws.send_json({"type": "llm_done", "llm_ms": 0, "text": response_text})
 
+            # v4·D connectivity polish: emit a zero-cost receipt on the
+            # TinkerClaw bypass path so the chat bubble gets stamped
+            # ("claw-agent · FREE") instead of no stamp at all.  TC turns
+            # don't expose token counts the way OpenRouter does; we just
+            # surface the engine name so transparency-per-bubble still
+            # holds.
+            if not ws.closed:
+                tc_model = getattr(llm, "name", "tinkerclaw")
+                # Prefer the gateway-reported model id (e.g. minimax/MiniMax-M2.5)
+                inner = getattr(llm, "_model", "") or ""
+                if inner:
+                    tc_model = inner
+                try:
+                    await ws.send_json({
+                        "type": "receipt",
+                        "stage": "llm",
+                        "model": tc_model,
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0,
+                        "cost_mils": 0,          # TC bills to its own gateway
+                        "llm_ms": 0,
+                        "retried": False,
+                        "retry_reason": "",
+                    })
+                except Exception:
+                    logger.debug("TC receipt emit failed", exc_info=True)
+
             # Rich media detection for TinkerClaw responses too
             if full_response and self._media_pipeline:
                 try:
@@ -1447,6 +1872,8 @@ class VoiceServer:
                     media_events = await self._media_pipeline.process_response(
                         response_text, session_id
                     )
+                    logger.info("MediaPipeline: %d event(s) for response len=%d",
+                                len(media_events), len(response_text))
                     for event in media_events:
                         if not ws.closed:
                             await ws.send_json(event)
@@ -1466,8 +1893,17 @@ class VoiceServer:
                 try:
                     await ws.send_json({"type": "tts_start"})
                     t0 = time.monotonic()
+                    # v4·D audit P1: mode-aware TTS synth budget.  Piper
+                    # can take 15-25 s on Q6A ARM64 for a 200-word reply;
+                    # cloud gpt-audio-mini is fast but still needs a
+                    # cushion when OpenRouter edge adds latency.  The
+                    # hardcoded 30 s was too tight in practice for local
+                    # and wasteful for cloud.
+                    tts_backend = (conn_cfg.tts.backend if conn_cfg else "piper")
+                    tts_timeout = 90 if tts_backend != "openrouter" else 30
                     audio_bytes = await asyncio.wait_for(
-                        pipeline._tts.synthesize(response_text), timeout=30
+                        pipeline._tts.synthesize(response_text),
+                        timeout=tts_timeout,
                     )
                     tts_ms = (time.monotonic() - t0) * 1000
 
@@ -1496,6 +1932,19 @@ class VoiceServer:
 
                     if not ws.closed:
                         await ws.send_json({"type": "tts_end", "tts_ms": round(tts_ms)})
+                        # Audit F5 (2026-04-20): TTS receipt for text-path
+                        # synthesis so chat bubbles surface the TTS backend
+                        # that spoke the reply.
+                        try:
+                            await ws.send_json({
+                                "type": "receipt",
+                                "stage": "tts",
+                                "model": tts_backend,
+                                "tts_ms": round(tts_ms),
+                                "cost_mils": 0,
+                            })
+                        except Exception:
+                            pass
                 except Exception:
                     logger.exception("TTS for text input failed")
                     # Always send tts_end so Tab5 doesn't hang in SPEAKING
@@ -1503,6 +1952,46 @@ class VoiceServer:
                         await ws.send_json({"type": "tts_end", "tts_ms": 0})
 
             logger.info("Text response on session %s: %s", session_id, response_text[:80])
+
+            # Phase 3 per-turn receipt for text-path turns. Voice-path
+            # receipts are emitted from pipeline._process_utterance; the
+            # text path reaches the LLM via ConversationEngine directly
+            # and bypasses pipeline entirely, so we emit here too.
+            try:
+                convo = conn_state.get("conversation") or self._conversation
+                cur_llm = getattr(convo, "_llm", None)
+                if cur_llm is not None and hasattr(cur_llm, "get_last_usage"):
+                    usage = cur_llm.get_last_usage()
+                    if usage and usage.get("total_tokens"):
+                        from dragon_voice.llm.openrouter_llm import price_for_model
+                        cost_mils = price_for_model(
+                            usage["model"],
+                            usage.get("prompt_tokens", 0),
+                            usage.get("completion_tokens", 0),
+                        )
+                        if not ws.closed:
+                            await ws.send_json({
+                                "type":              "receipt",
+                                "stage":             "llm",
+                                "model":             usage["model"],
+                                "prompt_tokens":     usage.get("prompt_tokens", 0),
+                                "completion_tokens": usage.get("completion_tokens", 0),
+                                "total_tokens":      usage.get("total_tokens", 0),
+                                "cost_mils":         cost_mils,
+                                # v4·D Gauntlet G2 surface retries
+                                "retried":           bool(usage.get("retried", False)),
+                                "retry_reason":      usage.get("retry_reason", ""),
+                            })
+                        logger.info(
+                            "Receipt emitted (text): model=%s tok=%d+%d=%d cost_mils=%d",
+                            usage["model"],
+                            usage.get("prompt_tokens", 0),
+                            usage.get("completion_tokens", 0),
+                            usage.get("total_tokens", 0),
+                            cost_mils,
+                        )
+            except Exception:
+                logger.exception("Text-path receipt emit failed")
 
         except Exception:
             logger.exception("Text processing error on session %s", session_id)
@@ -1587,6 +2076,14 @@ class VoiceServer:
         device_id = conn_state.get("device_id")
         ws_id = conn_state.get("ws_id")
         pipeline = conn_state.get("pipeline")
+
+        # v4·D Phase 4g: unregister the session's surface so skills that
+        # kept a reference to it start seeing dropped sends explicitly.
+        if session_id and self._surface_mgr is not None:
+            try:
+                await self._surface_mgr.unregister_session(session_id)
+            except Exception:
+                logger.debug("surface unregister failed")
 
         try:
             # Pause session (not end — it can be resumed)

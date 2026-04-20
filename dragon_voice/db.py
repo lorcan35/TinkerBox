@@ -172,8 +172,17 @@ class Database:
         logger.info("Schema applied from %s", _SCHEMA_PATH)
 
     async def close(self) -> None:
-        """Close the database connection."""
+        """Close the database connection.
+
+        v4·D audit P2 fix: checkpoint the WAL before closing so the next
+        startup doesn't have to replay a long tail of uncommitted pages.
+        PRAGMA wal_checkpoint(TRUNCATE) both merges + truncates the WAL.
+        """
         if self._db:
+            try:
+                await self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:
+                logger.debug("wal_checkpoint on close failed", exc_info=True)
             await self._db.close()
             self._db = None
             logger.info("Database closed")
@@ -344,6 +353,30 @@ class Database:
             (status, now, ended_at, session_id),
         )
         await self.conn.commit()
+
+    async def update_session_status_if(
+        self, session_id: str, new_status: str, expected_current: str,
+    ) -> bool:
+        """v4·D audit P1: atomic CAS on session.status.
+
+        Returns True if the row was updated (i.e., status transitioned
+        new_status from expected_current), False otherwise.  Uses a
+        single UPDATE ... WHERE so two concurrent disconnects on the
+        same session can't both fire "session.paused" events.
+        """
+        now = time.time()
+        ended_at = now if new_status == "ended" else None
+        cursor = await self.conn.execute(
+            """
+            UPDATE sessions
+               SET status = ?, last_active_at = ?,
+                   ended_at = COALESCE(?, ended_at)
+             WHERE id = ? AND status = ?
+            """,
+            (new_status, now, ended_at, session_id, expected_current),
+        )
+        await self.conn.commit()
+        return cursor.rowcount > 0
 
     async def touch_session(self, session_id: str) -> None:
         """Update last_active_at timestamp."""

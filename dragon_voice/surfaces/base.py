@@ -42,11 +42,13 @@ def _gen_card_id(skill_id: str | None = None) -> str:
 class Tab5Surface:
     """Per-session facade. One instance per connected Tab5."""
 
-    def __init__(self, send_json: SendJson, skill_id: str = "unknown") -> None:
+    def __init__(self, send_json: SendJson, skill_id: str = "unknown",
+                 caps: Optional[dict] = None) -> None:
         self._send = send_json
         self._skill_id = skill_id
         # Track live card_ids emitted by this surface so we can clear() later.
         self._live_cards: set[str] = set()
+        self._caps: dict = caps or {}
 
     def for_skill(self, skill_id: str) -> "Tab5Surface":
         """Return a child surface tagged with a specific skill id. The
@@ -94,6 +96,55 @@ class Tab5Surface:
         self._live_cards.add(cid)
         return cid
 
+    # ── widget_list ──────────────────────────────────────────────
+    async def list_(
+        self,
+        *,
+        title: str,
+        items: list[dict],
+        priority: int = 50,
+        tone: str = "info",
+        card_id: Optional[str] = None,
+        skill_id: Optional[str] = None,
+    ) -> str:
+        """Emit a ranked list widget to the Tab5 home live-slot.
+
+        items: up to 5 dicts shaped {"text": str, "value": str}.  Extra
+        items are silently dropped (Tab5 renders top 3 anyway, but the
+        store keeps up to 5 for scroll-later).
+
+        Tab5 renders this as a title + numbered rows on the home slot,
+        growing the card height to ~168 px.  Competes with widget_live
+        on the same priority queue.
+
+        v4·D Phase 4c (TinkerTab widget.h supports type=LIST).
+        """
+        sid = skill_id or self._skill_id
+        cid = card_id or _gen_card_id(sid)
+        # Truncate per-item strings to Tab5's widget.h field widths so
+        # over-long entries don't get silently cut at the parser.
+        safe_items = []
+        _max_items = int(self._caps.get("list_max_items", 5) or 5)
+        for it in items[:_max_items]:
+            if not isinstance(it, dict):
+                continue
+            safe_items.append({
+                "text":  str(it.get("text",  ""))[:79],
+                "value": str(it.get("value", ""))[:15],
+            })
+        msg: dict = {
+            "type": "widget_list",
+            "skill_id": sid,
+            "card_id": cid,
+            "title": title[:63],
+            "tone": tone,
+            "priority": max(0, min(100, int(priority))),
+            "items": safe_items,
+        }
+        await self._safe_send(msg, describe=f"list {sid}/{cid}")
+        self._live_cards.add(cid)
+        return cid
+
     async def live_update(
         self,
         card_id: str,
@@ -131,6 +182,87 @@ class Tab5Surface:
                 )
             self._live_cards.clear()
 
+    # ── widget_media ─────────────────────────────────────────────
+    async def media(
+        self,
+        *,
+        url: str,
+        alt: str = "",
+        title: str = "",
+        body: str = "",
+        tone: str = "info",
+        priority: int = 60,
+        card_id: Optional[str] = None,
+        skill_id: Optional[str] = None,
+    ) -> str:
+        """Emit a media widget (image + caption) to the Tab5 live-slot.
+
+        Skills shipping photos, screenshots, or chart thumbnails use this
+        surface.  `url` should be fetchable from the Tab5 (either Dragon
+        /api/media/* or a LAN-reachable origin).  v4·D Phase 4g.
+        """
+        sid = skill_id or self._skill_id
+        cid = card_id or _gen_card_id(sid)
+        msg: dict = {
+            "type": "widget_media",
+            "skill_id": sid,
+            "card_id": cid,
+            "url": url,
+            "tone": tone,
+            "priority": max(0, min(100, int(priority))),
+        }
+        if alt:   msg["alt"]   = alt[:95]
+        if title: msg["title"] = title[:63]
+        if body:  msg["body"]  = body[:255]
+        await self._safe_send(msg, describe=f"media {sid}/{cid}")
+        self._live_cards.add(cid)
+        return cid
+
+    # ── widget_prompt ────────────────────────────────────────────
+    async def prompt(
+        self,
+        *,
+        title: str,
+        choices: list[tuple],
+        body: str = "",
+        tone: str = "active",
+        priority: int = 70,
+        card_id: Optional[str] = None,
+        skill_id: Optional[str] = None,
+    ) -> str:
+        """Emit a prompt widget (title + up to 3 button choices).
+
+        `choices` is a list of (text, event) tuples.  Tab5 renders each
+        as a row; tapping fires widget_action carrying the matching
+        event.  Skill is expected to pre-register the event handler via
+        SurfaceManager.register_action.  v4·D Phase 4g.
+        """
+        sid = skill_id or self._skill_id
+        cid = card_id or _gen_card_id(sid)
+        safe = []
+        _max_choices = int(self._caps.get("prompt_max_choices", 3) or 3)
+        for c in choices[:_max_choices]:
+            if not isinstance(c, (list, tuple)) or len(c) < 2:
+                continue
+            txt, ev = c[0], c[1]
+            safe.append({
+                "text":  str(txt)[:47],
+                "event": str(ev)[:47],
+            })
+        msg: dict = {
+            "type": "widget_prompt",
+            "skill_id": sid,
+            "card_id": cid,
+            "title": title[:63],
+            "tone": tone,
+            "priority": max(0, min(100, int(priority))),
+            "choices": safe,
+        }
+        if body: msg["body"] = body[:255]
+        await self._safe_send(msg, describe=f"prompt {sid}/{cid}")
+        self._live_cards.add(cid)
+        return cid
+
     # ── widget_card ──────────────────────────────────────────────
     async def card(
         self,
@@ -162,6 +294,47 @@ class Tab5Surface:
         if action:
             msg["action"] = {"label": action[0][:15], "event": action[1][:47]}
         await self._safe_send(msg, describe=f"card {sid}/{cid}")
+        return cid
+
+    # ── widget_chart ─────────────────────────────────────────────
+    async def chart(
+        self,
+        *,
+        title: str,
+        values: list[float],
+        body: str = "",
+        tone: str = "info",
+        chart_max: float = 0.0,
+        priority: int = 60,
+        card_id: Optional[str] = None,
+        skill_id: Optional[str] = None,
+    ) -> str:
+        """Emit a bar/line chart widget (up to 12 points).
+
+        Audit B5/B13 (2026-04-20): the chart emitter was missing from
+        Tab5Surface, so no skill could ever produce a widget_chart — the
+        parser existed on Tab5 with no upstream source. values[] is sent
+        as-is; Tab5 normalizes against chart_max for bar heights (0 =
+        auto-scale to max of values).
+        """
+        sid = skill_id or self._skill_id
+        cid = card_id or _gen_card_id(sid)
+        _max_pts = int(self._caps.get("chart_max_points", 12) or 12)
+        pts = [float(v) for v in values[:_max_pts]]
+        msg: dict = {
+            "type": "widget_chart",
+            "skill_id": sid,
+            "card_id": cid,
+            "title": title[:63],
+            "tone": tone,
+            "priority": max(0, min(100, int(priority))),
+            "values": pts,
+            "max": float(chart_max),
+        }
+        if body:
+            msg["body"] = body[:255]
+        await self._safe_send(msg, describe=f"chart {sid}/{cid}")
+        self._live_cards.add(cid)
         return cid
 
     async def dismiss(self, card_id: str) -> None:

@@ -27,11 +27,31 @@ class OllamaBackend(LLMBackend):
     # fast enough to prevent dual-model memory spikes.
     KEEP_ALIVE = "30s"
 
+    def _capture_usage(self, chunk: dict) -> None:
+        """Populate self._last_usage from a done=true stream chunk.
+        Ollama's /api/chat tail chunk carries prompt_eval_count (input
+        tokens) and eval_count (output tokens).  Local inference has
+        zero marginal $ cost, but capturing the counts gives the UI
+        something to show in the chat receipt stamp ("qwen3 · FREE"). """
+        self._last_usage = {
+            "model": self._model,
+            "prompt_tokens":     int(chunk.get("prompt_eval_count", 0) or 0),
+            "completion_tokens": int(chunk.get("eval_count",        0) or 0),
+        }
+        self._last_usage["total_tokens"] = (
+            self._last_usage["prompt_tokens"]
+            + self._last_usage["completion_tokens"]
+        )
+
+    def get_last_usage(self) -> dict:
+        return dict(getattr(self, "_last_usage", {}))
+
     def __init__(self, config: LLMConfig) -> None:
         self._config = config
         self._base_url = config.ollama_url.rstrip("/")
         self._model = config.ollama_model
         self._session: aiohttp.ClientSession | None = None
+        self._last_usage: dict = {}
         self._conversation: list[dict] = []
         self._lock = asyncio.Lock()
 
@@ -138,6 +158,7 @@ class OllamaBackend(LLMBackend):
                             continue
 
                         if chunk.get("done"):
+                            self._capture_usage(chunk)
                             break
 
                         token = chunk.get("message", {}).get("content", "")
@@ -205,6 +226,7 @@ class OllamaBackend(LLMBackend):
                         continue
 
                     if chunk.get("done"):
+                        self._capture_usage(chunk)
                         break
 
                     token = chunk.get("message", {}).get("content", "")

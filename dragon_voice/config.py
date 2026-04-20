@@ -103,7 +103,7 @@ class LLMConfig:
     # TinkerClaw agent gateway (optional sidecar on localhost:18789)
     tinkerclaw_url: str = "http://localhost:18789"
     tinkerclaw_token: str = ""
-    tinkerclaw_model: str = "ollama/qwen3:1.7b"
+    tinkerclaw_model: str = "minimax/MiniMax-M2.5"
 
 
 @dataclass

@@ -241,15 +241,21 @@ class VoiceServer:
             # v4·D Gauntlet G9: two-step confirm-gated forget_fact tool.
             self._tool_registry.register(ForgetFactTool(self._memory_service))
 
-            # Tier 1 tools
-            from dragon_voice.tools.timer_tool import TimerTool
+            # Tier 1 tools.
+            # Audit D8/K7 dedup (wave 7, 2026-04-20): TimerTool is no
+            # longer registered. TimesenseTool (registered below, after
+            # SurfaceManager init) covers the "set a timer" use case
+            # AND emits widget_live progress.  Keeping both caused the
+            # LLM to pick TimerTool on short phrases ("timer 5 min"),
+            # leaving the whole widget-platform reference flow unreachable
+            # from voice.  TimerTool class file is retained for REST-only
+            # use cases; it's just not wired into the agentic loop.
             from dragon_voice.tools.weather_tool import WeatherTool
             from dragon_voice.tools.calculator_tool import CalculatorTool
             from dragon_voice.tools.unit_converter_tool import UnitConverterTool
             from dragon_voice.tools.note_tool import NoteTool
             from dragon_voice.tools.system_tool import SystemInfoTool
 
-            self._tool_registry.register(TimerTool())
             self._tool_registry.register(WeatherTool())
             self._tool_registry.register(CalculatorTool())
             self._tool_registry.register(UnitConverterTool())

@@ -1620,6 +1620,34 @@ class VoiceServer:
             if not ws.closed:
                 await ws.send_json({"type": "llm_done", "llm_ms": 0, "text": response_text})
 
+            # v4·D connectivity polish: emit a zero-cost receipt on the
+            # TinkerClaw bypass path so the chat bubble gets stamped
+            # ("claw-agent · FREE") instead of no stamp at all.  TC turns
+            # don't expose token counts the way OpenRouter does; we just
+            # surface the engine name so transparency-per-bubble still
+            # holds.
+            if not ws.closed:
+                tc_model = getattr(llm, "name", "tinkerclaw")
+                # Prefer the gateway-reported model id (e.g. minimax/MiniMax-M2.5)
+                inner = getattr(llm, "_model", "") or ""
+                if inner:
+                    tc_model = inner
+                try:
+                    await ws.send_json({
+                        "type": "receipt",
+                        "stage": "llm",
+                        "model": tc_model,
+                        "prompt_tokens": 0,
+                        "completion_tokens": 0,
+                        "total_tokens": 0,
+                        "cost_mils": 0,          # TC bills to its own gateway
+                        "llm_ms": 0,
+                        "retried": False,
+                        "retry_reason": "",
+                    })
+                except Exception:
+                    logger.debug("TC receipt emit failed", exc_info=True)
+
             # Rich media detection for TinkerClaw responses too
             if full_response and self._media_pipeline:
                 try:

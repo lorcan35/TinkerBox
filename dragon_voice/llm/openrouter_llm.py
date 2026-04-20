@@ -215,7 +215,7 @@ class OpenRouterBackend(LLMBackend):
                     # retry flag lets the receipt stamp a "retried"
                     # chip so users know something went sideways.
                     logger.error("OpenRouter error %d: %s",
-                                 resp.status, (err_body or "")[:200])
+                                 resp.status, (error_text or "")[:200])
                     self._last_retried = True
                     self._last_retry_reason = f"openrouter_{resp.status}"
                     yield "Sorry, the cloud model had a hiccup. Try again?"

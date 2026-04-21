@@ -17,7 +17,7 @@ Each of these removes friction that slows everything after it.
 
 - [x] **W14-H15** `[OPS]` gitignore + `git rm --cached` `dependencies.lock` → green TinkerTab CI · TinkerTab `81ce620` · verified: local rebuild clean, regenerated lock has only expected patch bumps
 - [x] **W14-M16** `[OPS]` ruff gate expansion `B904,E722,B007,RUF006` + land the 17 prep fixes · TinkerBox · verified: `ruff check --select ...` all pass + 52/52 pytest green
-- [ ] **W14-H16** `[OPS]` `scripts/deploy.sh` with snapshot rollback + auth-probed smoke
+- [x] **W14-H16** `[OPS]` `scripts/deploy.sh` with snapshot rollback + auth-probed smoke · TinkerBox · verified: ran end-to-end against 192.168.1.91, /health polled + auth probe 401/200, rollback snapshot `/home/radxa/.deploy_rollback/20260421-143142/` populated
 - [ ] **W14-H17** `[OPS]` `tinkerclaw-backup.service` + `.timer` (hourly, 14-copy retention)
 
 ## Phase 2 — CRITICALs

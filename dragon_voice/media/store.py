@@ -4,6 +4,7 @@ Stores rendered images (and other binary blobs) with UUID-based IDs.
 Tab5 downloads them via HTTP GET /api/media/{id}.
 """
 
+import asyncio
 import os
 import time
 import uuid
@@ -60,12 +61,18 @@ class MediaStore:
         margin; HMAC signing on the URL (see server.py) is the real
         access control.
         """
-        self._media_dir.mkdir(parents=True, exist_ok=True)
-
+        # Wave 14 W14-H09: mkdir + write_bytes hit the disk and on the
+        # Dragon's eMMC the write of a multi-MB Pygments JPEG can easily
+        # block the event loop for 20–80 ms.  Offload so the LLM→media
+        # path doesn't stall live WebSocket traffic.
         media_id = f"{uuid.uuid4().hex}.{ext}"
         dest = self._media_dir / media_id
 
-        dest.write_bytes(data)
+        def _write_sync() -> None:
+            self._media_dir.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
+
+        await asyncio.to_thread(_write_sync)
         logger.debug(
             "MediaStore.store: %s (%d bytes) session=%s",
             media_id,
@@ -96,7 +103,16 @@ class MediaStore:
         1. Delete every file whose mtime is older than *max_age_hours*.
         2. If total size still exceeds *max_total_mb*, delete the oldest
            remaining files until the store is within budget.
+
+        Wave 14 W14-H09: the whole sweep iterates the media dir, stats
+        every entry, and unlinks — synchronous disk I/O that can stall
+        for hundreds of ms on a full store.  Run the entire pass in a
+        worker thread so the hourly cleanup task can't freeze the WS
+        event loop.
         """
+        await asyncio.to_thread(self._cleanup_sync)
+
+    def _cleanup_sync(self) -> None:
         if not self._media_dir.exists():
             return
 

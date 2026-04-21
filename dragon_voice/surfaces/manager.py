@@ -40,7 +40,12 @@ class SurfaceManager:
                                   caps: Optional[dict] = None) -> Tab5Surface:
         """Called when a Tab5 WS connects. Returns the session's default surface."""
         async with self._lock:
-            surface = Tab5Surface(send, skill_id="session")
+            # Wave 10 B6/K3 — bind manager + session_id onto the surface so
+            # surface.prompt(on_action=handler) can register via the manager
+            # without the skill having to thread references manually.
+            surface = Tab5Surface(send, skill_id="session", caps=caps)
+            surface._manager = self
+            surface._session_id = session_id
             self._sessions[session_id] = _SessionState(send=send, surface=surface)
             log.info("surface registered: session=%s", session_id)
             return surface

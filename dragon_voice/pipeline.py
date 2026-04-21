@@ -260,8 +260,11 @@ class VoicePipeline:
                 if self._tts_started:
                     await self._on_event({"type": "tts_end", "tts_ms": 0})
                     self._tts_started = False
-            except Exception:
-                pass
+            except (ConnectionError, RuntimeError) as e:
+                # Wave 13 H5: narrow from `except Exception` — WS is the only
+                # thing `_on_event` can fail on, and it's expected to fail
+                # when the client already disconnected during timeout.
+                logger.debug("timeout-recovery emit skipped (client gone): %s", e)
 
     async def cancel(self) -> None:
         """Cancel ongoing processing and clean up in-flight TTS subprocesses."""
@@ -716,8 +719,10 @@ class VoicePipeline:
                 await self._on_event(
                     {"type": "error", "message": "Processing failed — see server logs"}
                 )
-            except Exception:
-                pass
+            except (ConnectionError, RuntimeError) as _e:
+                # Wave 13 H5: the WS is already torn down — don't mask the
+                # original exception with a secondary send failure.
+                logger.debug("pipeline-error notice not delivered: %s", _e)
         finally:
             total_ms = (time.monotonic() - pipeline_start) * 1000
             logger.info("Pipeline total: %.0fms", total_ms)
@@ -738,8 +743,11 @@ class VoicePipeline:
                         "type": "api_usage",
                         **cost_data,
                     })
-            except Exception:
-                pass  # Cost tracking is best-effort
+            except (ConnectionError, RuntimeError, AttributeError) as _e:
+                # Wave 13 H5: cost tracking must never take down the pipeline.
+                # Narrow from `Exception` to the handful of runtime errors we
+                # actually expect (WS torn down, backend without total_calls).
+                logger.debug("cost tracking emit skipped: %s", _e)
 
     async def speak_system(self, text: str) -> None:
         """Speak a short system message (not stored in conversation history).

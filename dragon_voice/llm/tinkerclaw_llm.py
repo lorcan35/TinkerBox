@@ -25,7 +25,17 @@ class TinkerClawBackend(LLMBackend):
     def __init__(self, config: LLMConfig) -> None:
         self._config = config
         self._url = (config.tinkerclaw_url or "http://localhost:18789").rstrip("/")
-        self._token = config.tinkerclaw_token
+        self._token = (config.tinkerclaw_token or "").strip()
+        # Wave 13 H6: fail fast at construction rather than silently sending
+        # unauthenticated requests that the gateway will reject with 401 on
+        # every single turn. The misconfigured case used to look like a
+        # "model is dumb" bug from the user's perspective.
+        if not self._token:
+            raise ValueError(
+                "tinkerclaw_token is blank — set TINKERCLAW_TOKEN in env "
+                "or llm.tinkerclaw_token in config.yaml. Gateway (port "
+                "18789) rejects every request without a bearer token."
+            )
         # Audit J12/J20/K13 (wave 7): align the empty-config fallback with
         # dragon_voice.config.LLMConfig.tinkerclaw_model default
         # ("minimax/MiniMax-M2.5") and with the TinkerTab audit expectation.

@@ -34,6 +34,12 @@ OUT = Path("/tmp/stress40")
 OUT.mkdir(exist_ok=True, parents=True)
 
 HEADERS = {"Authorization": f"Bearer {TOKEN}"}
+# Wave 13 C2: Dragon /debug/* and /api/v1/* now require a bearer token.
+# DRAGON_HEADERS gets threaded through every Dragon POST below.
+DRAGON_API_TOKEN = os.environ.get("DRAGON_API_TOKEN", "").strip()
+DRAGON_HEADERS = (
+    {"Authorization": f"Bearer {DRAGON_API_TOKEN}"} if DRAGON_API_TOKEN else {}
+)
 
 trace: list[dict] = []
 failures: list[str] = []
@@ -327,7 +333,7 @@ async def main():
                             data=json.dumps({"title": "Stress probe card",
                                              "body": "tap-free evidence", "tone": "info"}).encode())
         # Actually hit Dragon directly not Tab5 — tab5_post prepends TAB5
-        async with s.post(f"{DRAGON}/debug/widget_card",
+        async with s.post(f"{DRAGON}/debug/widget_card", headers=DRAGON_HEADERS,
                           data=json.dumps({"title": "Stress probe card",
                                             "body": f"t+{step_idx}", "tone": "info"}).encode()) as r2:
             dd = await r2.json()
@@ -348,7 +354,7 @@ async def main():
         step("Dragon emits widget_prompt")
         dp = {"emitted": 0}
         for attempt in range(2):
-            async with s.post(f"{DRAGON}/debug/widget_prompt",
+            async with s.post(f"{DRAGON}/debug/widget_prompt", headers=DRAGON_HEADERS,
                               data=json.dumps({"title": "Stress poll?",
                                                 "body": "Either works",
                                                 "choices": [["Yes", "ev.y"], ["No", "ev.n"]]}).encode()) as r2:
@@ -368,7 +374,7 @@ async def main():
 
         # 26. Emit widget_media (home live slot decoded)
         step("Dragon emits widget_media")
-        async with s.post(f"{DRAGON}/debug/widget_media",
+        async with s.post(f"{DRAGON}/debug/widget_media", headers=DRAGON_HEADERS,
                           data=json.dumps({
                               "url": "http://192.168.1.91:3502/api/media/wave7_b5.jpg",
                               "width": 480, "height": 80,
@@ -454,7 +460,7 @@ async def main():
         step("flood 5 widget_cards in 10s")
         emits = []
         for i in range(5):
-            async with s.post(f"{DRAGON}/debug/widget_card",
+            async with s.post(f"{DRAGON}/debug/widget_card", headers=DRAGON_HEADERS,
                               data=json.dumps({"title": f"Flood {i+1}",
                                                 "body": "flood", "tone": "info"}).encode()) as r2:
                 emits.append((await r2.json()).get("emitted", 0))

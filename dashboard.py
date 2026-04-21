@@ -17,6 +17,8 @@ import asyncio
 import logging
 import time
 
+import os
+
 import aiohttp
 from aiohttp import web
 
@@ -28,31 +30,45 @@ PORT = 3500
 DRAGON_SERVER = "http://127.0.0.1:3501"
 VOICE_SERVER = "http://127.0.0.1:3502"
 
-_client: aiohttp.ClientSession | None = None
+# Wave 13 C2: voice server now enforces bearer-token auth on /api/v1/* and the
+# rest of the private REST surface. The dashboard proxies user clicks to those
+# routes, so it needs to inject the token. Reads DRAGON_API_TOKEN from the
+# same .env the voice server does; both services share the secret.
+DRAGON_API_TOKEN = os.environ.get("DRAGON_API_TOKEN", "").strip()
+
+
+def _auth_headers() -> dict:
+    return {"Authorization": f"Bearer {DRAGON_API_TOKEN}"} if DRAGON_API_TOKEN else {}
+
+# Wave 13 H4: ClientSession lives on the aiohttp Application, not as a module
+# global. That makes the dashboard safe to embed inside another app in tests
+# and keeps the session tied to the correct event loop (module-global sessions
+# can accidentally bind to the wrong loop when multiple tests run back-to-back).
+CLIENT_KEY = web.AppKey("client_session", aiohttp.ClientSession)
+
 _start_time = time.time()
 
 
 # ── Lifecycle ────────────────────────────────────────────────────────────
 
 async def on_startup(app: web.Application) -> None:
-    global _client
-    _client = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
+    app[CLIENT_KEY] = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10))
     log.info("Dashboard started on http://%s:%d", HOST, PORT)
 
 
 async def on_shutdown(app: web.Application) -> None:
-    global _client
-    if _client:
-        await _client.close()
-        _client = None
+    client = app.get(CLIENT_KEY)
+    if client is not None and not client.closed:
+        await client.close()
 
 
 # ── Internal helpers ─────────────────────────────────────────────────────
 
-async def _fetch_json(url: str) -> dict | None:
+async def _fetch_json(app: web.Application, url: str) -> dict | None:
     """Fetch JSON from an internal service, return None on failure."""
+    client = app[CLIENT_KEY]
     try:
-        async with _client.get(url) as resp:
+        async with client.get(url, headers=_auth_headers()) as resp:
             if resp.status == 200:
                 return await resp.json()
             return {"error": f"HTTP {resp.status}"}
@@ -77,7 +93,9 @@ async def _proxy_request(request: web.Request) -> web.Response:
         target_url += f"?{request.query_string}"
 
     method = request.method.upper()
-    headers = {}
+    # Wave 13 C2: inject bearer token so proxied dashboard calls clear the
+    # voice server's auth middleware. Browser-side JS doesn't know the token.
+    headers = dict(_auth_headers())
     body = None
 
     # Forward JSON body for POST/PUT/PATCH
@@ -94,8 +112,9 @@ async def _proxy_request(request: web.Request) -> web.Response:
             except Exception:
                 pass
 
+    client = request.app[CLIENT_KEY]
     try:
-        async with _client.request(
+        async with client.request(
             method, target_url, data=body, headers=headers,
             timeout=aiohttp.ClientTimeout(total=120),
         ) as resp:
@@ -131,8 +150,9 @@ async def _proxy_request(request: web.Request) -> web.Response:
 
 async def handle_status(request: web.Request) -> web.Response:
     """Aggregate health from both services."""
-    dragon_task = asyncio.create_task(_fetch_json(f"{DRAGON_SERVER}/health"))
-    voice_task = asyncio.create_task(_fetch_json(f"{VOICE_SERVER}/health"))
+    app = request.app
+    dragon_task = asyncio.create_task(_fetch_json(app, f"{DRAGON_SERVER}/health"))
+    voice_task = asyncio.create_task(_fetch_json(app, f"{VOICE_SERVER}/health"))
     dragon, voice = await asyncio.gather(dragon_task, voice_task)
     return web.json_response({
         "dashboard_uptime": int(time.time() - _start_time),
@@ -143,7 +163,7 @@ async def handle_status(request: web.Request) -> web.Response:
 
 async def handle_get_voice_config(request: web.Request) -> web.Response:
     """Proxy GET /api/config from voice server."""
-    result = await _fetch_json(f"{VOICE_SERVER}/api/config")
+    result = await _fetch_json(request.app, f"{VOICE_SERVER}/api/config")
     if result is None:
         return web.json_response({"error": "Voice server unreachable"}, status=502)
     return web.json_response(result)
@@ -155,8 +175,9 @@ async def handle_set_voice_config(request: web.Request) -> web.Response:
         body = await request.json()
     except Exception:
         return web.json_response({"error": "Invalid JSON"}, status=400)
+    client = request.app[CLIENT_KEY]
     try:
-        async with _client.post(f"{VOICE_SERVER}/api/config", json=body) as resp:
+        async with client.post(f"{VOICE_SERVER}/api/config", json=body, headers=_auth_headers()) as resp:
             data = await resp.json()
             return web.json_response(data, status=resp.status)
     except Exception as exc:

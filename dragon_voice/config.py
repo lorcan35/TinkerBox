@@ -50,6 +50,10 @@ MAX_TOKENS_CLOUD = 512   # Cloud LLM can handle more
 class ServerConfig:
     host: str = "0.0.0.0"
     port: int = 3502
+    # Wave 13 C2: Bearer token protecting all REST routes except the public
+    # prefixes declared in server.py (_AUTH_PUBLIC_PREFIXES). Blank in the
+    # committed config — populated from DRAGON_API_TOKEN at load time.
+    api_token: str = ""
 
 
 @dataclass
@@ -283,6 +287,20 @@ def load_config(path: Optional[str] = None) -> VoiceConfig:
         memory=_dict_to_dataclass(MemoryConfig, raw["memory"]),
         database=_dict_to_dataclass(DatabaseConfig, raw["database"]),
     )
+
+    # Wave 13 C2: DRAGON_API_TOKEN env var sets the REST bearer token without
+    # requiring the DRAGON_VOICE_SERVER_API_TOKEN naming (shorter, lines up with
+    # how Tab5 and deploy scripts refer to it). Explicit env wins over yaml.
+    _dragon_api_token = os.environ.get("DRAGON_API_TOKEN", "").strip()
+    if _dragon_api_token:
+        config.server.api_token = _dragon_api_token
+
+    # Wave 13 H7: same pattern for the TinkerClaw gateway token. Used to live
+    # in config.yaml in the committed tree, which is a leak vector — now the
+    # yaml keeps a blank placeholder and real deploys inject via env/.env.
+    _tc_token = os.environ.get("TINKERCLAW_TOKEN", "").strip()
+    if _tc_token:
+        config.llm.tinkerclaw_token = _tc_token
 
     # Remember original local LLM backend for fallback from cloud mode
     if not config.llm.local_backend:

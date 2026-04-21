@@ -100,6 +100,12 @@ class VoiceServer:
         # shutdown is a no-op for pooled instances.
         self._backend_pool: dict = {}
 
+        # Wave 15 W15-H01 + W15-H06: rate-limit bucket store.  Keyed on
+        # (client_ip, method, path) tuple; value is
+        # {"window_start": float, "count": int}.  See
+        # `_rate_limit_middleware` for semantics.
+        self._rate_buckets: dict[tuple, dict] = {}
+
     def create_app(self) -> web.Application:
         """Create and configure the aiohttp application."""
         app = web.Application(
@@ -114,6 +120,10 @@ class VoiceServer:
                 self._security_headers_middleware,
                 self._cors_middleware,
                 self._auth_middleware,
+                # Wave 15 W15-H01 + W15-H06: rate limiter runs AFTER auth
+                # so only authenticated clients count against the budget
+                # — unauthenticated hits are already rejected cheaply.
+                self._rate_limit_middleware,
             ],
         )
 
@@ -279,6 +289,91 @@ class VoiceServer:
             return web.json_response(
                 {"error": "invalid_bearer_token",
                  "message": "token rejected"}, status=401)
+        return await handler(request)
+
+    # --------------------------------------------------------------- Rate limit
+
+    # Wave 15 W15-H01 + W15-H06: throttle per-IP + per-path on a small
+    # fixed window.  Keyed on client-IP + method + path so a DELETE to
+    # /api/v1/devices/foo burns budget independently from a POST to
+    # /api/v1/sessions/bar/chat.  State-changing + SSE-streaming
+    # endpoints get tight limits; read-only endpoints are
+    # unthrottled.  In-memory only — if the process restarts the
+    # counters reset, which is fine for this threat model (single-
+    # tenant deployment, we just want to stop loop-bugs and obvious
+    # DoS).
+    _RATE_LIMIT_RULES: ClassVar[tuple[tuple[str, str, int, int], ...]] = (
+        # (method_prefix, path_prefix, max_requests, window_seconds)
+        ("DELETE", "/api/v1/devices/",          20, 60),
+        ("DELETE", "/api/v1/sessions/",         20, 60),
+        ("DELETE", "/api/v1/messages",          20, 60),
+        ("DELETE", "/api/v1/memory/",           30, 60),
+        ("DELETE", "/api/v1/documents/",        10, 60),
+        ("DELETE", "/api/v1/config/",           20, 60),
+        ("POST",   "/api/v1/sessions/",         30, 60),  # /end, /pause, /resume
+        # W15-H06: SSE reconnect amplification — a broken client can
+        # re-open the chat stream 30 times/sec on tab-flap.  Cap at
+        # 20/min per IP + session to give the client room for legit
+        # retries but stop the storm.
+        ("POST",   "/api/v1/sessions/",         20, 60),  # covers /chat too
+        # Upload path — protect against the 10 MB upload × spam DoS
+        ("POST",   "/api/media/upload",         30, 60),
+    )
+
+    @web.middleware
+    async def _rate_limit_middleware(self, request: web.Request, handler):
+        # Fast path: only even consider paths that match at least one rule.
+        path = request.path
+        method = request.method
+        # `match_prefix` just walks the rule table — tiny list so this
+        # is cheap even at 1000 req/sec.
+        matched = None
+        for m, p, cap, win in self._RATE_LIMIT_RULES:
+            if method == m and path.startswith(p):
+                # Keep the TIGHTEST matching rule (smallest cap).
+                if matched is None or cap < matched[0]:
+                    matched = (cap, win)
+        if matched is None:
+            return await handler(request)
+
+        # Use peername as the client key; behind ngrok/proxy it's the
+        # proxy IP which is fine for single-tenant threat model.
+        peer = request.transport.get_extra_info("peername") if request.transport else None
+        client = peer[0] if peer else "unknown"
+        cap, win = matched
+        key = (client, method, path)
+
+        now = time.monotonic()
+        bucket = self._rate_buckets.get(key)
+        if bucket is None or now - bucket["window_start"] >= win:
+            self._rate_buckets[key] = {"window_start": now, "count": 1}
+        else:
+            bucket["count"] += 1
+            if bucket["count"] > cap:
+                retry_after = int(win - (now - bucket["window_start"])) + 1
+                logger.warning(
+                    "rate-limit: %s %s from %s (%d/%d in %ds)",
+                    method, path, client, bucket["count"], cap, win,
+                )
+                return web.json_response(
+                    {
+                        "error": "rate_limited",
+                        "message": f"limit {cap} requests per {win} s for this path",
+                        "retry_after_seconds": retry_after,
+                    },
+                    status=429,
+                    headers={"Retry-After": str(retry_after)},
+                )
+
+        # Periodic cheap GC so the dict doesn't grow unbounded over
+        # long uptimes (each entry is ~200 B; 10 000 entries = 2 MB).
+        if len(self._rate_buckets) > 4096:
+            cutoff = now - 600  # anything untouched 10 min gets dropped
+            self._rate_buckets = {
+                k: v for k, v in self._rate_buckets.items()
+                if v["window_start"] > cutoff
+            }
+
         return await handler(request)
 
     # --------------------------------------------------------------- Dashboard proxy

@@ -100,6 +100,23 @@ class MediaRoutes:
                 content_type="application/json",
             )
 
+        # Wave 15 W15-H02: reject over-sized uploads BEFORE we read the
+        # body.  aiohttp's app-level `client_max_size=32 MB` is the only
+        # pre-read cap, but our real limit is 10 MB; the old code read
+        # up to 32 MB into memory then compared.  Checking the
+        # `Content-Length` header up-front lets us fail fast on big
+        # garbage before allocating the buffer.  Chunked uploads with
+        # no Content-Length still fall through to the post-read check.
+        declared = request.content_length
+        if declared is not None and declared > _MAX_UPLOAD_BYTES:
+            return web.json_response(
+                {"error": "payload too large",
+                 "max_bytes": _MAX_UPLOAD_BYTES,
+                 "declared_bytes": declared},
+                status=413,
+                headers={"Connection": "close"},
+            )
+
         raw = await request.read()
         if not raw:
             return web.json_response({"error": "empty body"}, status=400)

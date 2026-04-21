@@ -115,16 +115,28 @@ async def story_mode_swap_midsession():
     async with aiohttp.ClientSession() as s:
         async with s.ws_connect(DRAGON_WS) as ws:
             await _register(ws, voice_mode=2)
+            # Drain the register/initial config_update echo backlog so the
+            # first swap's echo isn't masked by a pre-existing one with
+            # the starting voice_mode. Dragon's config_update is
+            # rate-limited at 500 ms; we also pause between swaps.
+            try:
+                async with asyncio.timeout(3):
+                    async for msg in ws:
+                        if msg.type != aiohttp.WSMsgType.TEXT: continue
+                        m = json.loads(msg.data)
+                        if m.get("type") in ("config_update", "vision_capability",
+                                              "session_start", "session_messages"):
+                            continue
+            except asyncio.TimeoutError:
+                pass
             ok_after = []
             for vmode in (0, 2, 3):
+                await asyncio.sleep(1.0)  # > 500 ms rate-limit window
                 await ws.send_json({"type": "config_update", "voice_mode": vmode,
                                     "llm_model": "openai/gpt-4o-mini"})
-                # Wait for a config_update echo that actually confirms the
-                # requested mode. Dragon's echo shape is
-                # {"type":"config_update","config":{"voice_mode":X,...}}.
                 seen = False
                 try:
-                    async with asyncio.timeout(6):
+                    async with asyncio.timeout(15):
                         async for msg in ws:
                             if msg.type != aiohttp.WSMsgType.TEXT: continue
                             m = json.loads(msg.data)

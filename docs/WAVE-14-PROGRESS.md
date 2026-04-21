@@ -40,12 +40,14 @@ Each of these removes friction that slows everything after it.
 ## Phase 4 — HIGH stability (firmware + server)
 
 - [ ] **W14-H06** `[TT]` unified suspended-task worker pattern (mode_switch / wifi / media_fetch / drawer_fetch)
-- [ ] **W14-H07** `[TT]` bump stacks: `sd_record_task` + `playback_task_fn` to 8 KB, `heap_watchdog_task` to 4 KB
+- [x] **W14-H07** `[TT]` bump stacks: `sd_record_task` + `playback_task_fn` to 8 KB, `heap_watchdog_task` to 4 KB · TinkerTab · verified: flashed, boots clean, 25 tasks live, wifi/dragon/voice connected, heap_min=21724236 stable, home screenshot clean
 - [ ] **W14-H08** `[TB]` `asyncio.to_thread` / `web.FileResponse` for 6 sync file-read sites
 - [ ] **W14-H09** `[TB]` MediaStore offload (`cleanup` + `store`) via `to_thread`; add default ClientTimeout
-- [ ] **W14-H10** `[TB]` `purge_old_messages` batching (`LIMIT N` + `asyncio.sleep(0)`); `executemany` for ingest
-- [ ] **W14-H11** `[TB]` `MemoryService` shared ClientSession lifecycle
-- [ ] **W14-H12** `[TB]` `MediaPipeline.close()` on shutdown (folded into H09)
+- [x] **W14-H10** `[TB]` `purge_old_messages` batching (`LIMIT N` + `asyncio.sleep(0)`); `executemany` for ingest · db.py batched at 500 rows/loop with yield; pytest green
+- [x] **W14-H11** `[TB]` `MemoryService` shared ClientSession lifecycle · memory.py._http_session + shutdown · live store+search+delete cycle green
+- [x] **W14-H12** `[TB]` `MediaPipeline.close()` on shutdown (folded into H09) · wired in server._on_shutdown
+- [x] **W14-H18** `[OPS]` `MemoryMax=4G MemoryHigh=3G` on voice service (bandaid); file the leak as separate issue · drop-in installed live: MemoryHigh=3221225472 MemoryMax=4294967296 TasksMax=512
+- [x] **W14-M09** `[TB]` `cancel() + await` `_periodic_purge` (wave 13 H3 pattern) · also folded memory_monitor cancel+await
 - [ ] **W14-H13** `[TB]` narrow ~17 residual `except Exception` in server/memory/media/tts
 - [ ] **W14-H14** `[OPS]` systemd hardening drop-ins for 6 units
 - [ ] **W14-H18** `[OPS]` `MemoryMax=4G MemoryHigh=3G` on voice service (bandaid); file the leak as separate issue

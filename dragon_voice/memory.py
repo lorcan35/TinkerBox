@@ -41,9 +41,23 @@ class MemoryService:
         # Falls back to Python-loop cosine when unavailable.
         self._use_vec: bool = False
         self._vec_created: bool = False
+        # Wave 14 W14-H11: shared aiohttp ClientSession for Ollama embed
+        # calls. Previously _get_embedding opened a fresh session + TCP
+        # per call — 200 TCP open/close cycles during a 200-chunk
+        # document ingest, and FD churn visible in the server.py DQ08
+        # FD counter.  Lazy-initialized in initialize(); closed in a new
+        # shutdown().
+        self._http_session: Optional[aiohttp.ClientSession] = None
 
     async def initialize(self) -> None:
         """Create memory tables if they don't exist."""
+        # Wave 14 W14-H11: open the shared Ollama HTTP session here.
+        # Default 30 s total, 5 s sock_connect.  Retried lazily in
+        # _get_embedding if someone closed it mid-run.
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30, sock_connect=5),
+            )
         # Try to load sqlite-vec for fast ANN search. Python-loop cosine
         # fallback kicks in if this fails. aiosqlite exposes
         # enable_load_extension + load_extension as coroutines that run on
@@ -139,24 +153,30 @@ class MemoryService:
     # ── Embeddings ──
 
     async def _get_embedding(self, text: str) -> Optional[bytes]:
-        """Get embedding vector from Ollama. Returns packed floats as bytes."""
+        """Get embedding vector from Ollama. Returns packed floats as bytes.
+
+        Wave 14 W14-H11: reuses a shared ClientSession instead of opening
+        one per call. Lazy-recreates if someone closed it.
+        """
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30, sock_connect=5),
+            )
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    f"{self._ollama_url}/api/embed",
-                    json={"model": self._embed_model, "input": text, "keep_alive": "30s"},
-                    timeout=aiohttp.ClientTimeout(total=30),
-                ) as resp:
-                    if resp.status != 200:
-                        logger.warning("Embedding request failed: %d", resp.status)
-                        return None
-                    data = await resp.json()
-                    embeddings = data.get("embeddings", [])
-                    if not embeddings:
-                        return None
-                    vec = embeddings[0]
-                    self._embed_dim = len(vec)
-                    return struct.pack(f"{len(vec)}f", *vec)
+            async with self._http_session.post(
+                f"{self._ollama_url}/api/embed",
+                json={"model": self._embed_model, "input": text, "keep_alive": "30s"},
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning("Embedding request failed: %d", resp.status)
+                    return None
+                data = await resp.json()
+                embeddings = data.get("embeddings", [])
+                if not embeddings:
+                    return None
+                vec = embeddings[0]
+                self._embed_dim = len(vec)
+                return struct.pack(f"{len(vec)}f", *vec)
         except Exception as e:
             logger.warning("Embedding failed (Ollama may not be running): %s", e)
             return None
@@ -412,3 +432,20 @@ class MemoryService:
             lines.append(f"- [From {c['document_title']}]: {c['content'][:200]}")
         lines.append("[END MEMORY CONTEXT]")
         return "\n".join(lines)
+
+
+    async def shutdown(self) -> None:
+        """Close the shared HTTP session.
+
+        Wave 14 W14-H11: the prior path opened a fresh ClientSession
+        per `_get_embedding` call. Now we keep one, which means someone
+        has to close it on service shutdown. VoiceServer._on_shutdown
+        calls this before DB.close() so the session outlives the final
+        recall. Idempotent.
+        """
+        if self._http_session is not None and not self._http_session.closed:
+            try:
+                await self._http_session.close()
+            except Exception:
+                logger.debug("MemoryService HTTP session close raised", exc_info=True)
+        self._http_session = None

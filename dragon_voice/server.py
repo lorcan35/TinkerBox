@@ -631,8 +631,23 @@ class VoiceServer:
         # Cancel periodic tasks
         if self._memory_monitor_task and not self._memory_monitor_task.done():
             self._memory_monitor_task.cancel()
+            # Wave 14 W14-M09 pattern: await so we don't leak the task
+            # across loop shutdown (produces the same "Task was
+            # destroyed but it is pending" warning wave-13 H3 fixed).
+            try:
+                await self._memory_monitor_task
+            except (asyncio.CancelledError, Exception):
+                pass
         if self._purge_task and not self._purge_task.done():
             self._purge_task.cancel()
+            # Wave 14 W14-M09: _periodic_purge sleeps 86400 s in one
+            # shot; cancel-without-await left it attached long enough
+            # for aiohttp to close the loop first, producing
+            # "RuntimeError: Event loop is closed" at systemctl restart.
+            try:
+                await self._purge_task
+            except (asyncio.CancelledError, Exception):
+                pass
         # Wave 13 H3: the media cleanup loop was being left running on shutdown
         # because it isn't touched here. If it was mid-sleep when the event loop
         # closes, asyncio logs "Task was destroyed but it is pending" warnings
@@ -670,9 +685,22 @@ class VoiceServer:
         # Shut down foundation
         if self._notes_svc:
             await self._notes_svc.shutdown()
+        if self._media_pipeline:
+            # Wave 14 W14-H12: close the MediaPipeline's shared aiohttp
+            # ClientSession.  Prior behaviour left it dangling across
+            # systemctl restart, logging "Unclosed client session" and
+            # making the wave-13 FD counter noisy.
+            try:
+                await self._media_pipeline.close()
+            except Exception:
+                logger.debug("MediaPipeline shutdown failed", exc_info=True)
         if self._memory_service:
             logger.info("Shutting down memory service")
-            # MemoryService doesn't have explicit shutdown but clear reference
+            # Wave 14 W14-H11: close the shared Ollama HTTP session.
+            try:
+                await self._memory_service.shutdown()
+            except Exception:
+                logger.debug("MemoryService shutdown raised", exc_info=True)
             self._memory_service = None
         if self._conversation:
             await self._conversation.shutdown()

@@ -41,7 +41,7 @@ Each of these removes friction that slows everything after it.
 
 - [ ] **W14-H06** `[TT]` unified suspended-task worker pattern (mode_switch / wifi / media_fetch / drawer_fetch)
 - [x] **W14-H07** `[TT]` bump stacks: `sd_record_task` + `playback_task_fn` to 8 KB, `heap_watchdog_task` to 4 KB · TinkerTab · verified: flashed, boots clean, 25 tasks live, wifi/dragon/voice connected, heap_min=21724236 stable, home screenshot clean
-- [ ] **W14-H08** `[TB]` `asyncio.to_thread` / `web.FileResponse` for 6 sync file-read sites
+- [x] **W14-H08** `[TB]` `asyncio.to_thread` / `web.FileResponse` for 6 sync file-read sites · api/synthesize.py (ota_check + ota_firmware), api/system.py (meminfo+loadavg), tools/system_tool.py (3 /proc reads), tts/piper_tts.py (voice config). Ruff ASYNC230 now 0. Live /api/v1/system + /api/ota/check + system_info tool all green.
 - [ ] **W14-H09** `[TB]` MediaStore offload (`cleanup` + `store`) via `to_thread`; add default ClientTimeout
 - [x] **W14-H10** `[TB]` `purge_old_messages` batching (`LIMIT N` + `asyncio.sleep(0)`); `executemany` for ingest · db.py batched at 500 rows/loop with yield; pytest green
 - [x] **W14-H11** `[TB]` `MemoryService` shared ClientSession lifecycle · memory.py._http_session + shutdown · live store+search+delete cycle green

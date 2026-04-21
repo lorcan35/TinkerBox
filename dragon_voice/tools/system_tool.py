@@ -1,5 +1,6 @@
 """System info tool: report Dragon server status."""
 
+import asyncio
 import logging
 import os
 import time
@@ -12,13 +13,20 @@ logger = logging.getLogger(__name__)
 _import_time = time.time()
 
 
-def _read_proc_file(path: str) -> str:
-    """Read a /proc file, return empty string on failure."""
+def _sync_read_proc_file(path: str) -> str:
+    """Sync helper; call from inside asyncio.to_thread only."""
     try:
         with open(path, "r") as f:
             return f.read()
     except (OSError, PermissionError):
         return ""
+
+
+async def _read_proc_file(path: str) -> str:
+    """Wave 14 W14-H08: async wrapper — /proc reads offloaded to a
+    thread so a slow read (cgroup accounting under load) doesn't
+    stall the tool-execution path + the WS it's called from."""
+    return await asyncio.to_thread(_sync_read_proc_file, path)
 
 
 class SystemInfoTool(Tool):
@@ -43,7 +51,7 @@ class SystemInfoTool(Tool):
         result = {}
 
         # Memory from /proc/meminfo
-        meminfo = _read_proc_file("/proc/meminfo")
+        meminfo = await _read_proc_file("/proc/meminfo")
         if meminfo:
             mem = {}
             for line in meminfo.splitlines():
@@ -64,7 +72,7 @@ class SystemInfoTool(Tool):
                 result["ram_percent"] = round(used_kb / total_kb * 100, 1)
 
         # CPU load from /proc/loadavg
-        loadavg = _read_proc_file("/proc/loadavg")
+        loadavg = await _read_proc_file("/proc/loadavg")
         if loadavg:
             parts = loadavg.split()
             if len(parts) >= 3:
@@ -80,7 +88,7 @@ class SystemInfoTool(Tool):
                 pass
 
         # Uptime from /proc/uptime
-        uptime_str = _read_proc_file("/proc/uptime")
+        uptime_str = await _read_proc_file("/proc/uptime")
         if uptime_str:
             try:
                 uptime_secs = float(uptime_str.split()[0])

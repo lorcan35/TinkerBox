@@ -151,17 +151,24 @@ class SynthesizeRoutes:
 
     async def ota_check(self, request: web.Request) -> web.Response:
         """GET /api/ota/check?current=VERSION"""
+        import asyncio as _asyncio
         import os
         import re as _re
         current = request.query.get("current", "0.0.0")
 
-        if not os.path.exists(self.OTA_VERSION_FILE):
-            return web.json_response({"update": False, "current": current})
-
-        try:
-            with open(self.OTA_VERSION_FILE) as f:
-                info = json.load(f)
-        except Exception:
+        # Wave 14 W14-H08: offload the sync file stat + open to a thread
+        # so the event loop doesn't stall even if eMMC is slow.  The
+        # file is tiny (<1 KB) so the to_thread overhead is negligible.
+        def _load_version_file():
+            if not os.path.exists(self.OTA_VERSION_FILE):
+                return None
+            try:
+                with open(self.OTA_VERSION_FILE) as f:
+                    return json.load(f)
+            except Exception:
+                return None
+        info = await _asyncio.to_thread(_load_version_file)
+        if info is None:
             return web.json_response({"update": False, "current": current})
 
         available_ver = info.get("version", "0.0.0")
@@ -197,20 +204,22 @@ class SynthesizeRoutes:
         })
 
     async def ota_firmware(self, request: web.Request) -> web.StreamResponse:
-        """GET /api/ota/firmware.bin — stream firmware binary"""
+        """GET /api/ota/firmware.bin — stream firmware binary.
+
+        Wave 14 W14-H08: prior code stalled the event loop on every
+        8 KB `f.read()` chunk (eMMC page cycles ~15-100 ms on Radxa).
+        ``web.FileResponse`` hands the file to sendfile(2) on Linux —
+        kernel-level copy, zero event-loop blocking, and lower latency
+        for the firmware download Tab5 makes on every Settings tap.
+        """
         import os
         firmware_path = os.path.join(self.OTA_DIR, "tinkertab.bin")
         if not os.path.exists(firmware_path):
             return web.Response(text="No firmware available", status=404)
-
-        file_size = os.path.getsize(firmware_path)
-        resp = web.StreamResponse()
-        resp.content_type = "application/octet-stream"
-        resp.content_length = file_size
-        resp.headers["Content-Disposition"] = "attachment; filename=tinkertab.bin"
-        await resp.prepare(request)
-
-        with open(firmware_path, "rb") as f:
-            while chunk := f.read(8192):
-                await resp.write(chunk)
-        return resp
+        return web.FileResponse(
+            path=firmware_path,
+            headers={
+                "Content-Type": "application/octet-stream",
+                "Content-Disposition": "attachment; filename=tinkertab.bin",
+            },
+        )

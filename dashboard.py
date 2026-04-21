@@ -1137,9 +1137,13 @@ function showToast(msg, type='success') {
 
 // ── Confirm Dialog ──
 function confirmAction(msg, callback) {
+  // Wave 14 W14-H02: msg can contain a server-controlled device name
+  // (see deleteDevice caller), so route it through textContent instead
+  // of splicing into innerHTML.
   const overlay = document.createElement('div');
   overlay.className = 'confirm-overlay';
-  overlay.innerHTML = `<div class="confirm-box"><p>${msg}</p><div class="btn-row"><button class="btn danger" id="confirm-yes">Confirm</button><button class="btn secondary" id="confirm-no">Cancel</button></div></div>`;
+  overlay.innerHTML = `<div class="confirm-box"><p class="confirm-msg"></p><div class="btn-row"><button class="btn danger" id="confirm-yes">Confirm</button><button class="btn secondary" id="confirm-no">Cancel</button></div></div>`;
+  overlay.querySelector('.confirm-msg').textContent = msg;
   document.body.appendChild(overlay);
   overlay.querySelector('#confirm-yes').onclick = () => { overlay.remove(); callback(); };
   overlay.querySelector('#confirm-no').onclick = () => overlay.remove();
@@ -1254,12 +1258,14 @@ async function refreshOverview() {
           const el = $('backends-' + cat);
           const active = be[cat]?.active || be.active?.[cat] || '';
           const available = be[cat]?.available || be.available?.[cat] || [];
+          // W14-H02: backend names come from the server config but
+          // they're identifiers — still escape for defense.
           if (available.length) {
             el.innerHTML = available.map(b =>
-              `<span class="backend-badge ${b === active ? 'current' : ''}">${b}${b === active ? ' (active)' : ''}</span>`
+              `<span class="backend-badge ${b === active ? 'current' : ''}">${escHtml(b)}${b === active ? ' (active)' : ''}</span>`
             ).join('');
           } else if (active) {
-            el.innerHTML = `<span class="backend-badge current">${active} (active)</span>`;
+            el.innerHTML = `<span class="backend-badge current">${escHtml(active)} (active)</span>`;
           } else {
             el.innerHTML = '<span style="color:var(--muted); font-size:12px;">--</span>';
           }
@@ -1283,13 +1289,17 @@ async function refreshOverview() {
       setVal('qs-messages', totalMsgs || '--');
 
       // Overview devices
+      // Wave 14 W14-H02: every server-controlled string is escaped before
+      // innerHTML. Without this, a device registering with a crafted
+      // `name` like `<img src=x onerror=fetch('/api/v1/memory')...>`
+      // would fire stored XSS every time an operator opened Overview.
       const devList = $('ov-devices');
       if (devices.items?.length) {
         devList.innerHTML = devices.items.map(d => `
           <div style="display:inline-flex; align-items:center; gap:6px; margin:4px 8px 4px 0; padding:6px 12px; background:var(--bg); border-radius:4px; font-size:13px;">
             <span class="dot ${d.is_online ? 'ok' : 'err'}"></span>
-            <span>${d.name || truncId(d.id)}</span>
-            <span style="color:var(--muted); font-size:11px;">${d.platform || ''}</span>
+            <span>${escHtml(d.name || truncId(d.id))}</span>
+            <span style="color:var(--muted); font-size:11px;">${escHtml(d.platform || '')}</span>
           </div>
         `).join('');
       } else {
@@ -1307,14 +1317,19 @@ async function refreshOverview() {
         tbody.innerHTML = '<tr><td colspan="6" class="empty">No sessions yet</td></tr>';
         return;
       }
+      // W14-H02: escape server-controlled strings before innerHTML.
+      // s.id / s.device_id are DB-generated hex (safe) but escaping them
+      // anyway is cheap insurance against a future schema change.
+      // s.status doubles as a CSS class + text content, so it's escAttr
+      // (class) + escHtml (text).
       tbody.innerHTML = sess.items.map(s => `
-        <tr class="clickable" onclick="switchToConversation('${s.id}')">
-          <td><code>${truncId(s.id)}</code></td>
-          <td>${s.device_id ? truncId(s.device_id) : '<span style="color:var(--muted)">API</span>'}</td>
-          <td>${s.type || 'conversation'}</td>
-          <td><span class="badge ${s.status}">${s.status}</span></td>
+        <tr class="clickable" onclick="switchToConversation('${escAttr(s.id)}')">
+          <td><code>${escHtml(truncId(s.id))}</code></td>
+          <td>${s.device_id ? escHtml(truncId(s.device_id)) : '<span style="color:var(--muted)">API</span>'}</td>
+          <td>${escHtml(s.type || 'conversation')}</td>
+          <td><span class="badge ${escAttr(s.status)}">${escHtml(s.status)}</span></td>
           <td>${s.message_count || 0}</td>
-          <td>${fmtTime(s.last_active_at)}</td>
+          <td>${escHtml(fmtTime(s.last_active_at))}</td>
         </tr>
       `).join('');
     } catch(e) {
@@ -1392,7 +1407,8 @@ async function loadConversations() {
       const devs = await api(P + '/api/v1/devices');
       if (devs.items) {
         for (const d of devs.items) {
-          devSel.innerHTML += `<option value="${d.id}">${d.name || truncId(d.id)}</option>`;
+          // W14-H02: escape attr + text independently.
+          devSel.innerHTML += `<option value="${escAttr(d.id)}">${escHtml(d.name || truncId(d.id))}</option>`;
         }
       }
     } catch(e) {}
@@ -1410,14 +1426,15 @@ async function loadConversations() {
       list.innerHTML = '<div class="empty">No sessions found</div>';
       return;
     }
+    // W14-H02: session items render with server strings; escape all of them.
     list.innerHTML = data.items.map(s => `
-      <div class="session-item ${s.id === selectedSessionId ? 'active' : ''}" data-sid="${s.id}" onclick="selectSession('${s.id}')">
+      <div class="session-item ${s.id === selectedSessionId ? 'active' : ''}" data-sid="${escAttr(s.id)}" onclick="selectSession('${escAttr(s.id)}')">
         <div style="display:flex; justify-content:space-between; align-items:center;">
-          <span class="sid">${truncId(s.id)}</span>
-          <span class="badge ${s.status}">${s.status}</span>
+          <span class="sid">${escHtml(truncId(s.id))}</span>
+          <span class="badge ${escAttr(s.status)}">${escHtml(s.status)}</span>
         </div>
         <div class="meta">
-          ${s.type || 'conversation'} · ${s.message_count || 0} msgs · ${fmtTime(s.last_active_at)}
+          ${escHtml(s.type || 'conversation')} · ${s.message_count || 0} msgs · ${escHtml(fmtTime(s.last_active_at))}
         </div>
       </div>
     `).join('');
@@ -1460,13 +1477,16 @@ async function selectSession(sid) {
     }
     container.innerHTML = data.items.map(m => {
       const ts = m.created_at ? new Date(typeof m.created_at === 'number' ? m.created_at * 1000 : m.created_at).toLocaleTimeString() : '';
+      // W14-H02: m.role is an enum (user/assistant/system/tool) but
+      // still escAttr/escHtml for defense.  m.input_mode + m.model come
+      // from the LLM backend's JSON — escape.
       return `
-      <div class="msg ${m.role}">
-        <div class="bubble">${escHtml(m.content)}${ts ? '<div style="font-size:11px;color:var(--muted);margin-top:4px;">'+ts+'</div>' : ''}</div>
+      <div class="msg ${escAttr(m.role)}">
+        <div class="bubble">${escHtml(m.content)}${ts ? '<div style="font-size:11px;color:var(--muted);margin-top:4px;">'+escHtml(ts)+'</div>' : ''}</div>
         <div class="msg-meta">
-          <span class="badge ${m.role}">${m.role}</span>
-          ${m.input_mode ? '<span style="color:var(--muted)">via '+m.input_mode+'</span>' : ''}
-          ${m.model ? '<span style="color:var(--muted)">'+m.model+'</span>' : ''}
+          <span class="badge ${escAttr(m.role)}">${escHtml(m.role)}</span>
+          ${m.input_mode ? '<span style="color:var(--muted)">via '+escHtml(m.input_mode)+'</span>' : ''}
+          ${m.model ? '<span style="color:var(--muted)">'+escHtml(m.model)+'</span>' : ''}
         </div>
       </div>
     `}).join('');
@@ -1570,6 +1590,18 @@ function escHtml(s) {
   return d.innerHTML;
 }
 
+// Wave 14 W14-H02: escape values embedded inside HTML attributes.
+// escHtml handles `<>&` but `"` would break `class="..."` and `onclick="..."`
+// unless we also escape it.  escAttr is the attribute-context sibling.
+function escAttr(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 // ── CHAT ──
 async function loadChatSessions() {
   try {
@@ -1579,7 +1611,8 @@ async function loadChatSessions() {
     sel.innerHTML = '<option value="">-- Create new session --</option>';
     if (data.items) {
       for (const s of data.items) {
-        sel.innerHTML += `<option value="${s.id}">${truncId(s.id)} (${s.message_count || 0} msgs)</option>`;
+        // W14-H02.
+        sel.innerHTML += `<option value="${escAttr(s.id)}">${escHtml(truncId(s.id))} (${s.message_count || 0} msgs)</option>`;
       }
     }
     if (oldVal) sel.value = oldVal;
@@ -1618,11 +1651,14 @@ async function onChatSessionChange() {
     const container = $('chat-messages');
     if (data.items?.length) {
       $('chat-empty')?.remove();
+      // W14-H02: m.role is enum (user|assistant|system|tool) — still
+      // escAttr for defense. ts is a locale string (safe) but escape
+      // anyway for consistency.
       container.innerHTML = data.items.map(m => {
         const ts = m.created_at ? new Date(typeof m.created_at === 'number' ? m.created_at * 1000 : m.created_at).toLocaleTimeString() : '';
         return `
-        <div class="msg ${m.role}">
-          <div class="bubble">${escHtml(m.content)}${ts ? '<div style="font-size:11px;color:var(--muted);margin-top:4px;">'+ts+'</div>' : ''}</div>
+        <div class="msg ${escAttr(m.role)}">
+          <div class="bubble">${escHtml(m.content)}${ts ? '<div style="font-size:11px;color:var(--muted);margin-top:4px;">'+escHtml(ts)+'</div>' : ''}</div>
         </div>
       `}).join('');
       container.scrollTop = container.scrollHeight;
@@ -1779,31 +1815,42 @@ async function loadDevices() {
     grid.innerHTML = data.items.map(d => {
       let caps = {};
       try { caps = typeof d.capabilities === 'string' ? JSON.parse(d.capabilities) : (d.capabilities || {}); } catch(e) {}
+      // Wave 14 W14-H02: escHtml() server-controlled strings before
+      // innerHTML, escAttr() before any HTML attribute.  The stored-XSS
+      // attack surface was registering a Tab5 with a payload in `name`
+      // or `hardware_id` (both user-settable over WS): the payload fired
+      // every time an operator opened Devices, in the dashboard fetch
+      // context that carries DRAGON_API_TOKEN.  d.id is server-
+      // generated hex (MAC-derived) so unescaped splice into onclick
+      // is safe; escAttr it anyway for cheap insurance against future
+      // schema changes.
+      const did = d.id || '';
+      const didAttr = escAttr(did);  // identifier escape (attrs AND onclick strings)
       return `
-        <div class="card device-card" onclick="toggleDeviceDetails(this)" data-device-id="${d.id}">
+        <div class="card device-card" onclick="toggleDeviceDetails(this)" data-device-id="${didAttr}">
           <div style="display:flex; justify-content:space-between; align-items:center;">
-            <span id="dev-name-display-${d.id}" class="editable-title" style="font-size:0.9em; color:var(--accent); text-transform:uppercase; letter-spacing:1px; font-weight:700;" onclick="event.stopPropagation(); startEditDeviceName('${d.id}', this)">${d.name || 'Unknown Device'}</span>
-            <span id="dev-name-edit-${d.id}" class="inline-edit" style="display:none;" onclick="event.stopPropagation();">
-              <input type="text" value="${escHtml(d.name || '')}" onkeydown="if(event.key==='Enter')saveDeviceName('${d.id}');if(event.key==='Escape')cancelEditDeviceName('${d.id}');">
-              <button class="btn small" onclick="saveDeviceName('${d.id}')">Save</button>
-              <button class="btn small secondary" onclick="cancelEditDeviceName('${d.id}')">Cancel</button>
+            <span id="dev-name-display-${didAttr}" class="editable-title" style="font-size:0.9em; color:var(--accent); text-transform:uppercase; letter-spacing:1px; font-weight:700;" onclick="event.stopPropagation(); startEditDeviceName('${didAttr}', this)">${escHtml(d.name || 'Unknown Device')}</span>
+            <span id="dev-name-edit-${didAttr}" class="inline-edit" style="display:none;" onclick="event.stopPropagation();">
+              <input type="text" value="${escAttr(d.name || '')}" onkeydown="if(event.key==='Enter')saveDeviceName('${didAttr}');if(event.key==='Escape')cancelEditDeviceName('${didAttr}');">
+              <button class="btn small" onclick="saveDeviceName('${didAttr}')">Save</button>
+              <button class="btn small secondary" onclick="cancelEditDeviceName('${didAttr}')">Cancel</button>
             </span>
             <div style="display:flex; gap:6px; align-items:center;">
               <span class="badge ${d.is_online ? 'online' : 'offline'}">${d.is_online ? 'Online' : 'Offline'}</span>
-              <button class="btn small danger" onclick="event.stopPropagation(); deleteDevice('${d.id}', '${escHtml(d.name || truncId(d.id))}')" title="Delete device">Del</button>
+              <button class="btn small danger" onclick="event.stopPropagation(); deleteDevice('${didAttr}', '${escAttr(d.name || truncId(did))}')" title="Delete device">Del</button>
             </div>
           </div>
           <div style="margin-top:8px;">
-            <div class="row"><span class="label">ID</span><span style="font-family:monospace; font-size:12px;">${truncId(d.id)}</span></div>
-            <div class="row"><span class="label">Hardware</span><span>${d.hardware_id || '--'}</span></div>
-            <div class="row"><span class="label">Platform</span><span>${d.platform || '--'}</span></div>
-            <div class="row"><span class="label">Firmware</span><span>${d.firmware_ver || '--'}</span></div>
-            <div class="row"><span class="label">Last Seen</span><span>${fmtTime(d.last_seen_at)}</span></div>
+            <div class="row"><span class="label">ID</span><span style="font-family:monospace; font-size:12px;">${escHtml(truncId(did))}</span></div>
+            <div class="row"><span class="label">Hardware</span><span>${escHtml(d.hardware_id || '--')}</span></div>
+            <div class="row"><span class="label">Platform</span><span>${escHtml(d.platform || '--')}</span></div>
+            <div class="row"><span class="label">Firmware</span><span>${escHtml(d.firmware_ver || '--')}</span></div>
+            <div class="row"><span class="label">Last Seen</span><span>${escHtml(fmtTime(d.last_seen_at))}</span></div>
           </div>
           <div class="device-details">
             <div style="margin-bottom:12px; padding:12px; background:rgba(6,182,212,0.05); border:1px solid rgba(6,182,212,0.2); border-radius:var(--radius);">
               <h2 style="font-size:0.8em; color:var(--accent2);">Voice Configuration</h2>
-              <div id="device-config-${d.id}" style="display:block;">
+              <div id="device-config-${didAttr}" style="display:block;">
                 <div style="display:flex; gap:12px; align-items:center; margin-top:8px; flex-wrap:wrap;">
                   <label style="font-size:12px; color:var(--muted);">Mode:
                     <select class="dev-voice-mode" style="background:var(--surface); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:4px 8px; font-size:12px;">
@@ -1821,13 +1868,13 @@ async function loadDevices() {
                       <option value="openai/gpt-4o-mini">GPT-4o Mini</option>
                     </select>
                   </label>
-                  <button class="btn small dev-apply-btn" onclick="applyDeviceConfig('${d.id}')">Apply</button>
+                  <button class="btn small dev-apply-btn" onclick="applyDeviceConfig('${didAttr}')">Apply</button>
                 </div>
               </div>
             </div>
             <h2 style="font-size:0.8em;">Capabilities</h2>
-            <pre style="font-size:11px; color:var(--muted); white-space:pre-wrap;">${JSON.stringify(caps, null, 2)}</pre>
-            <div data-dev-sessions="${d.id}" style="margin-top:12px;">
+            <pre style="font-size:11px; color:var(--muted); white-space:pre-wrap;">${escHtml(JSON.stringify(caps, null, 2))}</pre>
+            <div data-dev-sessions="${didAttr}" style="margin-top:12px;">
               <h2 style="font-size:0.8em;">Recent Sessions</h2>
               <div class="empty">Loading...</div>
             </div>
@@ -1857,13 +1904,14 @@ async function toggleDeviceDetails(card) {
       sessDiv.innerHTML = '<h2 style="font-size:0.8em;">Recent Sessions</h2><div class="empty">No sessions for this device</div>';
       return;
     }
+    // W14-H02.
     sessDiv.innerHTML = '<h2 style="font-size:0.8em;">Recent Sessions</h2>' +
       data.items.map(s => `
         <div style="display:flex; justify-content:space-between; padding:4px 0; border-bottom:1px solid rgba(15,52,96,0.2); font-size:12px;">
-          <span style="font-family:monospace;">${truncId(s.id)}</span>
-          <span class="badge ${s.status}">${s.status}</span>
+          <span style="font-family:monospace;">${escHtml(truncId(s.id))}</span>
+          <span class="badge ${escAttr(s.status)}">${escHtml(s.status)}</span>
           <span style="color:var(--muted);">${s.message_count||0} msgs</span>
-          <span style="color:var(--muted);">${fmtTime(s.last_active_at)}</span>
+          <span style="color:var(--muted);">${escHtml(fmtTime(s.last_active_at))}</span>
         </div>
       `).join('');
   } catch(e) {
@@ -1918,21 +1966,22 @@ async function loadNotes() {
       grid.innerHTML = '<div class="empty-state"><span class="icon">&#128221;</span><span class="msg">No notes yet. Create one!</span></div>';
       return;
     }
+    // W14-H02.
     grid.innerHTML = notes.map(n => `
       <div class="card note-card">
         <div style="display:flex; justify-content:space-between; align-items:center;">
           <h2 style="margin:0;">${escHtml(n.title || 'Untitled')}</h2>
-          <span style="font-size:11px; color:var(--muted);">${fmtTime(n.created_at)}</span>
+          <span style="font-size:11px; color:var(--muted);">${escHtml(fmtTime(n.created_at))}</span>
         </div>
         ${n.summary ? `<div style="margin-top:6px; font-size:12px; color:var(--accent2);">${escHtml(n.summary)}</div>` : ''}
         <div class="note-preview">${escHtml(n.transcript || n.text || '')}</div>
         <div style="display:flex; gap:12px; margin-top:8px; font-size:11px; color:var(--muted);">
           ${n.word_count ? `<span>${n.word_count} words</span>` : ''}
           ${n.duration_s ? `<span>${Math.round(n.duration_s)}s audio</span>` : ''}
-          ${n.source ? `<span>via ${n.source}</span>` : ''}
+          ${n.source ? `<span>via ${escHtml(n.source)}</span>` : ''}
         </div>
         <div class="note-actions">
-          <button class="btn small danger" onclick="deleteNote('${n.id}')">Delete</button>
+          <button class="btn small danger" onclick="deleteNote('${escAttr(n.id)}')">Delete</button>
         </div>
       </div>
     `).join('');
@@ -2012,7 +2061,7 @@ async function loadMemory() {
       <div class="card fact-card">
         <div style="display:flex; justify-content:space-between; align-items:flex-start;">
           <div class="fact-content">${escHtml(f.content || f.text || '')}</div>
-          <button class="btn small danger" onclick="deleteMemoryFact('${f.id}')" title="Delete fact" style="flex-shrink:0; margin-left:8px;">Del</button>
+          <button class="btn small danger" onclick="deleteMemoryFact('${escAttr(f.id)}')" title="Delete fact" style="flex-shrink:0; margin-left:8px;">Del</button>
         </div>
         <div class="fact-meta">
           ${f.source ? `<span>Source: ${escHtml(f.source)}</span>` : ''}
@@ -2074,6 +2123,7 @@ async function searchMemory() {
     }
     info.textContent = `Showing ${results.length} result(s) for "${q}"`;
     info.style.display = 'block';
+    // W14-H02.
     grid.innerHTML = results.map(f => `
       <div class="card fact-card">
         <div style="display:flex; justify-content:space-between; align-items:flex-start;">
@@ -2082,7 +2132,7 @@ async function searchMemory() {
         </div>
         <div class="fact-meta">
           ${f.source ? `<span>Source: ${escHtml(f.source)}</span>` : ''}
-          ${f.created_at ? `<span>${fmtTime(f.created_at)}</span>` : ''}
+          ${f.created_at ? `<span>${escHtml(fmtTime(f.created_at))}</span>` : ''}
         </div>
       </div>
     `).join('');
@@ -2109,17 +2159,20 @@ async function loadDocuments() {
       grid.innerHTML = '<div class="empty-state"><span class="icon">&#128196;</span><span class="msg">No documents ingested. Add one to enable RAG search!</span></div>';
       return;
     }
+    // W14-H02: doc.id is server-generated but escAttr anyway.
+    // d.title / d.source already escaped; d.created_at wasn't; d.id (truncId)
+    // wasn't.
     grid.innerHTML = docs.map(d => `
       <div class="card doc-card">
         <div style="display:flex; justify-content:space-between; align-items:center;">
           <h2 style="margin:0;">${escHtml(d.title || 'Untitled Document')}</h2>
-          <button class="btn small danger" onclick="deleteDocument('${d.id}')" title="Delete document">Del</button>
+          <button class="btn small danger" onclick="deleteDocument('${escAttr(d.id)}')" title="Delete document">Del</button>
         </div>
         <div style="display:flex; gap:12px; margin-top:8px; font-size:12px; color:var(--muted); flex-wrap:wrap;">
           ${d.chunk_count != null ? `<span>${d.chunk_count} chunks</span>` : ''}
           ${d.source ? `<span>Source: ${escHtml(d.source)}</span>` : ''}
-          ${d.created_at ? `<span>${fmtTime(d.created_at)}</span>` : ''}
-          ${d.id ? `<span style="font-family:monospace;">${truncId(d.id)}</span>` : ''}
+          ${d.created_at ? `<span>${escHtml(fmtTime(d.created_at))}</span>` : ''}
+          ${d.id ? `<span style="font-family:monospace;">${escHtml(truncId(d.id))}</span>` : ''}
         </div>
       </div>
     `).join('');
@@ -2184,6 +2237,7 @@ async function searchDocuments() {
     }
     info.textContent = `Showing ${results.length} matching chunk(s) for "${q}"`;
     info.style.display = 'block';
+    // W14-H02.
     grid.innerHTML = results.map(c => `
       <div class="card doc-card">
         <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -2193,7 +2247,7 @@ async function searchDocuments() {
         <div class="chunk-item">${escHtml(c.content || c.text || '')}</div>
         <div style="font-size:11px; color:var(--muted); margin-top:6px;">
           ${c.chunk_index != null ? `Chunk #${c.chunk_index}` : ''}
-          ${c.document_id ? ` &middot; Doc ${truncId(c.document_id)}` : ''}
+          ${c.document_id ? ` &middot; Doc ${escHtml(truncId(c.document_id))}` : ''}
         </div>
       </div>
     `).join('');
@@ -2225,8 +2279,13 @@ async function loadTools() {
     grid.innerHTML = tools.map(t => {
       const params = t.parameters_schema || t.parameters || {};
       const paramNames = params.properties ? Object.keys(params.properties) : [];
+      // W14-H02: escHtml(t.name) for TEXT content, escAttr for attr.
+      // `openToolExec('${escHtml(t.name)}')` was subtly broken — if
+      // t.name contained `<` or `&`, the JS string would still work but
+      // decoded differently at parse time.  Use escAttr on the attr
+      // side; escHtml on the text side.
       return `
-        <div class="card tool-card" style="cursor:pointer;" onclick="openToolExec('${escHtml(t.name)}')">
+        <div class="card tool-card" style="cursor:pointer;" onclick="openToolExec('${escAttr(t.name)}')">
           <h2 style="margin:0; display:flex; justify-content:space-between; align-items:center;">
             <span>${escHtml(t.name)}</span>
             <span class="badge info">tool</span>
@@ -2263,19 +2322,23 @@ function openToolExec(name) {
   if (Object.keys(props).length === 0) {
     paramsDiv.innerHTML = '<div style="font-size:12px; color:var(--muted);">This tool takes no parameters.</div>';
   } else {
+    // W14-H02: escape key for the DOM id, desc for placeholder attr,
+    // default values for value attr.  Values use escAttr (attribute
+    // context), visible text uses escHtml.
     paramsDiv.innerHTML = Object.entries(props).map(([key, schema]) => {
       const isReq = required.includes(key);
       const type = schema.type || 'string';
       const desc = schema.description || '';
+      const keyAttr = escAttr(key);
       let inputHtml;
       if (type === 'boolean') {
-        inputHtml = `<select id="tool-param-${key}"><option value="true">true</option><option value="false">false</option></select>`;
+        inputHtml = `<select id="tool-param-${keyAttr}"><option value="true">true</option><option value="false">false</option></select>`;
       } else if (schema.enum) {
-        inputHtml = `<select id="tool-param-${key}">${schema.enum.map(v => `<option value="${escHtml(String(v))}">${escHtml(String(v))}</option>`).join('')}</select>`;
+        inputHtml = `<select id="tool-param-${keyAttr}">${schema.enum.map(v => `<option value="${escAttr(String(v))}">${escHtml(String(v))}</option>`).join('')}</select>`;
       } else if (type === 'integer' || type === 'number') {
-        inputHtml = `<input id="tool-param-${key}" type="number" placeholder="${escHtml(desc)}" ${schema.default != null ? `value="${schema.default}"` : ''}>`;
+        inputHtml = `<input id="tool-param-${keyAttr}" type="number" placeholder="${escAttr(desc)}" ${schema.default != null ? `value="${escAttr(String(schema.default))}"` : ''}>`;
       } else {
-        inputHtml = `<input id="tool-param-${key}" type="text" placeholder="${escHtml(desc)}" ${schema.default != null ? `value="${escHtml(String(schema.default))}"` : ''}>`;
+        inputHtml = `<input id="tool-param-${keyAttr}" type="text" placeholder="${escAttr(desc)}" ${schema.default != null ? `value="${escAttr(String(schema.default))}"` : ''}>`;
       }
       return `
         <div class="param-field">
@@ -2363,16 +2426,18 @@ async function loadEvents() {
     }
     // Display newest first
     const sorted = [...events].reverse();
+    // W14-H02: ev.type + session_id + device_id + created_at all flow
+    // into innerHTML. ev.data is already stringified + escHtml'd above.
     container.innerHTML = sorted.map(ev => {
       let evData = {};
       try { evData = typeof ev.data === 'string' ? JSON.parse(ev.data) : (ev.data || {}); } catch(e) {}
       const summary = Object.keys(evData).length ? ' — ' + escHtml(JSON.stringify(evData).substring(0, 120)) : '';
       return `
         <div class="event-item">
-          <span class="ts">${fmtTime(ev.created_at)}</span>
+          <span class="ts">${escHtml(fmtTime(ev.created_at))}</span>
           <span class="etype">${escHtml(ev.type)}</span>
-          ${ev.session_id ? `<span style="color:var(--muted); font-size:11px;"> session:${truncId(ev.session_id)}</span>` : ''}
-          ${ev.device_id ? `<span style="color:var(--muted); font-size:11px;"> device:${truncId(ev.device_id)}</span>` : ''}
+          ${ev.session_id ? `<span style="color:var(--muted); font-size:11px;"> session:${escHtml(truncId(ev.session_id))}</span>` : ''}
+          ${ev.device_id ? `<span style="color:var(--muted); font-size:11px;"> device:${escHtml(truncId(ev.device_id))}</span>` : ''}
           <span style="color:var(--muted); font-size:11px;">${summary}</span>
         </div>
       `;
@@ -2400,11 +2465,12 @@ async function pollNewEvents() {
       const div = document.createElement('div');
       div.className = 'event-item';
       div.style.animation = 'fadeIn 0.3s';
+      // W14-H02.
       div.innerHTML = `
-        <span class="ts">${fmtTime(ev.created_at)}</span>
+        <span class="ts">${escHtml(fmtTime(ev.created_at))}</span>
         <span class="etype">${escHtml(ev.type)}</span>
-        ${ev.session_id ? `<span style="color:var(--muted); font-size:11px;"> session:${truncId(ev.session_id)}</span>` : ''}
-        ${ev.device_id ? `<span style="color:var(--muted); font-size:11px;"> device:${truncId(ev.device_id)}</span>` : ''}
+        ${ev.session_id ? `<span style="color:var(--muted); font-size:11px;"> session:${escHtml(truncId(ev.session_id))}</span>` : ''}
+        ${ev.device_id ? `<span style="color:var(--muted); font-size:11px;"> device:${escHtml(truncId(ev.device_id))}</span>` : ''}
         <span style="color:var(--muted); font-size:11px;">${summary}</span>
       `;
       container.prepend(div);

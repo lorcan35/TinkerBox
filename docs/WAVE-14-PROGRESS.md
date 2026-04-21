@@ -32,7 +32,7 @@ Each of these removes friction that slows everything after it.
 ## Phase 3 — HIGH security (Dragon)
 
 - [x] **W14-H01** `[TB]` widen `config_to_dict` redaction predicate to include `token|password|secret` · 5/5 pytest + live `/api/config` both tokens show `***redacted***`
-- [ ] **W14-H02** `[TB]` sweep dashboard innerHTML interpolations through `escHtml`; move `d.id` out of inline `onclick`
+- [x] **W14-H02** `[TB]` sweep dashboard innerHTML interpolations through `escHtml`; move `d.id` out of inline `onclick` · 13 render sites + new `escAttr` helper · verified: stored `<img src=x onerror=alert()>` in device name, dashboard renders it as literal text (23 `escAttr()` + 3 `escHtml(d.name)` gates shipped)
 - [x] **W14-H03** `[TB]` SSRF protection on `MediaPipeline.proxy_image` (reject loopback/link-local/RFC1918, cap redirects, running-byte-counter) · 13/13 pytest + stream-read refactor
 - [x] **W14-H04** `[TB]` bind `/api/media/{id}` to session OR issue HMAC-signed URLs; widen id to 128 bits · 11/11 pytest + live 403/200/403 for unsigned/signed/tampered
 - [x] **W14-H05** `[TB]` drop hardcoded `Access-Control-Allow-Origin: *` from `messages.py`/`completions.py`/`dashboard.py` · 3 sites · middleware's origin allowlist now decides

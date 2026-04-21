@@ -2,7 +2,7 @@
 
 import logging
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from dragon_voice.tools.base import Tool
 
@@ -64,7 +64,8 @@ class TimerTool(Tool):
         if duration > 86400:
             return {"error": "Maximum timer duration is 24 hours"}
 
-        now = datetime.now()
+        # Wave 14 W14-M14: tz-aware datetime.
+        now = datetime.now(timezone.utc).astimezone()
         fires_at = now + timedelta(seconds=duration)
 
         _timer_counter += 1

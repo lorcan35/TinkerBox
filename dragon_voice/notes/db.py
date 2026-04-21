@@ -139,10 +139,22 @@ class NotesDB:
             rows = await cur.fetchall()
         return [self._row_to_note(r) for r in rows], total
 
+    _UPDATABLE = frozenset({"title", "transcript", "summary", "tags", "embedding"})
+
     async def update(self, note_id: str, updates: dict) -> Optional[Note]:
+        # Wave 14 W14-M12: log unknown keys.  Dropping them silently
+        # was caught by the audit as a source of "I set X via PATCH
+        # and it didn't stick — why?" confusion.  Schema drift now
+        # surfaces in the log.
+        unknown = set(updates).difference(self._UPDATABLE)
+        if unknown:
+            logger.warning(
+                "NotesDB.update(%s): ignoring unknown keys %s (allowed: %s)",
+                note_id, sorted(unknown), sorted(self._UPDATABLE))
         async with self._write_lock:
             # Read inside the lock so a concurrent write can't race the
-            # round-trip.
+            # round-trip. The single write that follows is atomic on
+            # the aiosqlite background thread.
             async with self._conn.execute(
                 "SELECT * FROM notes WHERE id = ?", (note_id,)
             ) as cur:

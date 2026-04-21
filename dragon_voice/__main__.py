@@ -85,6 +85,37 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
 
+    # Wave 14 W14-L06: install a defense-in-depth log filter that
+    # redacts Bearer tokens and OpenRouter / Anthropic / TinkerClaw
+    # API keys from any log line. The wave-13 secret audit found
+    # nothing in journals, but any logger.exception(...) on a POST
+    # handler that echoes the body would leak the Authorization
+    # header; this filter catches that before it lands in journald.
+    import re as _re
+
+    class _SecretRedactingFilter(logging.Filter):
+        _PATTERNS = (
+            (_re.compile(r"Bearer\s+[A-Za-z0-9._\-~+/=]+"), "Bearer <REDACTED>"),
+            (_re.compile(r"sk-[A-Za-z0-9\-_]{20,}"), "<REDACTED_API_KEY>"),
+            (_re.compile(r"\"api_token\"\s*:\s*\"[^\"]*\""), '"api_token": "<REDACTED>"'),
+            (_re.compile(r"\"tinkerclaw_token\"\s*:\s*\"[^\"]*\""),
+             '"tinkerclaw_token": "<REDACTED>"'),
+        )
+
+        def filter(self, record: logging.LogRecord) -> bool:
+            try:
+                msg = record.getMessage()
+            except Exception:  # noqa: BLE001 — safety net; never raise from filter
+                return True
+            new_msg = msg
+            for pat, replacement in self._PATTERNS:
+                new_msg = pat.sub(replacement, new_msg)
+            if new_msg != msg:
+                record.msg, record.args = new_msg, ()
+            return True
+
+    logging.getLogger().addFilter(_SecretRedactingFilter())
+
     # Load config
     config = load_config(args.config)
 

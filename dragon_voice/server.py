@@ -154,9 +154,14 @@ class VoiceServer:
     # (health, WS handshake is separately gated via the `register` frame).
     _AUTH_PUBLIC_PREFIXES = (
         "/health",              # liveness probe
-        "/ws/voice",            # WS handshake; auth is at `register` time
+        # Wave 14 W14-C04: /ws/voice is allow-listed here (because the
+        # bearer comes from the upgrade header, not the request path),
+        # but _handle_ws_voice itself performs the Authorization check
+        # before ws.prepare().  Do NOT remove /ws/voice from this list or
+        # the CORS middleware will bounce the upgrade.
+        "/ws/voice",            # auth enforced inside _handle_ws_voice
         "/dashboard",           # proxied to localhost:3500 (separately gated)
-        "/api/media/",          # rendered media fetch — authenticated by ID obscurity
+        "/api/media/",          # rendered media fetch — W14-H04 will fix this
     )
 
     @web.middleware
@@ -984,6 +989,36 @@ class VoiceServer:
                     config_update, error, event
             - Binary: PCM int16 audio at config.tts_sample_rate
         """
+        # Wave 14 W14-C04: authenticate the WS upgrade request.  Prior to
+        # this, /ws/voice was publicly reachable and the `register` frame
+        # only required a non-empty device_id — so any attacker with the
+        # ngrok URL could impersonate any Tab5, hijack sessions, and burn
+        # OpenRouter/TinkerClaw budget.
+        #
+        # Contract:
+        #   - If server.api_token is configured: client MUST present
+        #       `Authorization: Bearer <token>` on the upgrade request,
+        #       matched with hmac.compare_digest.  Mismatch → 401.
+        #   - If server.api_token is blank (unprovisioned/dev): allow the
+        #       handshake but log-warn so the operator knows they're
+        #       running unauthenticated.  This matches the pattern of
+        #       letting first-run bootstraps work without breaking Tab5
+        #       flashes mid-upgrade.
+        expected_token = (getattr(self._config.server, "api_token", "") or "").strip()
+        if expected_token:
+            auth_header = request.headers.get("Authorization", "")
+            supplied = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
+            import hmac as _hmac
+            if not supplied or not _hmac.compare_digest(supplied, expected_token):
+                logger.warning(
+                    "WS /ws/voice: rejecting unauthenticated upgrade from %s (header_present=%s)",
+                    request.remote, bool(auth_header))
+                return web.Response(text="Unauthorized", status=401)
+        else:
+            logger.warning(
+                "WS /ws/voice: server.api_token not configured — allowing "
+                "unauthenticated WS. Set DRAGON_API_TOKEN to enforce.")
+
         # Reject if at connection limit
         if len(self._active_connections) >= self._max_connections:
             logger.warning("Connection limit reached (%d), rejecting", self._max_connections)

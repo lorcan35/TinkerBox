@@ -62,8 +62,13 @@ class PiperBackend(TTSBackend):
         try:
             import piper
 
-            model_path = self._ensure_model(model_name, data_dir)
             loop = asyncio.get_running_loop()
+            # Wave 14 W14-M13: blocking wget happens inside _ensure_model
+            # when the voice isn't cached yet. Offload so cold-boot doesn't
+            # stall the event loop for up to 2×120 s.
+            model_path = await loop.run_in_executor(
+                inference_executor, self._ensure_model, model_name, data_dir,
+            )
 
             def _load():
                 voice = piper.PiperVoice.load(str(model_path))
@@ -100,7 +105,10 @@ class PiperBackend(TTSBackend):
 
         self._use_binary = True
         self._binary_path = binary
-        self._model_path = self._ensure_model(model_name, data_dir)
+        loop = asyncio.get_running_loop()
+        self._model_path = await loop.run_in_executor(
+            inference_executor, self._ensure_model, model_name, data_dir,
+        )
         logger.info("Piper will use binary at %s", binary)
 
     @staticmethod

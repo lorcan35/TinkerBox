@@ -18,6 +18,14 @@ from dragon_voice.llm.base import LLMBackend
 
 logger = logging.getLogger(__name__)
 
+# Wave 14 W14-M07: per-line + total-stream caps for the TinkerClaw SSE
+# parser.  The gateway is trusted in theory, but a bug on the other
+# end (or a hostile proxy) could stream an unbounded SSE line or
+# infinite body that exhausts Dragon's memory budget.  We cap both.
+_SSE_MAX_LINE_BYTES = 256 * 1024          # 256 KiB — one SSE "data: ..." frame
+_SSE_MAX_STREAM_BYTES = 16 * 1024 * 1024  # 16 MiB — whole response total
+_SSE_MAX_TOKENS = 50_000                  # ~200 KB of text, generous
+
 
 class TinkerClawBackend(LLMBackend):
     """LLM backend that proxies to a local TinkerClaw agent gateway."""
@@ -137,10 +145,31 @@ class TinkerClawBackend(LLMBackend):
 
                 saw_done = False
                 token_count = 0
+                total_bytes = 0  # W14-M07: running total of SSE body bytes
                 consecutive_errors = 0  # P11: detect HTML error pages from proxy
 
-                async for line in resp.content:
-                    line = line.decode("utf-8", errors="replace").strip()
+                # W14-M07: use readline with explicit byte cap so one
+                # pathologically long SSE frame can't blow memory.
+                while True:
+                    raw = await resp.content.readline()
+                    if not raw:
+                        break
+                    if len(raw) > _SSE_MAX_LINE_BYTES:
+                        logger.error(
+                            "M07: SSE line exceeded %d bytes — aborting stream",
+                            _SSE_MAX_LINE_BYTES,
+                        )
+                        yield " ... (response aborted: oversized SSE frame)"
+                        return
+                    total_bytes += len(raw)
+                    if total_bytes > _SSE_MAX_STREAM_BYTES:
+                        logger.error(
+                            "M07: SSE stream exceeded %d bytes total — aborting",
+                            _SSE_MAX_STREAM_BYTES,
+                        )
+                        yield " ... (response aborted: stream too large)"
+                        return
+                    line = raw.decode("utf-8", errors="replace").strip()
                     if not line or not line.startswith("data: "):
                         continue
 
@@ -172,6 +201,13 @@ class TinkerClawBackend(LLMBackend):
                     token = delta.get("content", "")
                     if token:
                         token_count += 1
+                        if token_count > _SSE_MAX_TOKENS:
+                            logger.error(
+                                "M07: SSE token count exceeded %d — aborting",
+                                _SSE_MAX_TOKENS,
+                            )
+                            yield " ... (response aborted: too many tokens)"
+                            return
                         yield token
 
                 # A07: Truncation detection — stream ended without [DONE]

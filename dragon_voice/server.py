@@ -378,7 +378,10 @@ class VoiceServer:
             from dragon_voice.notes.api import setup_routes as setup_notes_routes
 
             notes_db = NotesDB()
-            notes_db.initialize()
+            # Wave 14 W14-C05: NotesDB.initialize is async now. The prior
+            # direct call here was un-awaited, producing a stray coroutine
+            # and an intermittent None-connection race. NotesService.initialize
+            # already calls await self._db.initialize(), so this line is gone.
             notes_svc = NotesService(self._config, notes_db)
             await notes_svc.initialize()
             self._notes_svc = notes_svc  # Store for shutdown

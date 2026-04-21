@@ -352,9 +352,9 @@ dragon_voice/         — Voice pipeline package (port 3502)
     pipeline.py       — MediaPipeline: detects code/tables/image URLs in LLM output, renders JPEG via Pygments/Pillow
   api/media_routes.py — MediaRoutes: GET /api/media/{id} (serve), POST /api/media/upload (Tab5 camera)
 tests/                — E2E test suite
-  test_api_e2e.py     — 29 tests (14 single-step, 8 multi-step, 7 complex chained)
+  test_api_e2e.py     — 29 live-device tests (14 single-step, 8 multi-step, 7 complex chained)
   test_media_store.py — 12 unit tests for MediaStore
-  test_media_pipeline.py — 32 unit tests for MediaPipeline
+  test_media_pipeline.py — 29 unit tests for MediaPipeline
 docs/
   protocol.md         — WebSocket protocol spec (Tab5 ↔ Dragon)
   npu-setup.md        — Qualcomm NPU / QAIRT SDK setup guide
@@ -370,9 +370,11 @@ LEARNINGS.md          — Institutional knowledge (MANDATORY reading)
   - **7 complex chained tests:** Full workflows across multiple subsystems (session + chat + memory + tools, etc.)
 
 ### Media Tests
-- **44 media tests** — all passing
+- **41 media tests** — all passing
   - `tests/test_media_store.py` — 12 unit tests for MediaStore (disk storage, cleanup, capacity limits)
-  - `tests/test_media_pipeline.py` — 32 unit tests for MediaPipeline (code block detection, table rendering, image URL handling, strip logic)
+  - `tests/test_media_pipeline.py` — 29 unit tests for MediaPipeline (code block detection, table rendering, image URL handling, strip logic)
+
+Aggregate pytest run (excluding `tests/audit/` which needs pytest-asyncio): **121 tests collected, 121 passing** (April 2026, wave 14). Verify with `python3 -m pytest tests/ -q --ignore=tests/audit`.
 
 ### Dashboard Debug Tab E2E Suite
 - **55 tests** — runnable from the Debug tab in the dashboard

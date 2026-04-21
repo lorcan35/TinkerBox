@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import secrets
+import sqlite3
 import struct
 import time
 from typing import Optional
@@ -63,6 +64,11 @@ class MemoryService:
         # enable_load_extension + load_extension as coroutines that run on
         # the DB worker thread (so the extension ends up attached to the
         # right connection).
+        # Wave 14 W14-H13: narrow from bare Exception.  Realistic failures
+        # are ImportError (package missing) + sqlite3.OperationalError
+        # (extension load rejected, e.g. disabled in build).  AttributeError
+        # would signal an API drift in sqlite_vec itself — bubble so we
+        # notice.
         try:
             import sqlite_vec
             await self._db.conn.enable_load_extension(True)
@@ -70,7 +76,7 @@ class MemoryService:
             await self._db.conn.enable_load_extension(False)
             self._use_vec = True
             logger.info("sqlite-vec loaded OK; vector search enabled")
-        except Exception as e:
+        except (ImportError, sqlite3.OperationalError, sqlite3.DatabaseError) as e:
             self._use_vec = False
             logger.warning("sqlite-vec unavailable (%s) — falling back to "
                            "Python-loop cosine", e)
@@ -144,7 +150,9 @@ class MemoryService:
             await self._db.conn.commit()
             self._use_fts5 = True
             logger.info("FTS5 memory_facts_fts ready (keyword search enabled)")
-        except Exception as e:
+        except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
+            # W14-H13: FTS5 may be missing in the sqlite build; both
+            # error classes cover that. Narrowed from bare Exception.
             self._use_fts5 = False
             logger.warning("FTS5 init failed: %s -- keyword search disabled", e)
         await self._db.conn.commit()
@@ -177,7 +185,12 @@ class MemoryService:
                 vec = embeddings[0]
                 self._embed_dim = len(vec)
                 return struct.pack(f"{len(vec)}f", *vec)
-        except Exception as e:
+        except (aiohttp.ClientError, TimeoutError, struct.error, json.JSONDecodeError) as e:
+            # W14-H13: narrow from bare Exception.  Ollama unreachable
+            # (ClientError), slow (TimeoutError), returns non-JSON
+            # (JSONDecodeError), or returns a non-float embedding
+            # (struct.error).  AttributeError etc. would signal a bug
+            # in our own code — bubble.
             logger.warning("Embedding failed (Ollama may not be running): %s", e)
             return None
 
@@ -211,7 +224,9 @@ class MemoryService:
             await self._db.conn.commit()
             self._vec_created = True
             logger.info("memory_facts_vec created (dim=%d)", self._embed_dim)
-        except Exception as e:
+        except (sqlite3.OperationalError, sqlite3.DatabaseError) as e:
+            # W14-H13: vec0 extension API surface — OperationalError on
+            # malformed CREATE or missing vec0 module.
             logger.warning("vec virtual table create failed: %s", e)
             self._use_vec = False
 
@@ -235,7 +250,8 @@ class MemoryService:
                     "INSERT INTO memory_facts_vec (id, embedding) VALUES (?, ?)",
                     (fact_id, embedding),
                 )
-            except Exception as e:
+            except sqlite3.Error as e:
+                # W14-H13: any sqlite3 error is expected for a best-effort mirror.
                 logger.debug("vec insert failed: %s", e)
         await self._db.conn.commit()
         logger.info("Fact stored: %s (%s)", fact_id, content[:50])
@@ -260,7 +276,9 @@ class MemoryService:
                 await self._db.conn.execute(
                     "DELETE FROM memory_facts_vec WHERE id = ?", (fact_id,)
                 )
-            except Exception as e:
+            except sqlite3.Error as e:
+                # W14-H13: sqlite3.Error covers every backend failure;
+                # anything else is a bug worth raising.
                 logger.debug("vec delete failed: %s", e)
         await self._db.conn.commit()
         return cursor.rowcount > 0
@@ -294,7 +312,10 @@ class MemoryService:
                         "score": 1.0 - float(d["distance"]),
                     })
                 return out
-            except Exception as e:
+            except sqlite3.Error as e:
+                # W14-H13: vec MATCH can raise OperationalError on a
+                # dimension mismatch or a missing index.  Fallback is
+                # already correct.
                 logger.warning("vec search failed, falling back to Python-loop: %s", e)
 
         cursor = await self._db.conn.execute(
@@ -446,6 +467,9 @@ class MemoryService:
         if self._http_session is not None and not self._http_session.closed:
             try:
                 await self._http_session.close()
-            except Exception:
+            except (aiohttp.ClientError, RuntimeError):
+                # W14-H13: close() can race with in-flight requests in
+                # aiohttp ≥3.10 and raise RuntimeError("Session is closed");
+                # safely swallowed since the post-condition is "closed".
                 logger.debug("MemoryService HTTP session close raised", exc_info=True)
         self._http_session = None

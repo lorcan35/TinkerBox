@@ -14,16 +14,16 @@ Canonical status for every item in [docs/AUDIT-WAVE-15.md](AUDIT-WAVE-15.md). Up
 
 ## Phase 2 — CRITICALs
 
-- [ ] **W15-C02** `[TT]` Tab5 httpd handle never stored/stopped — `debug_server.c:2009-2131`. (GitHub `TinkerTab#94`.)
-- [ ] **W15-C03** `[TB]` PIL `Image.open` leaks FDs on upload + render — `api/media_routes.py:110`, `media/pipeline.py:483`.
-- [ ] **W15-C04** `[TB]` Backend-swap race on `ws.closed` check — `server.py:1545`.
+- [x] **W15-C02** `[TT]` Tab5 httpd handle never stored/stopped — `debug_server.c:2009-2131`. (GitHub `TinkerTab#94`.) · verified: PR lorcan35/TinkerTab#96. Stored httpd handle in file-scoped static + tab5_debug_server_stop() public API + idempotent init. Flashed to Tab5 192.168.1.90, /selftest 6/6 pass. Also closed TT #94 as misdiagnosed — port 3500 vs 8080.
+- [x] **W15-C03** `[TB]` PIL `Image.open` leaks FDs on upload + render — `api/media_routes.py:110`, `media/pipeline.py:483`. · verified: PR #53. Image.open wrapped in ctx mgr at both sites (api/media_routes.py upload, media/pipeline.py render). Live-verified: 30 uploads + 30 renders → FD count flat at 14 (was 14→74 pre-fix). 3-case regression test in tests/test_media_fd_leak.py.
+- [x] **W15-C04** `[TB]` Backend-swap race on `ws.closed` check — `server.py:1545`. · verified: PR #53. Swap-error send now goes through _safe_send_json (existing helper) — no TOCTOU between ws.closed check and send. Also added ws_id to logger.exception for traceability.
 
 ## Phase 3 — HIGH
 
 - [ ] **W15-H01** `[TB]` Rate limit state-changing endpoints
 - [ ] **W15-H02** `[TB]` 32 MB app limit vs 10 MB upload cap mismatch
 - [ ] **W15-H03** `[TB]` `_handle_disconnect` bg-task cancel race
-- [ ] **W15-H04** `[TB]` `Image.open` decode result not validated
+- [x] **W15-H04** `[TB]` `Image.open` decode result not validated · verified: folded into C03 — .size access now in try/except, returns 400 on partial decode
 - [ ] **W15-H05** `[TB]` Broad except in `pipeline.finish_dictation`
 - [ ] **W15-H06** `[TB]` SSE reconnect amplification on `/chat`
 - [ ] **W15-H07** `[TB]` WS upgrade 401 path lacks integration test
@@ -79,3 +79,6 @@ _(filled in as we close items — template: `PR#` · branch · items closed · e
 
 ## Session log
 _(append date-prefixed notes as phases land)_
+
+## Added during execution
+- [ ] **W15-C05** `[TT]` CRITICAL — Tab5 panics on Dragon WS disconnect · `exc_pc=0xA5A5A5A5` = FreeRTOS freed-stack poison = use-after-free · reliably reproduced with `systemctl restart tinkerclaw-voice` · filed as TinkerTab#95. This is the actual root cause of the "Dragon unreachable" user-visible regression (not a UI banner flash). Needs coredump pull + fault-site pinning.

@@ -62,6 +62,42 @@ _SILENCE_THRESHOLD = 500  # RMS amplitude below this = silence (int16 range)
 MAX_AUDIO_BUFFER = 5 * 60 * 16000 * 2  # 9,600,000 bytes
 
 
+# Wave 15 W15-C01: stable signatures for the shared backend pool.  Two
+# pipelines with the same (backend, model) signature can share a
+# backend instance — the per-connection state (audio buffer, VAD,
+# conversation) lives on the pipeline itself, not on the backend.
+def _stt_sig(stt_config) -> tuple:
+    return ("stt", stt_config.backend, getattr(stt_config, "model", ""))
+
+
+def _tts_sig(tts_config) -> tuple:
+    return (
+        "tts",
+        tts_config.backend,
+        getattr(tts_config, "piper_model", "")
+        or getattr(tts_config, "kokoro_model", "")
+        or "",
+    )
+
+
+def _llm_sig(llm_config) -> tuple:
+    # Model name varies per backend — grab the one that's actually used
+    # so a pool hit requires *identical* model too (otherwise reloading
+    # the LLM is semantically required).
+    be = llm_config.backend
+    if be == "ollama":
+        model = getattr(llm_config, "ollama_model", "")
+    elif be == "openrouter":
+        model = getattr(llm_config, "openrouter_model", "")
+    elif be == "tinkerclaw":
+        model = getattr(llm_config, "tinkerclaw_model", "")
+    elif be == "lmstudio":
+        model = getattr(llm_config, "lmstudio_model", "")
+    else:
+        model = ""
+    return ("llm", be, model)
+
+
 class VoicePipeline:
     """Orchestrates the full STT -> LLM -> TTS voice pipeline.
 
@@ -77,6 +113,7 @@ class VoicePipeline:
         conversation_engine=None,
         session_id: str = "",
         media_pipeline=None,
+        backend_pool: Optional[dict] = None,
     ) -> None:
         """Initialize the pipeline.
 
@@ -91,6 +128,9 @@ class VoicePipeline:
                                (which stores messages in DB for context).
             session_id: Active session ID (required if conversation_engine is set).
             media_pipeline: Optional MediaPipeline for rich media detection.
+            backend_pool: Optional dict for sharing backends across pipelines
+                (see W15-C01).  When provided, compatible backends are
+                borrowed from the pool instead of re-initialising them.
         """
         self._config = config
         self._on_audio = on_audio
@@ -102,6 +142,17 @@ class VoicePipeline:
         self._stt: Optional[STTBackend] = None
         self._tts: Optional[TTSBackend] = None
         self._llm: Optional[LLMBackend] = None
+
+        # Wave 15 W15-C01: backend-pool support — when the server hands
+        # us a pool dict (keyed by a stable signature tuple), we reuse
+        # existing backend instances across WS reconnects instead of
+        # reloading the ~140 MB Moonshine model every time Tab5 bounces.
+        # When a backend is borrowed from the pool, _pooled_* flips True
+        # so shutdown() knows to skip .shutdown() on it.
+        self._backend_pool: Optional[dict] = backend_pool
+        self._pooled_stt = False
+        self._pooled_tts = False
+        self._pooled_llm = False
 
         # Audio buffer for incoming PCM data
         self._audio_buffer = bytearray()
@@ -126,25 +177,76 @@ class VoicePipeline:
         self._dictation_segments: list[str] = []
 
     async def initialize(self) -> None:
-        """Create and initialize all backends."""
+        """Create and initialize all backends.
+
+        W15-C01: when `self._backend_pool` is set, backends are borrowed
+        by signature and their `.initialize()` runs at most once per
+        server lifetime.  Tab5 reconnects no longer trigger a Moonshine
+        model reload (~140 MB / reconnect leak).
+        """
         logger.info("Initializing voice pipeline...")
 
-        self._stt = create_stt(self._config.stt)
-        self._tts = create_tts(self._config.tts)
-        self._llm = create_llm(self._config.llm)
+        pool = self._backend_pool
+        stt_key = _stt_sig(self._config.stt)
+        tts_key = _tts_sig(self._config.tts)
+        llm_key = _llm_sig(self._config.llm)
 
-        # Initialize in parallel
-        await asyncio.gather(
-            self._stt.initialize(),
-            self._tts.initialize(),
-            self._llm.initialize(),
-        )
+        stt_new = False
+        tts_new = False
+        llm_new = False
+
+        if pool is not None and stt_key in pool:
+            self._stt = pool[stt_key]
+            self._pooled_stt = True
+        else:
+            self._stt = create_stt(self._config.stt)
+            stt_new = True
+
+        if pool is not None and tts_key in pool:
+            self._tts = pool[tts_key]
+            self._pooled_tts = True
+        else:
+            self._tts = create_tts(self._config.tts)
+            tts_new = True
+
+        if pool is not None and llm_key in pool:
+            self._llm = pool[llm_key]
+            self._pooled_llm = True
+        else:
+            self._llm = create_llm(self._config.llm)
+            llm_new = True
+
+        init_tasks = []
+        if stt_new:
+            init_tasks.append(self._stt.initialize())
+        if tts_new:
+            init_tasks.append(self._tts.initialize())
+        if llm_new:
+            init_tasks.append(self._llm.initialize())
+
+        if init_tasks:
+            await asyncio.gather(*init_tasks)
+
+        # Register freshly-initialized backends in the pool so the next
+        # pipeline can borrow them.  Flipping `_pooled_* = True` here
+        # guarantees that when THIS pipeline shuts down it won't kill
+        # the backend it just contributed — the pool is now the owner.
+        if pool is not None:
+            if stt_new:
+                pool[stt_key] = self._stt
+                self._pooled_stt = True
+            if tts_new:
+                pool[tts_key] = self._tts
+                self._pooled_tts = True
+            if llm_new:
+                pool[llm_key] = self._llm
+                self._pooled_llm = True
 
         logger.info(
-            "Pipeline ready — STT=%s, TTS=%s, LLM=%s",
-            self._stt.name,
-            self._tts.name,
-            self._llm.name,
+            "Pipeline ready — STT=%s%s, TTS=%s%s, LLM=%s%s",
+            self._stt.name, " (pooled)" if self._pooled_stt else "",
+            self._tts.name, " (pooled)" if self._pooled_tts else "",
+            self._llm.name, " (pooled)" if self._pooled_llm else "",
         )
 
     async def feed_audio(self, audio_bytes: bytes) -> None:
@@ -906,40 +1008,66 @@ class VoicePipeline:
             old_config = self._config
             self._config = config
 
+            # W15-C01: pool-aware swap — prefer reusing existing pooled
+            # backend for the NEW signature; only tear down the old one
+            # if it wasn't pooled.
+            pool = self._backend_pool
             tasks = []
 
-            # Check if STT backend changed
+            # STT
             if (
                 config.stt.backend != old_config.stt.backend
                 or config.stt.model != old_config.stt.model
             ):
                 logger.info("Swapping STT: %s -> %s", old_config.stt.backend, config.stt.backend)
-                if self._stt:
+                if self._stt and not self._pooled_stt:
                     await self._stt.shutdown()
-                self._stt = create_stt(config.stt)
-                tasks.append(self._stt.initialize())
+                new_key = _stt_sig(config.stt)
+                if pool is not None and new_key in pool:
+                    self._stt = pool[new_key]
+                    self._pooled_stt = True
+                else:
+                    self._stt = create_stt(config.stt)
+                    self._pooled_stt = False
+                    tasks.append((self._stt, new_key, "stt"))
 
-            # Check if TTS backend changed
+            # TTS
             if config.tts.backend != old_config.tts.backend:
                 logger.info("Swapping TTS: %s -> %s", old_config.tts.backend, config.tts.backend)
-                if self._tts:
+                if self._tts and not self._pooled_tts:
                     await self._tts.shutdown()
-                self._tts = create_tts(config.tts)
-                tasks.append(self._tts.initialize())
+                new_key = _tts_sig(config.tts)
+                if pool is not None and new_key in pool:
+                    self._tts = pool[new_key]
+                    self._pooled_tts = True
+                else:
+                    self._tts = create_tts(config.tts)
+                    self._pooled_tts = False
+                    tasks.append((self._tts, new_key, "tts"))
 
-            # Check if LLM backend changed
+            # LLM
             if (
                 config.llm.backend != old_config.llm.backend
                 or config.llm.ollama_model != old_config.llm.ollama_model
             ):
                 logger.info("Swapping LLM: %s -> %s", old_config.llm.backend, config.llm.backend)
-                if self._llm:
+                if self._llm and not self._pooled_llm:
                     await self._llm.shutdown()
-                self._llm = create_llm(config.llm)
-                tasks.append(self._llm.initialize())
+                new_key = _llm_sig(config.llm)
+                if pool is not None and new_key in pool:
+                    self._llm = pool[new_key]
+                    self._pooled_llm = True
+                else:
+                    self._llm = create_llm(config.llm)
+                    self._pooled_llm = False
+                    tasks.append((self._llm, new_key, "llm"))
 
             if tasks:
-                await asyncio.gather(*tasks)
+                await asyncio.gather(*(t[0].initialize() for t in tasks))
+                # Register freshly-created backends in the pool.
+                if pool is not None:
+                    for backend, key, _kind in tasks:
+                        pool[key] = backend
                 logger.info("Backend swap complete")
         finally:
             # US-P01: Re-enable audio ingestion after swap completes (or fails)
@@ -966,14 +1094,21 @@ class VoicePipeline:
         return self._processing
 
     async def shutdown(self) -> None:
-        """Shut down all backends."""
+        """Shut down all backends.
+
+        W15-C01: backends borrowed from the server-level pool are NOT
+        shut down here — the pool owns their lifecycle and will release
+        them on server shutdown.  Only backends this pipeline personally
+        created (pool miss, or cloud-mode per-connection instance) get
+        their `.shutdown()` called.
+        """
         await self.cancel()
         tasks = []
-        if self._stt:
+        if self._stt and not self._pooled_stt:
             tasks.append(self._stt.shutdown())
-        if self._tts:
+        if self._tts and not self._pooled_tts:
             tasks.append(self._tts.shutdown())
-        if self._llm:
+        if self._llm and not self._pooled_llm:
             tasks.append(self._llm.shutdown())
         # Pre-warmed fallback backends (from P1 STT/TTS cache fix).
         fb_stt = getattr(self, "_fallback_stt", None)

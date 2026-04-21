@@ -10,7 +10,7 @@ Canonical status for every item in [docs/AUDIT-WAVE-15.md](AUDIT-WAVE-15.md). Up
 
 ## Phase 1 — Unblock
 
-- [ ] **W15-C01** `[TB]` Dragon RSS leak (~2 MB/min) — the real fix for the W14-H18 bandaid. Instrument tracemalloc at 1 min / 10 min / 30 min / 60 min / 4 h, identify which long-lived object is accumulating, fix, 4 h soak verifies RSS stays within ±10% baseline. (GitHub `TinkerBox#50`.)
+- [~] **W15-C01** `[TB]` Dragon RSS leak · **root-cause found + fix implemented, 15-min soak in progress**. The leak was **VoicePipeline + Moonshine being re-created on every Tab5 WS reconnect**. Tab5 reconnects every 2–3 min (its own watchdog cycle), and each reconnect called `STT.initialize()` → new `Transcriber` → new ORT `InferenceSession` → fresh 140 MB of mmap'd model + tensor arenas. `Transcriber.close()` did NOT release the ORT memory to the OS (known ORT behavior — native allocator pool stays resident). Before-fix smaps showed `decoder_kv.ort` mmap'd TWICE (285 MB duplicate) in a freshly-restarted process. **Fix**: server-level backend pool keyed by stable signature `(kind, backend_name, model_name)`. Pipelines borrow from the pool; only the pool owns shutdown lifecycle. After-fix: 1 Moonshine load on startup, every subsequent WS reconnect logs "Pipeline ready — STT=Moonshine (pooled), TTS=Piper (pooled), LLM=Ollama (pooled)", smaps shows 1 `decoder_kv.ort` mapping. Regression test: `tests/test_backend_pool.py` (5 cases, all passing). GitHub `TinkerBox#50`.
 
 ## Phase 2 — CRITICALs
 

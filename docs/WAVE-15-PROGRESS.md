@@ -81,4 +81,4 @@ _(filled in as we close items — template: `PR#` · branch · items closed · e
 _(append date-prefixed notes as phases land)_
 
 ## Added during execution
-- [ ] **W15-C05** `[TT]` CRITICAL — Tab5 panics on Dragon WS disconnect · `exc_pc=0xA5A5A5A5` = FreeRTOS freed-stack poison = use-after-free · reliably reproduced with `systemctl restart tinkerclaw-voice` · filed as TinkerTab#95. This is the actual root cause of the "Dragon unreachable" user-visible regression (not a UI banner flash). Needs coredump pull + fault-site pinning.
+- [x] **W15-C05** `[TT]` CRITICAL — Tab5 panics on Dragon WS disconnect · `exc_pc=0xA5A5A5A5` = FreeRTOS freed-stack poison = use-after-free · reliably reproduced with `systemctl restart tinkerclaw-voice` · filed as TinkerTab#95. This is the actual root cause of the "Dragon unreachable" user-visible regression (not a UI banner flash). Needs coredump pull + fault-site pinning. · verified: heap_wd dma_exhausted panic (NOT a UAF as originally filed). Threshold 16K→4K, grace list extended to CONNECTING+RECONNECTING, reboot count 2→5. Dragon restart now leaves Tab5 uptime monotonic (+100s). /coredump endpoint added. PR TT#97.

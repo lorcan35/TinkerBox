@@ -42,7 +42,7 @@ Each of these removes friction that slows everything after it.
 - [x] **W14-H06** `[TT]` unified suspended-task worker pattern (mode_switch / wifi / media_fetch / drawer_fetch) · new `main/task_worker.{h,c}` single-queue single-worker; 4 task families converted from one-shot-spawn-then-suspend to plain job fns enqueued onto the worker. Live proof: 20 mic taps, tasks count stable at 26 (pre-H06 would have been 46), psram_free −424 bytes (vs expected 160 KB leak). Home UI re-renders clean post-overlay-dismiss.
 - [x] **W14-H07** `[TT]` bump stacks: `sd_record_task` + `playback_task_fn` to 8 KB, `heap_watchdog_task` to 4 KB · TinkerTab · verified: flashed, boots clean, 25 tasks live, wifi/dragon/voice connected, heap_min=21724236 stable, home screenshot clean
 - [x] **W14-H08** `[TB]` `asyncio.to_thread` / `web.FileResponse` for 6 sync file-read sites · api/synthesize.py (ota_check + ota_firmware), api/system.py (meminfo+loadavg), tools/system_tool.py (3 /proc reads), tts/piper_tts.py (voice config). Ruff ASYNC230 now 0. Live /api/v1/system + /api/ota/check + system_info tool all green.
-- [ ] **W14-H09** `[TB]` MediaStore offload (`cleanup` + `store`) via `to_thread`; add default ClientTimeout
+- [x] **W14-H09** `[TB]` MediaStore offload (`cleanup` + `store`) via `to_thread`; add default ClientTimeout · verified: MediaStore.store + cleanup offloaded via asyncio.to_thread; ClientTimeout already set from M10; pytest 121/121 green; live deploy to Dragon — 17%% RAM, 1 WS session live.
 - [x] **W14-H10** `[TB]` `purge_old_messages` batching (`LIMIT N` + `asyncio.sleep(0)`); `executemany` for ingest · db.py batched at 500 rows/loop with yield; pytest green
 - [x] **W14-H11** `[TB]` `MemoryService` shared ClientSession lifecycle · memory.py._http_session + shutdown · live store+search+delete cycle green
 - [x] **W14-H12** `[TB]` `MediaPipeline.close()` on shutdown (folded into H09) · wired in server._on_shutdown
@@ -68,16 +68,16 @@ Each of these removes friction that slows everything after it.
 - [x] **W14-M04** `[TT]` check `fread`/`fwrite` returns in WAV-header repair · all 4 fseek/fread/fwrite returns checked; garbage-on-short-read corruption vector closed
 - [ ] **W14-M05** `[TB]` switch `serve_media` to `web.FileResponse` (folded into H08)
 - [x] **W14-M06** `[TB]` response-headers middleware (CSP, X-CTO, X-Frame-Options, Referrer-Policy) · outermost middleware stamps on every response incl. 401s; 3 pytest cases; live curl -sI confirms all 4 headers on /health and 401 path.
-- [ ] **W14-M07** `[TB]` TinkerClaw gateway SSE chunk validation + length cap
+- [x] **W14-M07** `[TB]` TinkerClaw gateway SSE chunk validation + length cap · verified: TinkerClaw SSE parser caps: per-line 256 KiB, total 16 MiB, 50K tokens. Aborts with honest truncation msg instead of OOM. 121/121 pytest.
 - [x] **W14-M08** `[TT]` log `receipt_attach`/`voice_async_*` OOM drops · `ESP_LOGW` on all 3 drop paths
 - [ ] **W14-M09** `[TB]` `cancel() + await` `_periodic_purge` (wave 13 H3 pattern)
 - [ ] **W14-M10** `[TB]` ClientTimeout on MediaPipeline session (folded into H09)
 - [x] **W14-M11** `[TB]` call `config.validate()` at end of `load_config`; raise on error · load_config now raises ValueError with actionable message on invalid backend string
 - [x] **W14-M12** `[TB]` `NotesDB.update` single UPDATE with COALESCE; log unknown keys · new `_UPDATABLE` frozenset + warning log on dropped keys (atomic write under _write_lock preserved)
-- [ ] **W14-M13** `[TB]` route `PiperBackend._ensure_model` consistently through executor
+- [x] **W14-M13** `[TB]` route `PiperBackend._ensure_model` consistently through executor · verified: PiperBackend._ensure_model now runs in inference_executor — 2×120 s wget no longer stalls event loop on cold boot.
 - [x] **W14-M14** `[TB]` `datetime.now(timezone.utc)` + `ClassVar[frozenset]` for CORS allowlist · datetime_tool.py + timer_tool.py tz-aware; `_CORS_ALLOWED_ORIGINS` now `ClassVar[frozenset]`
 - [ ] **W14-M15** `[TB]` type annotations on DI entry points; `mypy --strict` on `api/`
-- [ ] **W14-M17** `[OPS]` kill `tinkeraimcp` tunnel; basic_auth on dashboard+gateway
+- [x] **W14-M17** `[OPS]` kill `tinkeraimcp` tunnel; basic_auth on dashboard+gateway · verified: Killed tinkeraimcp.ngrok.dev (404), added basic_auth to dashboard+gateway (401 unauth / 200 authed verified live), voice stays bearer-only.
 - [ ] **W14-M18** `[DOC]` update IDF pin references in TinkerTab/CLAUDE.md to 5.5.2
 - [ ] **W14-M19** `[DOC]` update debug-server endpoint count 22 → 26 (or drop)
 - [ ] **W14-M20** `[DOC]` update test counts: pipeline 28, aggregate 40
@@ -92,10 +92,10 @@ Each of these removes friction that slows everything after it.
 - [x] **W14-L04** `[TB]` clamp + try/except in `parse_pagination` · non-numeric limit no longer raises 500; negative offset clamped to 0. Live curl `?limit=abc` returns 200.
 - [x] **W14-L05** `[TB]` `/api/ota/check` read canonical host from config · prefer version.json's `url` field; falls back to request.host for back-compat
 - [x] **W14-L06** `[OPS]` logging.Filter redacting Bearer/sk- patterns · installed in `dragon_voice/__main__.py`; covers Bearer tokens, `sk-*` keys, and json `api_token`/`tinkerclaw_token` values
-- [ ] **W14-L07** `[OPS]` `scripts/deploy-firmware.sh` atomic sha+json write
+- [x] **W14-L07** `[OPS]` `scripts/deploy-firmware.sh` atomic sha+json write · verified: New scripts/deploy-firmware.sh — stage-then-rename atomic publish; live-tested twice; /api/ota/check sha matches local sha.
 - [ ] **W14-L08** `[OPS]` `tinkerclaw-mdns` drop-in with `DynamicUser=true`
-- [ ] **W14-L09** `[DOC]` Tab5 CLAUDE.md Key Files sweep against `ls main/`
-- [ ] **W14-L10** `[DOC]` replace Recovery & Rollback section with tag-based rule
+- [x] **W14-L09** `[DOC]` Tab5 CLAUDE.md Key Files sweep against `ls main/` · verified: Key Files rebuilt from ls main/ — 90+ sources grouped into seven topical sections; stale v0.8.0 ref dropped.
+- [x] **W14-L10** `[DOC]` replace Recovery & Rollback section with tag-based rule · verified: Recovery & Rollback rewrite — three-layer protocol (OTA auto-rollback / re-flash from Dragon / git revert) replaces stale 2026-03-31 physical-backup pointers.
 - [ ] **W14-L11** `[DOC]` protocol.md §2.1 add `capabilities.widgets` subsection (folded into H19)
 - [x] **W14-L12** `[TB]` `conftest.py` for `test_foundation.py` scoped fixture · session-scoped `_session_db_root` autouse fixture in `tests/conftest.py`; CI's multi-file pytest invocation no longer accumulates /tmp noise
 

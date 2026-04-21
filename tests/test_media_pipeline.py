@@ -22,7 +22,6 @@ from dragon_voice.media.pipeline import (
     MAX_MEDIA_PER_RESPONSE,
     MediaPipeline,
     _extract_table,
-    _og_meta,
     _parse_table,
     _render_code_plain,
     _render_table_pillow,
@@ -297,27 +296,9 @@ def test_extract_table_stops_at_non_pipe_line():
     assert "| A | B |" in result
 
 
-# ── _og_meta ─────────────────────────────────────────────────────────────────
-
-
-def test_og_meta_property_before_content():
-    html = '<meta property="og:title" content="My Title">'
-    assert _og_meta(html, "og:title") == "My Title"
-
-
-def test_og_meta_content_before_property():
-    html = '<meta content="My Title" property="og:title">'
-    assert _og_meta(html, "og:title") == "My Title"
-
-
-def test_og_meta_not_found():
-    html = '<meta property="og:description" content="desc">'
-    assert _og_meta(html, "og:title") is None
-
-
-def test_og_meta_twitter_card():
-    html = '<meta name="twitter:title" content="Tweet Title">'
-    assert _og_meta(html, "twitter:title") == "Tweet Title"
+# Wave 5 (audit H12) removed _og_meta + fetch_link_preview from
+# dragon_voice/media/pipeline.py as dead code (never called from the live
+# path). The four tests that exercised that helper are deleted here to match.
 
 
 # ── render_code_block (unit, no I/O) ────────────────────────────────────────

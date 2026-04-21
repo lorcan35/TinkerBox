@@ -27,6 +27,13 @@ DRAGON_WS = os.environ.get("DRAGON_URL", "ws://192.168.1.91:3502/ws/voice")
 DRAGON_HTTP = os.environ.get("DRAGON_HTTP", "http://192.168.1.91:3502")
 TAB5_URL = os.environ.get("TAB5_URL", "http://192.168.1.90:8080")
 TOKEN = os.environ.get("TAB5_TOKEN", "05eed3b13bf62d92cfd8ac424438b9f2")
+# Wave 13 C2: all Dragon private REST routes now require a bearer token.
+# Existing stories hitting /api/v1/memory etc. were getting 401; pass the
+# token via DRAGON_API_TOKEN env for every aiohttp session here.
+DRAGON_API_TOKEN = os.environ.get("DRAGON_API_TOKEN", "").strip()
+DRAGON_AUTH_HEADERS = (
+    {"Authorization": f"Bearer {DRAGON_API_TOKEN}"} if DRAGON_API_TOKEN else {}
+)
 
 results: list[tuple[str, bool, str]] = []
 
@@ -80,7 +87,7 @@ async def _collect(ws, until: str = "tts_end", timeout: int = 30):
 async def story_d6_code_block():
     """User asks for a Python snippet in Cloud. Dragon renders JPEG, Tab5
     gets media event AFTER text_update clears the raw markdown bubble."""
-    async with aiohttp.ClientSession() as s:
+    async with aiohttp.ClientSession(headers=DRAGON_AUTH_HEADERS) as s:
         async with s.ws_connect(DRAGON_WS) as ws:
             await _register(ws)
             await ws.send_json({"type": "text",
@@ -98,7 +105,7 @@ async def story_d6_code_block():
 
 # ── Story 2: Cloud tool call — no XML leak, tool events fire ──────────────
 async def story_d5_cloud_tool_call():
-    async with aiohttp.ClientSession() as s:
+    async with aiohttp.ClientSession(headers=DRAGON_AUTH_HEADERS) as s:
         async with s.ws_connect(DRAGON_WS) as ws:
             await _register(ws)
             await ws.send_json({"type": "text",
@@ -112,7 +119,7 @@ async def story_d5_cloud_tool_call():
 
 # ── Story 3: Mode swap mid-session survives (cloud -> local -> cloud) ─────
 async def story_mode_swap_midsession():
-    async with aiohttp.ClientSession() as s:
+    async with aiohttp.ClientSession(headers=DRAGON_AUTH_HEADERS) as s:
         async with s.ws_connect(DRAGON_WS) as ws:
             await _register(ws, voice_mode=2)
             # Drain the register/initial config_update echo backlog so the
@@ -157,7 +164,7 @@ async def story_mode_swap_midsession():
 
 # ── Story 4: Memory store then semantic recall round-trip ─────────────────
 async def story_memory_semantic_recall():
-    async with aiohttp.ClientSession() as s:
+    async with aiohttp.ClientSession(headers=DRAGON_AUTH_HEADERS) as s:
         # Store a fact
         fact_id: Optional[str] = None
         async with s.post(f"{DRAGON_HTTP}/api/v1/memory",
@@ -183,7 +190,7 @@ async def story_memory_semantic_recall():
 async def story_widget_prompt_no_handler_dismiss():
     """Emit a widget_prompt with NO handler registered, tap a choice,
     expect a widget_dismiss back (wave 8 default-dismiss guard)."""
-    async with aiohttp.ClientSession() as s:
+    async with aiohttp.ClientSession(headers=DRAGON_AUTH_HEADERS) as s:
         async with s.ws_connect(DRAGON_WS) as ws:
             await _register(ws, voice_mode=2)
             # Manually emit a widget_prompt via debug endpoint to ensure a
@@ -214,7 +221,7 @@ async def story_widget_prompt_no_handler_dismiss():
 
 # ── Story 6: sqlite-vec hybrid search result includes score ──────────────
 async def story_sqlite_vec_ranking():
-    async with aiohttp.ClientSession() as s:
+    async with aiohttp.ClientSession(headers=DRAGON_AUTH_HEADERS) as s:
         async with s.post(f"{DRAGON_HTTP}/api/v1/memory/search",
                           json={"query": "what do I drink in the morning"}) as r:
             d = await r.json()
@@ -229,7 +236,7 @@ async def story_sqlite_vec_ranking():
 async def story_session_resume_replay():
     """Connect, chat, disconnect, reconnect with same session_id, assert
     session_messages event fires with recent history."""
-    async with aiohttp.ClientSession() as s:
+    async with aiohttp.ClientSession(headers=DRAGON_AUTH_HEADERS) as s:
         # First session
         did = "resume-" + secrets.token_hex(4)
         hw = "hw-" + secrets.token_hex(6)
@@ -278,7 +285,7 @@ async def story_session_resume_replay():
 
 # ── Story 8: TC receipt model stamp is honest (not bare "tinkerclaw") ─────
 async def story_tc_receipt_model_honest():
-    async with aiohttp.ClientSession() as s:
+    async with aiohttp.ClientSession(headers=DRAGON_AUTH_HEADERS) as s:
         async with s.ws_connect(DRAGON_WS) as ws:
             await _register(ws, voice_mode=3)
             await ws.send_json({"type": "text", "content": "pick one word"})

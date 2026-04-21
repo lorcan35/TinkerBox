@@ -1,6 +1,10 @@
 server:
   host: "0.0.0.0"
   port: 3502
+  # Wave 13 C2: REST bearer token. Leave blank here — real value comes from
+  # DRAGON_API_TOKEN env (see /home/radxa/.env on Dragon). Middleware fails
+  # closed (503) on private routes if this is empty.
+  api_token: ""
 
 stt:
   backend: "moonshine"  # moonshine, whisper_cpp, vosk
@@ -42,7 +46,11 @@ llm:
 
   # TinkerClaw agent gateway (optional sidecar)
   tinkerclaw_url: "http://localhost:18789"
-  tinkerclaw_token: ""  # set to match gateway auth token
+  # Wave 13 H7: tinkerclaw_token MUST stay blank here. Inject via the
+  # TINKERCLAW_TOKEN env var (see /home/radxa/.env loaded by systemd
+  # EnvironmentFile=). TinkerClawBackend raises at construction if the
+  # token resolves to blank, so a misconfigured gateway no-ops loudly.
+  tinkerclaw_token: ""
   tinkerclaw_model: "minimax/MiniMax-M2.5"
 
   system_prompt: "You are Tinker, a helpful AI assistant. Reply in 1-2 sentences maximum. Be concise. Never simulate user responses. Never generate text after your answer. Stop immediately after answering."

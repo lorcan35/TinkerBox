@@ -87,7 +87,7 @@ class VoiceServer:
         """Create and configure the aiohttp application."""
         app = web.Application(
             client_max_size=32 * 1024 * 1024,  # 32MB for audio uploads
-            middlewares=[self._cors_middleware],
+            middlewares=[self._cors_middleware, self._auth_middleware],
         )
 
         # HTTP routes (legacy)
@@ -138,12 +138,60 @@ class VoiceServer:
             return web.Response(headers={
                 "Access-Control-Allow-Origin": origin,
                 "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type, X-Sample-Rate, Accept",
+                "Access-Control-Allow-Headers": "Content-Type, X-Sample-Rate, Accept, Authorization",
                 "Access-Control-Max-Age": "3600",
             })
         response = await handler(request)
         response.headers["Access-Control-Allow-Origin"] = origin
         return response
+
+    # ----------------------------------------------------------------- Auth
+    #
+    # Wave 13 C2 security: bearer-token auth on every privileged route.
+    # Matches the scheme docs/protocol.md calls out for Tab5 debug server;
+    # the token is read from config.yaml (reads DRAGON_API_TOKEN env)
+    # and can be rotated without code changes.  Public paths are allowlisted
+    # (health, WS handshake is separately gated via the `register` frame).
+    _AUTH_PUBLIC_PREFIXES = (
+        "/health",              # liveness probe
+        "/ws/voice",            # WS handshake; auth is at `register` time
+        "/dashboard",           # proxied to localhost:3500 (separately gated)
+        "/api/media/",          # rendered media fetch — authenticated by ID obscurity
+    )
+
+    @web.middleware
+    async def _auth_middleware(self, request: web.Request, handler):
+        path = request.path or "/"
+        # Never gate OPTIONS (CORS middleware already answered it).
+        if request.method == "OPTIONS":
+            return await handler(request)
+        if any(path == p or path.startswith(p) for p in self._AUTH_PUBLIC_PREFIXES):
+            return await handler(request)
+        # Resolve the expected token once from config (hot-reload-safe).
+        expected = (getattr(self._config.server, "api_token", "") or "").strip()
+        if not expected:
+            # Token not configured — fail closed on private paths to avoid
+            # accidentally exposing everything when a deployer forgets.
+            # During local-dev bootstrap, set `api_token: ""` in config.yaml
+            # explicitly to an empty-string marker + allowlist the paths.
+            return web.json_response(
+                {"error": "dragon_api_token_not_configured",
+                 "message": "Set DRAGON_API_TOKEN in env or api_token in config.yaml"},
+                status=503)
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return web.json_response(
+                {"error": "missing_bearer_token",
+                 "message": "Authorization: Bearer <token> required"},
+                status=401)
+        supplied = auth[7:].strip()
+        # Constant-time compare to avoid timing-oracle credential leaks.
+        import hmac
+        if not hmac.compare_digest(supplied, expected):
+            return web.json_response(
+                {"error": "invalid_bearer_token",
+                 "message": "token rejected"}, status=401)
+        return await handler(request)
 
     # --------------------------------------------------------------- Dashboard proxy
 
@@ -562,6 +610,16 @@ class VoiceServer:
             self._memory_monitor_task.cancel()
         if self._purge_task and not self._purge_task.done():
             self._purge_task.cancel()
+        # Wave 13 H3: the media cleanup loop was being left running on shutdown
+        # because it isn't touched here. If it was mid-sleep when the event loop
+        # closes, asyncio logs "Task was destroyed but it is pending" warnings
+        # and the 24h TTL cleaner can orphan partial deletes. Cancel + await.
+        if self._media_cleanup_task and not self._media_cleanup_task.done():
+            self._media_cleanup_task.cancel()
+            try:
+                await self._media_cleanup_task
+            except (asyncio.CancelledError, Exception):
+                pass
 
         # Shut down pipelines
         tasks = []
@@ -2102,8 +2160,13 @@ class VoiceServer:
                 })
             return
 
-        with open(image_path, "rb") as f:
-            image_b64 = base64.b64encode(f.read()).decode()
+        # Wave 13 H2: image may be up to ~8 MB (camera JPEG) -- reading on the
+        # event loop thread stalls every other WS connection. Offload the
+        # blocking read + base64 to the default executor.
+        def _read_and_encode(path: str) -> str:
+            with open(path, "rb") as f:
+                return base64.b64encode(f.read()).decode()
+        image_b64 = await asyncio.to_thread(_read_and_encode, image_path)
 
         messages = [{
             "role": "user",

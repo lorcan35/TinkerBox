@@ -28,6 +28,13 @@ from typing import Any, Awaitable, Callable, Optional, Tuple
 
 log = logging.getLogger("tab5.surface")
 
+# Wave 13 H9 (ruff F821 fix): the `prompt(..., on_action=...)` signature
+# referenced `ActionHandler` but the import lived only in manager.py, so a
+# runtime-evaluated annotation (outside `from __future__ import annotations`
+# semantics at class-define time) would have NameError'd.  Define the alias
+# locally so the base module is self-contained.
+ActionHandler = Callable[[str, dict], Awaitable[Any]]
+
 # Type for the ws-send callable the surface uses. aiohttp WebSocketResponse.send_json
 # is async and raises on closed sockets; caller handles that.
 SendJson = Callable[[dict], Awaitable[Any]]

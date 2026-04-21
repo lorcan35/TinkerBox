@@ -541,3 +541,46 @@ sequentially across the whole file (don't restart per section).
 - **Root Cause:** `devices.hardware_id` has a UNIQUE constraint. Empty string counts as a value. The register handler doesn't fill in a default if the client omits it.
 - **Fix:** Synthetic tests now send `hardware_id: "probe-hw-" + secrets.token_hex(6)` to dodge the constraint. Real Tab5s always send a MAC-derived ID so this doesn't hit in production.
 - **Prevention:** Either make `hardware_id` default to the `device_id` if empty in `_handle_register`, or drop the UNIQUE constraint (device_id is already the PK). For synthetic/integration tests, always generate unique hardware_ids.
+
+### 69. WiFi creds plaintext in public sdkconfig.defaults
+- **Date:** 2026-04-20 (wave 13 C1)
+- **Symptom:** Audit flagged real router SSID + password baked into `TinkerTab/sdkconfig.defaults` and pushed to the public GitHub repo. Password was a rotating-but-remembered secret.
+- **Root Cause:** `sdkconfig.defaults` is the expected place to define Kconfig-backed strings, and the ESP-IDF build bakes them into the firmware. Someone added placeholders, someone else filled them in with live values, and the file kept getting committed.
+- **Fix:** Replaced live values with `CHANGEME_SET_IN_SDKCONFIG_LOCAL` markers. Added `sdkconfig.local.example` (committed) and made `sdkconfig.local` (gitignored) the deployer's override. ESP-IDF merges `sdkconfig.local` on top of `.defaults` during reconfigure. CI plants a placeholder `sdkconfig.local` in-workflow so `idf.py build` still compiles.
+- **Prevention:** Any Kconfig string that carries an environment-specific value MUST default to an obviously-invalid placeholder. If the build fails loudly when run without overrides, nobody gets tempted to "just set it here real quick". The old password is in the git history forever — rotate it on the router.
+
+### 70. Dragon REST surface had no auth
+- **Date:** 2026-04-20 (wave 13 C2)
+- **Symptom:** `/api/v1/sessions`, `/api/v1/memory`, etc. were reachable from any host on the LAN (and via ngrok from anywhere) with zero credentials. Anyone could read conversation history or inject fake sessions.
+- **Root Cause:** No middleware gated the REST routes. The WS handshake authenticated at the `register` frame, but HTTP did not.
+- **Fix:** New `_auth_middleware` in `server.py` + `ServerConfig.api_token` field + `DRAGON_API_TOKEN` env override. All routes require `Authorization: Bearer <token>` except the `_AUTH_PUBLIC_PREFIXES` allowlist (`/health`, `/ws/voice` handshake, `/dashboard`, `/api/media/`). Constant-time comparison via `hmac.compare_digest`. Fail-closed with HTTP 503 when token is unconfigured. Regression tests in `tests/test_auth_middleware.py` (6 cases).
+- **Prevention:** Every new HTTP route handler must either land under an existing public prefix or add itself to the allowlist explicitly. The middleware's fail-closed behaviour (503 on unconfigured) makes "forgot to set the token" impossible to miss.
+
+### 71. TinkerClaw gateway token silently sent as blank
+- **Date:** 2026-04-20 (wave 13 H6/H7)
+- **Symptom:** Voice mode 3 (TinkerClaw) returned 401s on every request when the config tree was missing the gateway token, but the error path surfaced only a generic "LLM unavailable" to the user.
+- **Root Cause:** `TinkerClawBackend.__init__` copied `config.tinkerclaw_token` without validation. A blank string was a valid Python value that silently produced a broken `Authorization: Bearer ` header.
+- **Fix:** Constructor now raises `ValueError` with actionable message if token resolves to blank. `TINKERCLAW_TOKEN` env override lives in `config.load_config` (same pattern as `DRAGON_API_TOKEN`). `config.yaml` ships with the placeholder blank and a comment pointing at `/home/radxa/.env`.
+- **Prevention:** Never accept a blank credential as valid config at construction time. Validate at the boundary closest to the caller so the error message carries the most context. The pattern to copy: read → strip → raise-if-blank.
+
+### 72. pipeline.py silent swallow masked WS teardown errors
+- **Date:** 2026-04-20 (wave 13 H5)
+- **Symptom:** Clients disconnecting mid-turn produced cascading "Processing failed" log spam because the secondary `_on_event({"type":"error"...})` emit would raise a wholly different `ConnectionResetError`, get logged at `exception` level by the outer `logger.exception`, and mask the original pipeline fault.
+- **Root Cause:** Three `except Exception: pass` handlers in `pipeline.py` silently swallowed all exceptions — when the inner emit failed, the primary error was still logged, but the silent pass hid a signal we actually want.
+- **Fix:** Narrowed the three silent swallowers to `(ConnectionError, RuntimeError[, AttributeError])` and replaced `pass` with a `logger.debug(...)` that names the handler. The primary `logger.exception` paths keep `except Exception` because they surface the error for diagnosis.
+- **Prevention:** If a handler is silently swallowing, narrow the catch until the specific class makes sense. `except Exception: pass` is a smell — it means the author didn't know what can fail. The acceptable version is a narrow catch of expected failure modes plus at least a `logger.debug`.
+
+### 73. ClientSession on module-global bound to wrong event loop
+- **Date:** 2026-04-20 (wave 13 H4)
+- **Symptom:** Test harness that restarted the dashboard app between tests raised `RuntimeError: Session is closed` or "Timeout context manager should be used inside a task" depending on the test ordering. Production dashboard didn't show this — only the test rig did.
+- **Root Cause:** `_client: aiohttp.ClientSession | None = None` was a module global initialized in `on_startup`. On app teardown it was set to None, but the second app's `on_startup` created a new session bound to a *new* event loop — yet helpers accessing `_client` could still see a stale reference in flight.
+- **Fix:** Moved the session onto `app[CLIENT_KEY]` (aiohttp's `AppKey` API). Helpers now take the `app` explicitly (`_fetch_json(app, url)`). Lifecycle is app-scoped; each app owns its own session.
+- **Prevention:** Never hold an aiohttp session in a module global. Use `web.AppKey` + `app[key]`. This is the pattern aiohttp 3.9+ actively recommends.
+
+### 74. media_cleanup task not cancelled on shutdown
+- **Date:** 2026-04-20 (wave 13 H3)
+- **Symptom:** Graceful shutdown logged "Task was destroyed but it is pending" for `_media_cleanup_loop` when systemd sent SIGTERM during the 24h TTL sleep.
+- **Root Cause:** `_on_shutdown` cancelled `_memory_monitor_task` and `_purge_task` but missed `_media_cleanup_task` entirely. The loop sat in `asyncio.sleep(3600)` and the event loop closed out from under it.
+- **Fix:** Added cancel + await-with-suppressed-CancelledError for `_media_cleanup_task` in `_on_shutdown`, matching the sibling cleanup tasks.
+- **Prevention:** Every `asyncio.create_task(...)` that lives past the request must be tracked in a single `self._*_task` field AND cancelled in `_on_shutdown`. Grep for `create_task` before adding a new long-lived task.
+

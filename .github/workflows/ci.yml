@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install runtime + test deps
+        run: |
+          python -m pip install --upgrade pip
+          # aiosqlite is used by dragon_voice.db but wasn't in requirements.txt.
+          pip install aiosqlite
+          pip install -r requirements.txt
+          # Test + lint tooling.
+          pip install ruff pytest pytest-asyncio
+
+      - name: Lint (ruff — real-bug gate)
+        run: |
+          # Wave 13 H9: start narrow.  The legacy tree has ~100 style
+          # findings we haven't triaged; failing CI on those would just
+          # block merges.  Gate on the codes that catch actual runtime bugs:
+          #   F821 undefined name        F811 redefinition of unused name
+          #   F722 syntax error           F823 local var referenced before assign
+          #   E999 syntax error           B006 mutable default argument
+          # Style/UP/I can be tightened in a follow-up wave.
+          ruff check --select F821,F722,F811,F823,B006 \
+            dragon_voice/ dashboard.py tests/
+
+      - name: Run unit + middleware tests
+        env:
+          DRAGON_API_TOKEN: ci-bearer-token
+          TINKERCLAW_TOKEN: ci-tc-token
+        run: |
+          # Dragon E2E suite requires a live server -- skip it in CI and only
+          # run the pure-unit + middleware tests that pass without I/O.
+          python -m pytest -v \
+            tests/test_auth_middleware.py \
+            tests/test_session_cas.py \
+            tests/test_media_store.py \
+            tests/test_media_pipeline.py \
+            tests/test_mcp_bridge.py

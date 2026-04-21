@@ -18,7 +18,7 @@ Each of these removes friction that slows everything after it.
 - [x] **W14-H15** `[OPS]` gitignore + `git rm --cached` `dependencies.lock` → green TinkerTab CI · TinkerTab `81ce620` · verified: local rebuild clean, regenerated lock has only expected patch bumps
 - [x] **W14-M16** `[OPS]` ruff gate expansion `B904,E722,B007,RUF006` + land the 17 prep fixes · TinkerBox · verified: `ruff check --select ...` all pass + 52/52 pytest green
 - [x] **W14-H16** `[OPS]` `scripts/deploy.sh` with snapshot rollback + auth-probed smoke · TinkerBox · verified: ran end-to-end against 192.168.1.91, /health polled + auth probe 401/200, rollback snapshot `/home/radxa/.deploy_rollback/20260421-143142/` populated
-- [ ] **W14-H17** `[OPS]` `tinkerclaw-backup.service` + `.timer` (hourly, 14-copy retention)
+- [x] **W14-H17** `[OPS]` `tinkerclaw-backup.service` + `.timer` (hourly, 14-copy retention) · TinkerBox · verified: triggered once, stamp=20260421-103548, `tinkerclaw-4.7MB notes-28KB cfg-1.4MB`, timer active, next fire 11:01 UTC. Backup .db contains all state tables (devices/events/memory_facts/memory_facts_fts/memory_facts_vec/memory_chunks/memory_documents). rsync + sqlite3 apt-installed on Dragon.
 
 ## Phase 2 — CRITICALs
 

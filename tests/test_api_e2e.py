@@ -6,7 +6,7 @@ Three tiers:
   2. Multi-step user stories (workflows)
   3. Complex chained user stories (cross-feature integration)
 
-Run: python3 tests/test_api_e2e.py [--host 192.168.1.89] [--port 3502]
+Run: python3 tests/test_api_e2e.py [--host 192.168.1.91] [--port 3502]
 """
 
 import argparse
@@ -632,7 +632,7 @@ async def tier3_complex_chained(t: TestRunner):
 
 async def main():
     parser = argparse.ArgumentParser(description="E2E API tests for Dragon Voice Server")
-    parser.add_argument("--host", default="192.168.1.89", help="Dragon host")
+    parser.add_argument("--host", default="192.168.1.91", help="Dragon host")
     parser.add_argument("--port", default="3502", help="Voice server port")
     parser.add_argument("--tier", type=int, default=0, help="Run specific tier (1/2/3, 0=all)")
     args = parser.parse_args()

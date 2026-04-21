@@ -50,14 +50,13 @@ Each of these removes friction that slows everything after it.
 - [x] **W14-M09** `[TB]` `cancel() + await` `_periodic_purge` (wave 13 H3 pattern) · also folded memory_monitor cancel+await
 - [x] **W14-H13** `[TB]` narrow ~17 residual `except Exception` in server/memory/media/tts · media/pipeline.py (4 sites narrowed to (OSError, ValueError, RuntimeError) + Pygments ClassNotFound), memory.py (6 sites narrowed to sqlite3.Error / aiohttp.ClientError / TimeoutError per intent), tts/edge_tts_backend.py (aiohttp+OS-only). server.py logger.exception sites left broad — they already surface bugs at exception log level. 90/90 pytest green.
 - [x] **W14-H14** `[OPS]` systemd hardening drop-ins for 6 units · 5 drop-ins installed (voice/dashboard/gateway/ngrok/mdns); iteration-2 notes for known-breaks (SystemCallFilter dropped, AF_NETLINK kept, mdns User=nobody not DynamicUser). systemd-analyze score dropped ~9.6 → 6.5 per unit. Tab5 still WS-connected through the restart cycle.
-- [ ] **W14-H18** `[OPS]` `MemoryMax=4G MemoryHigh=3G` on voice service (bandaid); file the leak as separate issue
 
 ## Phase 5 — HIGH docs + protocol
 
 - [x] **W14-H19** `[DOC]` reconcile `capabilities.widgets` / `widget_capability` / protocol.md §2.1 / §17.12 · §2.1 register now documents `capabilities.widgets` nested form; §17.12 rewritten as "wave-14 reconciliation note" pointing back; reference table updated
-- [ ] **W14-H20** `[DOC]` `clear_history` → `clear` in TinkerTab/CLAUDE.md
+- [x] **W14-H20** `[DOC]` `clear_history` → `clear` in TinkerTab/CLAUDE.md · landed in TT #89 (commit 44fe387) with H22
 - [x] **W14-H21** `[DOC]` delete `conn_mode` paragraph from TinkerBox/CLAUDE.md · removed from header + table row; voice_mode now includes 0|1|2|3
-- [ ] **W14-H22** `[DOC]` extend TinkerTab/CLAUDE.md NVS keys table with 11 missing entries
+- [x] **W14-H22** `[DOC]` extend TinkerTab/CLAUDE.md NVS keys table with 11 missing entries · landed in TT #89 alongside H20
 - [x] **W14-H23** `[DOC]` endpoint count: pick one number or generate from code · canonical count is 47 REST endpoints; 3 stale callsites all updated with grep-from-code formula
 
 ## Phase 6 — MEDIUM
@@ -66,12 +65,12 @@ Each of these removes friction that slows everything after it.
 - [x] **W14-M02** `[TT]` move overflow log outside `s_play_mutex` · already outside mutex at voice.c:394 — no code change needed; audit was against a stale snapshot
 - [x] **W14-M03** `[TT]` `volatile` on `s_ws` + `dragon_link.s_state` · both decls now `volatile`; use-after-free race on disconnect closed
 - [x] **W14-M04** `[TT]` check `fread`/`fwrite` returns in WAV-header repair · all 4 fseek/fread/fwrite returns checked; garbage-on-short-read corruption vector closed
-- [ ] **W14-M05** `[TB]` switch `serve_media` to `web.FileResponse` (folded into H08)
+- [x] **W14-M05** `[TB]` switch `serve_media` to `web.FileResponse` · folded into H08 (api/synthesize.py ota_firmware path uses FileResponse)
 - [x] **W14-M06** `[TB]` response-headers middleware (CSP, X-CTO, X-Frame-Options, Referrer-Policy) · outermost middleware stamps on every response incl. 401s; 3 pytest cases; live curl -sI confirms all 4 headers on /health and 401 path.
 - [x] **W14-M07** `[TB]` TinkerClaw gateway SSE chunk validation + length cap · verified: TinkerClaw SSE parser caps: per-line 256 KiB, total 16 MiB, 50K tokens. Aborts with honest truncation msg instead of OOM. 121/121 pytest.
 - [x] **W14-M08** `[TT]` log `receipt_attach`/`voice_async_*` OOM drops · `ESP_LOGW` on all 3 drop paths
-- [ ] **W14-M09** `[TB]` `cancel() + await` `_periodic_purge` (wave 13 H3 pattern)
-- [ ] **W14-M10** `[TB]` ClientTimeout on MediaPipeline session (folded into H09)
+- [x] **W14-M09** `[TB]` `cancel() + await` `_periodic_purge` (wave 13 H3 pattern) · landed alongside batch 1 (see Phase 4 entry)
+- [x] **W14-M10** `[TB]` ClientTimeout on MediaPipeline session · folded into H09 (`_get_http_session` sets `ClientTimeout(total=30, sock_connect=5)` as default; per-call proxy_image still overrides with tighter budget)
 - [x] **W14-M11** `[TB]` call `config.validate()` at end of `load_config`; raise on error · load_config now raises ValueError with actionable message on invalid backend string
 - [x] **W14-M12** `[TB]` `NotesDB.update` single UPDATE with COALESCE; log unknown keys · new `_UPDATABLE` frozenset + warning log on dropped keys (atomic write under _write_lock preserved)
 - [x] **W14-M13** `[TB]` route `PiperBackend._ensure_model` consistently through executor · verified: PiperBackend._ensure_model now runs in inference_executor — 2×120 s wget no longer stalls event loop on cold boot.
@@ -96,7 +95,7 @@ Each of these removes friction that slows everything after it.
 - [ ] **W14-L08** `[OPS]` `tinkerclaw-mdns` drop-in with `DynamicUser=true`
 - [x] **W14-L09** `[DOC]` Tab5 CLAUDE.md Key Files sweep against `ls main/` · verified: Key Files rebuilt from ls main/ — 90+ sources grouped into seven topical sections; stale v0.8.0 ref dropped.
 - [x] **W14-L10** `[DOC]` replace Recovery & Rollback section with tag-based rule · verified: Recovery & Rollback rewrite — three-layer protocol (OTA auto-rollback / re-flash from Dragon / git revert) replaces stale 2026-03-31 physical-backup pointers.
-- [ ] **W14-L11** `[DOC]` protocol.md §2.1 add `capabilities.widgets` subsection (folded into H19)
+- [x] **W14-L11** `[DOC]` protocol.md §2.1 add `capabilities.widgets` subsection · folded into H19 (§2.1 register frame now documents nested `capabilities.widgets` object)
 - [x] **W14-L12** `[TB]` `conftest.py` for `test_foundation.py` scoped fixture · session-scoped `_session_db_root` autouse fixture in `tests/conftest.py`; CI's multi-file pytest invocation no longer accumulates /tmp noise
 
 ---

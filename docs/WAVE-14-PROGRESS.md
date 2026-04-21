@@ -39,7 +39,7 @@ Each of these removes friction that slows everything after it.
 
 ## Phase 4 — HIGH stability (firmware + server)
 
-- [ ] **W14-H06** `[TT]` unified suspended-task worker pattern (mode_switch / wifi / media_fetch / drawer_fetch)
+- [x] **W14-H06** `[TT]` unified suspended-task worker pattern (mode_switch / wifi / media_fetch / drawer_fetch) · new `main/task_worker.{h,c}` single-queue single-worker; 4 task families converted from one-shot-spawn-then-suspend to plain job fns enqueued onto the worker. Live proof: 20 mic taps, tasks count stable at 26 (pre-H06 would have been 46), psram_free −424 bytes (vs expected 160 KB leak). Home UI re-renders clean post-overlay-dismiss.
 - [x] **W14-H07** `[TT]` bump stacks: `sd_record_task` + `playback_task_fn` to 8 KB, `heap_watchdog_task` to 4 KB · TinkerTab · verified: flashed, boots clean, 25 tasks live, wifi/dragon/voice connected, heap_min=21724236 stable, home screenshot clean
 - [x] **W14-H08** `[TB]` `asyncio.to_thread` / `web.FileResponse` for 6 sync file-read sites · api/synthesize.py (ota_check + ota_firmware), api/system.py (meminfo+loadavg), tools/system_tool.py (3 /proc reads), tts/piper_tts.py (voice config). Ruff ASYNC230 now 0. Live /api/v1/system + /api/ota/check + system_info tool all green.
 - [ ] **W14-H09** `[TB]` MediaStore offload (`cleanup` + `store`) via `to_thread`; add default ClientTimeout

@@ -283,6 +283,14 @@ class VoiceServer:
                 from dragon_voice.tools.timesense_tool import TimesenseTool
                 self._tool_registry.register(TimesenseTool(self._surface_mgr))
                 logger.info("TimesenseTool registered (widget emitter)")
+                # Wave 12 skill SDK: QuickPollTool is the reference
+                # for docs/SKILL_AUTHORING.md — declarative
+                # surface.prompt(on_action=handler), no imperative
+                # register_action bookkeeping.  ~80 LOC total, a
+                # minimal viable widget skill.
+                from dragon_voice.tools.quick_poll_tool import QuickPollTool
+                self._tool_registry.register(QuickPollTool(self._surface_mgr))
+                logger.info("QuickPollTool registered (declarative widget skill)")
             except Exception as e:
                 logger.warning("TimesenseTool registration failed: %s", e)
 

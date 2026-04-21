@@ -130,7 +130,15 @@ class ConversationEngine:
                     tool_calls_made += 1
                     logger.info("Tool call (sync): %s(%s)", tool_call["tool"], tool_call["args"])
 
-                    result = await self._tool_registry.execute(tool_call["tool"], tool_call["args"])
+                    # Wave 12 skill SDK: inject session_id so skills can
+                    # resolve the per-Tab5 surface via
+                    # SurfaceManager.surface_for(session_id, skill_id).
+                    # Without this the skill pulls "unknown" and no
+                    # widget ever reaches the user.  Existing tools that
+                    # don't need session continue to ignore the key.
+                    _args = dict(tool_call["args"] or {})
+                    _args.setdefault("session_id", session_id)
+                    result = await self._tool_registry.execute(tool_call["tool"], _args)
 
                     import json as _json
                     await self._messages.add_message(
@@ -277,7 +285,15 @@ class ConversationEngine:
                             logger.debug("Callback error: %s", e)
 
                     # Execute the tool
-                    result = await self._tool_registry.execute(tool_call["tool"], tool_call["args"])
+                    # Wave 12 skill SDK: inject session_id so skills can
+                    # resolve the per-Tab5 surface via
+                    # SurfaceManager.surface_for(session_id, skill_id).
+                    # Without this the skill pulls "unknown" and no
+                    # widget ever reaches the user.  Existing tools that
+                    # don't need session continue to ignore the key.
+                    _args = dict(tool_call["args"] or {})
+                    _args.setdefault("session_id", session_id)
+                    result = await self._tool_registry.execute(tool_call["tool"], _args)
 
                     if on_tool_result:
                         try:

@@ -623,7 +623,7 @@ class VoiceServer:
 
         # Shut down pipelines
         tasks = []
-        for ws_id, conn in list(self._active_connections.items()):
+        for _ws_id, conn in list(self._active_connections.items()):
             pipeline = conn.get("pipeline")
             if pipeline:
                 tasks.append(pipeline.shutdown())
@@ -1098,6 +1098,10 @@ class VoiceServer:
             "conn_lock": conn_lock,  # A06: stored so HTTP config handler can serialize
             "_on_audio": None,   # stored for pipeline re-init (A04)
             "_on_event": None,
+            # Wave 14 W14-C06: per-connection background tasks (e.g.
+            # cap_downgrade speak_system, out-of-band TTS) tracked here so
+            # _handle_disconnect can cancel them before closing the pipeline.
+            "bg_tasks": set(),
         }
         self._active_connections[ws_id] = conn_state
 
@@ -1502,9 +1506,15 @@ class VoiceServer:
                                 if cmd.get("reason") == "cap_downgrade":
                                     pipeline = conn_state.get("pipeline")
                                     if pipeline and hasattr(pipeline, "speak_system"):
-                                        asyncio.create_task(pipeline.speak_system(
+                                        # Wave 14 W14-C06: track the task so
+                                        # _handle_disconnect can cancel it if
+                                        # the user closes mid-utterance.
+                                        bg = conn_state["bg_tasks"]
+                                        t = asyncio.create_task(pipeline.speak_system(
                                             "Daily budget cap reached. Switched back to local mode."
                                         ))
+                                        bg.add(t)
+                                        t.add_done_callback(bg.discard)
                             except Exception:
                                 logger.exception("cap_downgrade alert failed")
 
@@ -2219,6 +2229,16 @@ class VoiceServer:
         device_id = conn_state.get("device_id")
         ws_id = conn_state.get("ws_id")
         pipeline = conn_state.get("pipeline")
+
+        # Wave 14 W14-C06: cancel any per-connection background tasks
+        # (e.g. cap_downgrade speak_system) before we shut down the pipeline
+        # they depend on. Without this, the orphan task holds the Piper
+        # subprocess + TTS lock past WS close.
+        bg_tasks = conn_state.get("bg_tasks") or set()
+        if bg_tasks:
+            for t in list(bg_tasks):
+                t.cancel()
+            await asyncio.gather(*bg_tasks, return_exceptions=True)
 
         # v4·D Phase 4g: unregister the session's surface so skills that
         # kept a reference to it start seeing dropped sends explicitly.

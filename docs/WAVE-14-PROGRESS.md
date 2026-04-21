@@ -15,8 +15,8 @@ PRs rather than a single monolith so each phase can be reverted independently.
 
 Each of these removes friction that slows everything after it.
 
-- [ ] **W14-H15** `[OPS]` gitignore + `git rm --cached` `dependencies.lock` → green TinkerTab CI
-- [ ] **W14-M16** `[OPS]` ruff gate expansion `B904,E722,B007,RUF006` + land the 17 prep fixes
+- [x] **W14-H15** `[OPS]` gitignore + `git rm --cached` `dependencies.lock` → green TinkerTab CI · TinkerTab `81ce620` · verified: local rebuild clean, regenerated lock has only expected patch bumps
+- [x] **W14-M16** `[OPS]` ruff gate expansion `B904,E722,B007,RUF006` + land the 17 prep fixes · TinkerBox · verified: `ruff check --select ...` all pass + 52/52 pytest green
 - [ ] **W14-H16** `[OPS]` `scripts/deploy.sh` with snapshot rollback + auth-probed smoke
 - [ ] **W14-H17** `[OPS]` `tinkerclaw-backup.service` + `.timer` (hourly, 14-copy retention)
 
@@ -27,7 +27,7 @@ Each of these removes friction that slows everything after it.
 - [ ] **W14-C03** `[TT]` `ui_notes.c:1066-1067` — NULL-guard on transcription-queue HTTP init
 - [ ] **W14-C04** `[TB+TT]` authenticate `/ws/voice` register frame (bearer OR signed HMAC)
 - [ ] **W14-C05** `[TB]` port `NotesDB` to `aiosqlite` (or uniform `asyncio.to_thread`)
-- [ ] **W14-C06** `[TB]` store + cancel 3 fire-and-forget `asyncio.create_task` sites
+- [x] **W14-C06** `[TB]` store + cancel 3 fire-and-forget `asyncio.create_task` sites · same commit as M16 · verified: NotesService._spawn_bg + conn_state["bg_tasks"] both wired; cancelled in shutdown/_handle_disconnect
 
 ## Phase 3 — HIGH security (Dragon)
 

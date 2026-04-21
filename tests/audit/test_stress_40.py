@@ -61,7 +61,7 @@ async def tab5_post(s: aiohttp.ClientSession, path: str, **kw) -> Optional[dict]
         async with asyncio.timeout(8):
             async with s.post(f"{TAB5}{path}", headers=HEADERS, **kw) as r:
                 try: return await r.json()
-                except: return {"status": r.status}
+                except (aiohttp.ContentTypeError, json.JSONDecodeError): return {"status": r.status}
     except Exception as e:
         return {"error": str(e)}
 
@@ -353,7 +353,7 @@ async def main():
         # reconnect window after the heavy chat turns above.
         step("Dragon emits widget_prompt")
         dp = {"emitted": 0}
-        for attempt in range(2):
+        for _attempt in range(2):
             async with s.post(f"{DRAGON}/debug/widget_prompt", headers=DRAGON_HEADERS,
                               data=json.dumps({"title": "Stress poll?",
                                                 "body": "Either works",

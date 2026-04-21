@@ -43,11 +43,11 @@ class VoskBackend(STTBackend):
         """Load the Vosk model, downloading if necessary."""
         try:
             import vosk
-        except ImportError:
+        except ImportError as err:
             raise ImportError(
                 "vosk is required for the vosk backend. "
                 "Install it: pip install vosk"
-            )
+            ) from err
 
         model_path = self._config.vosk_model_path
         model_size = self._config.model

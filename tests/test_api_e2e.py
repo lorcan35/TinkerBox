@@ -46,7 +46,7 @@ class TestRunner:
         async with self.session.get(f"{self.base_url}{path}") as r:
             try:
                 body = await r.json()
-            except:
+            except (aiohttp.ContentTypeError, json.JSONDecodeError):
                 body = {"raw": await r.text()}
             return r.status, body
 
@@ -54,7 +54,7 @@ class TestRunner:
         async with self.session.post(f"{self.base_url}{path}", json=data) as r:
             try:
                 body = await r.json()
-            except:
+            except (aiohttp.ContentTypeError, json.JSONDecodeError):
                 body = {"raw": await r.text()}
             return r.status, body
 
@@ -81,7 +81,7 @@ class TestRunner:
                         d = json.loads(text[6:])
                         if "token" in d:
                             tokens.append(d["token"])
-                    except:
+                    except json.JSONDecodeError:
                         pass
             return r.status, "".join(tokens)
 

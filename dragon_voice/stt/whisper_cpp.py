@@ -32,11 +32,11 @@ class WhisperCppBackend(STTBackend):
         """
         try:
             from pywhispercpp.model import Model
-        except ImportError:
+        except ImportError as err:
             raise ImportError(
                 "pywhispercpp is required for the whisper_cpp backend. "
                 "Install it: pip install pywhispercpp"
-            )
+            ) from err
 
         model_path = self._config.whisper_model_path
         model_size = self._config.model

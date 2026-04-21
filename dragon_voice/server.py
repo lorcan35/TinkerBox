@@ -1669,13 +1669,25 @@ class VoiceServer:
                                                 pipeline._llm.set_session_key(
                                                     conn_state.get("session_id", ""))
                                     except Exception as e:
-                                        logger.exception("Backend swap failed")
-                                        if not ws.closed:
-                                            await ws.send_json({
-                                                "type": "config_update",
-                                                "error": f"Backend swap failed: {e}",
-                                                "voice_mode": 0,
-                                            })
+                                        logger.exception(
+                                            "Backend swap failed for %s",
+                                            conn_state.get("ws_id", "?"),
+                                        )
+                                        # W15-C04: `_safe_send_json` owns the
+                                        # closed-check + send atomically and
+                                        # doesn't raise if the socket closed
+                                        # after our swap started.  The old
+                                        # `if not ws.closed: send_json(...)`
+                                        # pattern had a TOCTOU window where
+                                        # TCP FIN could land between check
+                                        # and send and raise inside the
+                                        # except handler, hiding the original
+                                        # backend-swap error.
+                                        await self._safe_send_json(ws, {
+                                            "type": "config_update",
+                                            "error": f"Backend swap failed: {e}",
+                                            "voice_mode": 0,
+                                        })
                                         continue
 
                                 # Also swap ConversationEngine LLM (used by _handle_text).

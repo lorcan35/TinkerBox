@@ -152,6 +152,7 @@ class SynthesizeRoutes:
     async def ota_check(self, request: web.Request) -> web.Response:
         """GET /api/ota/check?current=VERSION"""
         import os
+        import re as _re
         current = request.query.get("current", "0.0.0")
 
         if not os.path.exists(self.OTA_VERSION_FILE):
@@ -166,7 +167,25 @@ class SynthesizeRoutes:
         available_ver = info.get("version", "0.0.0")
         sha256 = info.get("sha256", "")
 
-        if available_ver <= current:
+        # Wave 10 fix: parse version as a tuple of ints so 0.10.0 beats 0.8.0
+        # (the old `available <= current` string compare rejected 0.10.x
+        # because '1' < '8' lexicographically). Any non-numeric suffix
+        # (e.g. "-wave10") is stripped before parsing.
+        def _parts(v: str) -> tuple:
+            head = _re.split(r"[-+]", str(v).lstrip("v"))[0]
+            bits = []
+            for piece in head.split("."):
+                m = _re.match(r"\d+", piece)
+                bits.append(int(m.group(0)) if m else 0)
+            return tuple(bits)
+
+        try:
+            avail_parts = _parts(available_ver)
+            cur_parts = _parts(current)
+        except Exception:
+            avail_parts = cur_parts = ()
+
+        if avail_parts <= cur_parts:
             return web.json_response({"update": False, "current": current, "available": available_ver})
 
         host = request.host

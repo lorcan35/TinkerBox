@@ -1866,8 +1866,28 @@ class VoiceServer:
             return
 
         try:
-            # Stream LLM response via conversation engine
+            # Stream LLM response via conversation engine.
+            #
+            # Wave 10 audit #78 fix: buffer tokens client-side before
+            # forwarding so a stray `<tool>...</tool><args>...</args>`
+            # block emitted mid-stream by qwen3:1.7b (or any small model
+            # with a shaky tool-call grammar) never reaches the chat
+            # bubble. conversation.py already strips markup on the
+            # final-yield fallthrough path, but the happy path yields
+            # one token at a time — a raw `<tool>` tag can land in Tab5
+            # before the LLM finishes emitting the closing `</tool>`.
+            #
+            # Strategy: hold tokens in a rolling buffer. When the buffer
+            # contains a complete `<tool>...</args>` block, strip it
+            # before flushing. Emit the remaining prefix on every tick
+            # so streaming latency stays low for normal text.
             full_response = []
+            pending = ""  # tokens not yet safe to forward
+            import re as _re
+            _TOOL_RE_LOCAL = _re.compile(
+                r"<tool>[\s\S]*?</tool>\s*<args>[\s\S]*?</args>\s*>?",
+                _re.IGNORECASE,
+            )
             async for token in self._conversation.process_text_stream(
                 session_id=session_id,
                 text=content,
@@ -1876,10 +1896,33 @@ class VoiceServer:
                 on_tool_result=conn_state.get("on_tool_result"),
             ):
                 full_response.append(token)
-                if not ws.closed:
-                    await ws.send_json({"type": "llm", "text": token})
+                pending += token
+                # Strip any complete tool blocks sitting in the pending
+                # buffer. Substitute in-place so remaining prose still
+                # flushes below.
+                stripped = _TOOL_RE_LOCAL.sub("", pending)
+                if stripped != pending:
+                    pending = stripped
+                # Hold back the tail if it looks like a partial tool
+                # marker so we don't flush `<tool>dat` to the client and
+                # then have to retract it.
+                hold_at = -1
+                for marker in ("<tool>", "<tool", "</tool", "<args", "</args"):
+                    idx = pending.rfind(marker)
+                    if idx >= 0 and idx > hold_at:
+                        hold_at = idx
+                if hold_at >= 0:
+                    flush, pending = pending[:hold_at], pending[hold_at:]
+                else:
+                    flush, pending = pending, ""
+                if flush and not ws.closed:
+                    await ws.send_json({"type": "llm", "text": flush})
+            # End-of-stream: flush whatever remains, stripped one more time.
+            pending = _TOOL_RE_LOCAL.sub("", pending)
+            if pending and not ws.closed:
+                await ws.send_json({"type": "llm", "text": pending})
 
-            response_text = "".join(full_response)
+            response_text = _TOOL_RE_LOCAL.sub("", "".join(full_response))
 
             if not ws.closed:
                 await ws.send_json({"type": "llm_done", "llm_ms": 0})

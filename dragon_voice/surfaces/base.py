@@ -49,6 +49,11 @@ class Tab5Surface:
         # Track live card_ids emitted by this surface so we can clear() later.
         self._live_cards: set[str] = set()
         self._caps: dict = caps or {}
+        # Wave 10 B6/K3: bound lazily by SurfaceManager.register_session so
+        # surface.prompt(on_action=...) can route handler registrations
+        # without the skill referencing the manager directly.
+        self._manager = None
+        self._session_id: Optional[str] = None
 
     def for_skill(self, skill_id: str) -> "Tab5Surface":
         """Return a child surface tagged with a specific skill id. The
@@ -58,9 +63,16 @@ class Tab5Surface:
         per-skill surfaces also respect Tab5-declared limits. Previously
         the child got a fresh empty dict and list/prompt/chart helpers
         fell back to hardcoded defaults, making the widget_capabilities
-        probe cosmetic for anything emitted through a scoped surface."""
+        probe cosmetic for anything emitted through a scoped surface.
+
+        Wave 10 B6/K3 fix: also carry the _manager + _session_id bindings
+        so ``surface.for_skill(...).prompt(on_action=handler)`` registers
+        the handler on the right session without the skill having to
+        touch the manager directly."""
         child = Tab5Surface(self._send, skill_id=skill_id, caps=self._caps)
         child._live_cards = self._live_cards
+        child._manager = getattr(self, "_manager", None)
+        child._session_id = getattr(self, "_session_id", None)
         return child
 
     # ── widget_live ──────────────────────────────────────────────
@@ -244,13 +256,23 @@ class Tab5Surface:
         priority: int = 70,
         card_id: Optional[str] = None,
         skill_id: Optional[str] = None,
+        on_action: Optional[ActionHandler] = None,
     ) -> str:
         """Emit a prompt widget (title + up to 3 button choices).
 
-        `choices` is a list of (text, event) tuples.  Tab5 renders each
+        `choices` is a list of (text, event) tuples. Tab5 renders each
         as a row; tapping fires widget_action carrying the matching
-        event.  Skill is expected to pre-register the event handler via
-        SurfaceManager.register_action.  v4·D Phase 4g.
+        event.
+
+        Wave 10 audit B6/K3 — declarative action dispatch:
+        Pass ``on_action=handler`` and the Surface auto-registers the
+        callback with the SurfaceManager for this card_id. Skills no
+        longer have to call ``register_action`` imperatively AFTER the
+        emit, which was the source of the "platform works for any skill"
+        overclaim (half the skills forgot the second call). When
+        ``on_action`` is None the caller can still register manually
+        via ``SurfaceManager.register_action`` — useful for multi-card
+        workflows where one handler services several prompts.
         """
         sid = skill_id or self._skill_id
         cid = card_id or _gen_card_id(sid)
@@ -264,6 +286,20 @@ class Tab5Surface:
                 "text":  str(txt)[:47],
                 "event": str(ev)[:47],
             })
+        # Register the handler BEFORE the emit so a fast user tap can
+        # never land before the manager knows who owns the card.
+        if on_action is not None:
+            mgr = getattr(self, "_manager", None)
+            session_id = getattr(self, "_session_id", None)
+            if mgr is not None and session_id is not None:
+                mgr.register_action(session_id, cid, on_action)
+            else:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "surface.prompt(on_action=...) dropped — surface has "
+                    "no manager/session binding. Use SurfaceManager."
+                    "register_action(sid, cid, handler) instead."
+                )
         msg: dict = {
             "type": "widget_prompt",
             "skill_id": sid,

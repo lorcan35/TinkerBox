@@ -71,12 +71,18 @@ class PiperBackend(TTSBackend):
 
             self._voice = await loop.run_in_executor(inference_executor, _load)
             self._model_path = model_path
-            # Piper voices declare their sample rate in config
+            # Piper voices declare their sample rate in config.
+            # Wave 14 W14-H08: offload the small config read to a thread
+            # so model-swap doesn't stall the event loop on a slow eMMC.
             config_path = model_path.with_suffix(model_path.suffix + ".json")
             if config_path.exists():
+                import asyncio as _asyncio
                 import json
-                with open(config_path) as f:
-                    voice_cfg = json.load(f)
+
+                def _load_cfg(p):
+                    with open(p) as f:
+                        return json.load(f)
+                voice_cfg = await _asyncio.to_thread(_load_cfg, config_path)
                 self._sample_rate = voice_cfg.get("audio", {}).get("sample_rate", 22050)
             logger.info("Piper loaded via Python package (rate=%d)", self._sample_rate)
             return

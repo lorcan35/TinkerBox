@@ -6,6 +6,7 @@ Schema is applied from schema.sql on first run.
 refs #16
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -496,11 +497,21 @@ class Database:
         row = await cursor.fetchone()
         return dict(row) if row else None
 
-    async def purge_old_messages(self, days: int = 30) -> dict[str, int]:
+    async def purge_old_messages(
+        self, days: int = 30, batch_size: int = 500
+    ) -> dict[str, int]:
         """Purge messages and orphaned events older than `days`.
 
         Skips messages belonging to active or paused sessions to avoid
         deleting context from sessions still in use.
+
+        Wave 14 W14-H10: previously a single ``DELETE ... WHERE NOT IN
+        (SELECT ...)`` ran on the shared aiosqlite connection — on a
+        large tail it serialized every other coroutine behind 2-3 s of
+        purge. Now the delete runs in ``batch_size``-row chunks with
+        ``await asyncio.sleep(0)`` between batches, yielding the event
+        loop so WS keepalives and receipt emits can progress even on a
+        huge purge.
 
         Returns dict with counts: {"messages": N, "events": M}.
         """
@@ -511,34 +522,57 @@ class Database:
         cutoff = time.time() - (days * 86400)
 
         # Delete old messages, but only from ended sessions (or sessions
-        # with no matching row, i.e. orphaned messages)
-        cursor = await self.conn.execute(
-            """
-            DELETE FROM messages
-            WHERE created_at < ?
-              AND session_id NOT IN (
-                  SELECT id FROM sessions WHERE status IN ('active', 'paused')
-              )
-            """,
-            (cutoff,),
-        )
-        msg_count = cursor.rowcount
-        await self.conn.commit()
+        # with no matching row, i.e. orphaned messages).
+        # Wave 14 W14-H10: batch via LIMIT + asyncio.sleep(0) yield so
+        # the purge does NOT hold the aiosqlite background thread
+        # exclusively for the full delete.
+        msg_count = 0
+        while True:
+            cursor = await self.conn.execute(
+                """
+                DELETE FROM messages
+                WHERE rowid IN (
+                    SELECT rowid FROM messages
+                    WHERE created_at < ?
+                      AND session_id NOT IN (
+                          SELECT id FROM sessions WHERE status IN ('active', 'paused')
+                      )
+                    LIMIT ?
+                )
+                """,
+                (cutoff, batch_size),
+            )
+            deleted = cursor.rowcount
+            await self.conn.commit()
+            msg_count += deleted
+            if deleted < batch_size:
+                break
+            await asyncio.sleep(0)  # yield the loop between batches
 
-        # Delete orphaned events older than the cutoff
-        cursor = await self.conn.execute(
-            """
-            DELETE FROM events
-            WHERE created_at < ?
-              AND (session_id IS NULL
-                   OR session_id NOT IN (
-                       SELECT id FROM sessions WHERE status IN ('active', 'paused')
-                   ))
-            """,
-            (cutoff,),
-        )
-        evt_count = cursor.rowcount
-        await self.conn.commit()
+        # Delete orphaned events older than the cutoff — same batching.
+        evt_count = 0
+        while True:
+            cursor = await self.conn.execute(
+                """
+                DELETE FROM events
+                WHERE rowid IN (
+                    SELECT rowid FROM events
+                    WHERE created_at < ?
+                      AND (session_id IS NULL
+                           OR session_id NOT IN (
+                               SELECT id FROM sessions WHERE status IN ('active', 'paused')
+                           ))
+                    LIMIT ?
+                )
+                """,
+                (cutoff, batch_size),
+            )
+            deleted = cursor.rowcount
+            await self.conn.commit()
+            evt_count += deleted
+            if deleted < batch_size:
+                break
+            await asyncio.sleep(0)
 
         # PASSIVE checkpoint after bulk deletes — moves WAL pages back into
         # the main DB file without blocking readers. Reduces WAL file growth

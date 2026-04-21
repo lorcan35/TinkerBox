@@ -31,12 +31,34 @@ class SystemRoutes:
         uptime_s = time.time() - self._start_time
         active = self._get_active_connections()
 
-        # Memory from /proc/meminfo (no external dependency)
+        # Memory from /proc/meminfo (no external dependency).
+        # Wave 14 W14-H08: /proc reads are usually instant but get slow
+        # under load (cgroup accounting on Radxa).  Offload to a thread
+        # so system polls from the dashboard don't jitter the event loop.
+        import asyncio as _asyncio
+
+        def _read_meminfo():
+            try:
+                with open("/proc/meminfo") as f:
+                    return f.read()
+            except Exception:
+                return ""
+
+        def _read_loadavg():
+            try:
+                with open("/proc/loadavg") as f:
+                    return f.read()
+            except Exception:
+                return ""
+
+        meminfo_raw = await _asyncio.to_thread(_read_meminfo)
+        loadavg_raw = await _asyncio.to_thread(_read_loadavg)
+
         mem = {"total_mb": 0, "used_mb": 0, "available_mb": 0, "percent": 0}
-        try:
-            with open("/proc/meminfo") as f:
+        if meminfo_raw:
+            try:
                 info = {}
-                for line in f:
+                for line in meminfo_raw.splitlines():
                     parts = line.split()
                     if len(parts) >= 2:
                         info[parts[0].rstrip(":")] = int(parts[1])
@@ -46,18 +68,17 @@ class SystemRoutes:
                 mem["available_mb"] = round(available / 1024)
                 mem["used_mb"] = mem["total_mb"] - mem["available_mb"]
                 mem["percent"] = round((1 - available / total) * 100, 1) if total else 0
-        except Exception:
-            pass
+            except Exception:
+                pass
 
-        # CPU from /proc/stat (simple instant snapshot)
         cpu_percent = 0
-        try:
-            with open("/proc/loadavg") as f:
-                load_1m = float(f.read().split()[0])
+        if loadavg_raw:
+            try:
+                load_1m = float(loadavg_raw.split()[0])
                 cpu_count = os.cpu_count() or 1
                 cpu_percent = round(load_1m / cpu_count * 100, 1)
-        except Exception:
-            pass
+            except Exception:
+                pass
 
         result = {
             "uptime_s": round(uptime_s, 1),

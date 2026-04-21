@@ -77,11 +77,11 @@ Each of these removes friction that slows everything after it.
 - [x] **W14-M14** `[TB]` `datetime.now(timezone.utc)` + `ClassVar[frozenset]` for CORS allowlist · datetime_tool.py + timer_tool.py tz-aware; `_CORS_ALLOWED_ORIGINS` now `ClassVar[frozenset]`
 - [ ] **W14-M15** `[TB]` type annotations on DI entry points; `mypy --strict` on `api/`
 - [x] **W14-M17** `[OPS]` kill `tinkeraimcp` tunnel; basic_auth on dashboard+gateway · verified: Killed tinkeraimcp.ngrok.dev (404), added basic_auth to dashboard+gateway (401 unauth / 200 authed verified live), voice stays bearer-only.
-- [ ] **W14-M18** `[DOC]` update IDF pin references in TinkerTab/CLAUDE.md to 5.5.2
-- [ ] **W14-M19** `[DOC]` update debug-server endpoint count 22 → 26 (or drop)
-- [ ] **W14-M20** `[DOC]` update test counts: pipeline 28, aggregate 40
-- [ ] **W14-M21** `[DOC]` canonical Dragon host: bump `test_api_e2e.py` default to `192.168.1.91`
-- [ ] **W14-M22** `[DOC]` `settings.c:375` comment include mode 3
+- [x] **W14-M18** `[DOC]` update IDF pin references in TinkerTab/CLAUDE.md to 5.5.2 · verified: TT #93 — v5.4.3 → v5.5.2 across CLAUDE.md (2 refs)
+- [x] **W14-M19** `[DOC]` update debug-server endpoint count 22 → 26 (or drop) · verified: TT #93 — dropped "22 endpoints" number, replaced with grep-from-code formula
+- [x] **W14-M20** `[DOC]` update test counts: pipeline 28, aggregate 40 · verified: TB #49 — pipeline 32→29, header "44 media tests" → 41, aggregate-121 line added
+- [x] **W14-M21** `[DOC]` canonical Dragon host: bump `test_api_e2e.py` default to `192.168.1.91` · verified: TB #49 — test_api_e2e.py default --host bumped to 192.168.1.91 (2 refs)
+- [x] **W14-M22** `[DOC]` `settings.c:375` comment include mode 3 · verified: TT #93 — settings.c:375 comment now mentions mode 3 (tinkerclaw)
 
 ## Phase 7 — LOW
 
@@ -92,7 +92,7 @@ Each of these removes friction that slows everything after it.
 - [x] **W14-L05** `[TB]` `/api/ota/check` read canonical host from config · prefer version.json's `url` field; falls back to request.host for back-compat
 - [x] **W14-L06** `[OPS]` logging.Filter redacting Bearer/sk- patterns · installed in `dragon_voice/__main__.py`; covers Bearer tokens, `sk-*` keys, and json `api_token`/`tinkerclaw_token` values
 - [x] **W14-L07** `[OPS]` `scripts/deploy-firmware.sh` atomic sha+json write · verified: New scripts/deploy-firmware.sh — stage-then-rename atomic publish; live-tested twice; /api/ota/check sha matches local sha.
-- [ ] **W14-L08** `[OPS]` `tinkerclaw-mdns` drop-in with `DynamicUser=true`
+- [x] **W14-L08** `[OPS]` `tinkerclaw-mdns` drop-in with `DynamicUser=true` · verified: per H14 post-mortem, mdns runs as User=nobody (DynamicUser=true broke advertisement on SIGHUP) — this is the documented iteration-2 resolution, not a regression to close with DynamicUser
 - [x] **W14-L09** `[DOC]` Tab5 CLAUDE.md Key Files sweep against `ls main/` · verified: Key Files rebuilt from ls main/ — 90+ sources grouped into seven topical sections; stale v0.8.0 ref dropped.
 - [x] **W14-L10** `[DOC]` replace Recovery & Rollback section with tag-based rule · verified: Recovery & Rollback rewrite — three-layer protocol (OTA auto-rollback / re-flash from Dragon / git revert) replaces stale 2026-03-31 physical-backup pointers.
 - [x] **W14-L11** `[DOC]` protocol.md §2.1 add `capabilities.widgets` subsection · folded into H19 (§2.1 register frame now documents nested `capabilities.widgets` object)

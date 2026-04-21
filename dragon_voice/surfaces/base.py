@@ -52,8 +52,14 @@ class Tab5Surface:
 
     def for_skill(self, skill_id: str) -> "Tab5Surface":
         """Return a child surface tagged with a specific skill id. The
-        underlying send is shared; only the default skill_id differs."""
-        child = Tab5Surface(self._send, skill_id=skill_id)
+        underlying send is shared; only the default skill_id differs.
+
+        Wave 8 audit B14/#8 fix: propagate parent caps to the child so
+        per-skill surfaces also respect Tab5-declared limits. Previously
+        the child got a fresh empty dict and list/prompt/chart helpers
+        fell back to hardcoded defaults, making the widget_capabilities
+        probe cosmetic for anything emitted through a scoped surface."""
+        child = Tab5Surface(self._send, skill_id=skill_id, caps=self._caps)
         child._live_cards = self._live_cards
         return child
 
@@ -214,6 +220,15 @@ class Tab5Surface:
         if alt:   msg["alt"]   = alt[:95]
         if title: msg["title"] = title[:63]
         if body:  msg["body"]  = body[:255]
+        # Wave 8 audit #8: carry the Tab5-declared media dimensions so the
+        # client can reserve layout space without downloading the image.
+        # The skill can override via `width`/`height` args in a future
+        # pass; for now we default to the client-advertised max so images
+        # get a correct aspect-ratio placeholder.
+        _max_w = int(self._caps.get("media_max_w", 660) or 660)
+        _max_h = int(self._caps.get("media_max_h", 440) or 440)
+        msg["width"] = _max_w
+        msg["height"] = _max_h
         await self._safe_send(msg, describe=f"media {sid}/{cid}")
         self._live_cards.add(cid)
         return cid

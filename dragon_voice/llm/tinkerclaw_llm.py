@@ -26,7 +26,14 @@ class TinkerClawBackend(LLMBackend):
         self._config = config
         self._url = (config.tinkerclaw_url or "http://localhost:18789").rstrip("/")
         self._token = config.tinkerclaw_token
-        self._model = config.tinkerclaw_model or "ollama/qwen3:1.7b"
+        # Audit J12/J20/K13 (wave 7): align the empty-config fallback with
+        # dragon_voice.config.LLMConfig.tinkerclaw_model default
+        # ("minimax/MiniMax-M2.5") and with the TinkerTab audit expectation.
+        # The old "ollama/qwen3:1.7b" fallback was a three-layer mismatch
+        # (Dragon fallback ≠ gateway default ≠ Tab5 expectation) so users
+        # could think they were talking to MiniMax while actually getting
+        # whatever the gateway chose from its own config.
+        self._model = config.tinkerclaw_model or "minimax/MiniMax-M2.5"
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_key: Optional[str] = None
 

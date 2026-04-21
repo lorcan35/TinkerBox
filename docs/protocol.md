@@ -1204,11 +1204,15 @@ Replaces the text in the last AI chat bubble. Used after code blocks have been r
 | Field | Type | Description |
 |-------|------|-------------|
 | `type` | string | `"text_update"` |
-| `text` | string | Replacement text for the last AI bubble (code blocks stripped). |
+| `text` | string | Replacement text for the last AI bubble (code blocks stripped). May be `""` if the entire response was a code block that was rendered as media. |
 
-**When sent:** After `media` messages, when `strip_rendered_content()` has removed rendered code blocks or tables from the response text.
+**When sent (audit D6, 2026-04-20):** BEFORE any `media` messages for the same turn, whenever `strip_rendered_content()` has modified the response. Sending order is load-bearing — Tab5 targets the tail of the chat store when updating, and the `media` event appends a new bubble to that tail. If `text_update` arrived after the media event, the clear would hit the wrong bubble. Always emit `text_update` first, then the media events.
 
-**Tab5 behavior on receive:** Replace the text content of the most recent AI chat bubble with the new text.
+**Tab5 behavior on receive:**
+- Non-empty text: replace the text content of the most recent AI chat bubble.
+- **Empty text (`""`)**: remove the most recent AI chat bubble entirely via `chat_store_pop_last()`. This is the "whole response was a code block that moved into media" case — the raw markdown bubble is no longer needed because the rendered JPEG will render alone.
+
+**Regression test:** `TinkerBox/tests/audit/test_d5_d6_ws.py` exercises this contract end-to-end against a live Dragon, asserting `text_update.index < media.index` in the event stream.
 
 ### 15.5 user_media (Tab5 -> Dragon)
 

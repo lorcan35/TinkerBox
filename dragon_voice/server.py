@@ -241,15 +241,21 @@ class VoiceServer:
             # v4·D Gauntlet G9: two-step confirm-gated forget_fact tool.
             self._tool_registry.register(ForgetFactTool(self._memory_service))
 
-            # Tier 1 tools
-            from dragon_voice.tools.timer_tool import TimerTool
+            # Tier 1 tools.
+            # Audit D8/K7 dedup (wave 7, 2026-04-20): TimerTool is no
+            # longer registered. TimesenseTool (registered below, after
+            # SurfaceManager init) covers the "set a timer" use case
+            # AND emits widget_live progress.  Keeping both caused the
+            # LLM to pick TimerTool on short phrases ("timer 5 min"),
+            # leaving the whole widget-platform reference flow unreachable
+            # from voice.  TimerTool class file is retained for REST-only
+            # use cases; it's just not wired into the agentic loop.
             from dragon_voice.tools.weather_tool import WeatherTool
             from dragon_voice.tools.calculator_tool import CalculatorTool
             from dragon_voice.tools.unit_converter_tool import UnitConverterTool
             from dragon_voice.tools.note_tool import NoteTool
             from dragon_voice.tools.system_tool import SystemInfoTool
 
-            self._tool_registry.register(TimerTool())
             self._tool_registry.register(WeatherTool())
             self._tool_registry.register(CalculatorTool())
             self._tool_registry.register(UnitConverterTool())
@@ -1805,11 +1811,20 @@ class VoiceServer:
             # surface the engine name so transparency-per-bubble still
             # holds.
             if not ws.closed:
-                tc_model = getattr(llm, "name", "tinkerclaw")
-                # Prefer the gateway-reported model id (e.g. minimax/MiniMax-M2.5)
+                # Wave 8 audit #2 (A4/F3/J12): the first-turn fallback was
+                # the bare string "tinkerclaw" which shows up in chat
+                # bubbles as a generic stamp until the gateway populates
+                # `_model`. Fall back to the LLMConfig default
+                # ("minimax/MiniMax-M2.5") when both `name` and `_model`
+                # are empty so the first bubble stamp is still honest.
                 inner = getattr(llm, "_model", "") or ""
-                if inner:
-                    tc_model = inner
+                conf_default = getattr(conn_cfg.llm, "tinkerclaw_model", "") or ""
+                tc_model = (
+                    inner
+                    or getattr(llm, "name", None)
+                    or conf_default
+                    or "minimax/MiniMax-M2.5"
+                )
                 try:
                     await ws.send_json({
                         "type": "receipt",
@@ -1832,16 +1847,19 @@ class VoiceServer:
                     media_events = await self._media_pipeline.process_response(
                         response_text, session_id
                     )
-                    for event in media_events:
-                        if not ws.closed:
-                            await ws.send_json(event)
+                    # Audit D6 (TC path): send text_update BEFORE media events
+                    # so Tab5's last-bubble targeting still points at the
+                    # text bubble when the clear arrives.
                     if media_events:
                         logger.info("Sent %d media events for TinkerClaw response", len(media_events))
                         cleaned = self._media_pipeline.strip_rendered_content(response_text, media_events)
                         logger.info("Text stripped: %d→%d chars", len(response_text), len(cleaned))
-                        if cleaned != response_text and not ws.closed:
+                        if not ws.closed:
                             await ws.send_json({"type": "text_update", "text": cleaned})
-                            logger.info("Sent text_update with cleaned text")
+                            logger.info("Sent text_update (D6 TC) with %d chars", len(cleaned))
+                    for event in media_events:
+                        if not ws.closed:
+                            await ws.send_json(event)
                 except Exception as e:
                     logger.warning("TinkerClaw media detection failed: %s", e)
 
@@ -1866,7 +1884,13 @@ class VoiceServer:
             if not ws.closed:
                 await ws.send_json({"type": "llm_done", "llm_ms": 0})
 
-            # Rich media detection — scan response for image/chart/map references
+            # Rich media detection — scan response for image/chart/map references.
+            # Audit D6: send text_update BEFORE media events. Tab5's
+            # ui_chat_update_last_message targets the *last* chat bubble. If
+            # we send media first, the image becomes "last" and the empty-
+            # string text_update removes the wrong row. text_update first
+            # clears the streamed markdown bubble; media events then append
+            # the rendered JPEG below.
             if full_response:
                 try:
                     media_events = await self._media_pipeline.process_response(
@@ -1874,13 +1898,18 @@ class VoiceServer:
                     )
                     logger.info("MediaPipeline: %d event(s) for response len=%d",
                                 len(media_events), len(response_text))
+                    if media_events:
+                        cleaned = self._media_pipeline.strip_rendered_content(
+                            response_text, media_events
+                        )
+                        logger.info("strip_rendered_content: %d->%d chars",
+                                    len(response_text), len(cleaned))
+                        if not ws.closed:
+                            await ws.send_json({"type": "text_update", "text": cleaned})
+                            logger.info("Sent text_update (D6) with %d chars", len(cleaned))
                     for event in media_events:
                         if not ws.closed:
                             await ws.send_json(event)
-                    if media_events:
-                        cleaned = self._media_pipeline.strip_rendered_content(response_text, media_events)
-                        if cleaned != response_text and not ws.closed:
-                            await ws.send_json({"type": "text_update", "text": cleaned})
                 except Exception as e:
                     logger.warning("Media detection failed: %s", e)
 

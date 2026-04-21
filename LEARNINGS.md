@@ -508,3 +508,36 @@ sequentially across the whole file (don't restart per section).
 - **Root Cause:** Pygments `ImageFormatter` renders syntax-highlighted code as a bitmap image. It requires a monospace font to be available on the system. Dragon's minimal Debian image did not have any suitable fonts installed — Pygments silently fell back to a default that produced unreadable output.
 - **Fix:** Installed `fonts-dejavu-core` on Dragon: `sudo apt install fonts-dejavu-core`. This provides DejaVu Sans Mono which Pygments uses by default.
 - **Prevention:** When deploying Python packages that render text to images (Pygments, Pillow text drawing, matplotlib, etc.), always verify that the required system fonts are installed on the target machine. Add `apt install fonts-dejavu-core` to the Dragon setup script (`setup.sh`). Minimal ARM64 images rarely include fonts.
+
+---
+
+## Audit Wave Reconciliation (April 2026)
+
+### 65. err_body NameError silenced the rate-limit fallback message (wave 6)
+- **Date:** 2026-04-20
+- **Symptom:** When OpenRouter returned a 429 or other non-200/non-400 error, Dragon's conversation turn returned an empty bubble to Tab5 — users saw nothing. Journal showed `NameError: name 'err_body' is not defined` in `openrouter_llm.py`.
+- **Root Cause:** The response body was captured as `error_text = await resp.text()` on line 166 but referenced as `err_body` on line 218 inside the error-logging path. The `yield "Sorry, the cloud model had a hiccup..."` line below never executed because the NameError aborted the generator first.
+- **Fix:** One-char rename — `err_body` → `error_text`. Commit `06ba2ad` on `fix/wave-6-audit`.
+- **Prevention:** Always exercise the error branches of LLM backends during integration testing, not just the happy path. A rate-limited model is the easiest way to surface dead error handlers. Consider adding a fault-injection harness that swaps `resp.text()` with a mock returning a 502.
+
+### 66. text_update must arrive BEFORE media events, not after
+- **Date:** 2026-04-20
+- **Symptom:** Cloud-mode responses containing code blocks rendered the raw markdown as a chat bubble ABOVE the decoded JPEG. User saw both the text and the image (duplicate content).
+- **Root Cause:** Tab5's `ui_chat_update_last_message` targets the tail of the chat message store. The `text_update` message carried an empty string (the whole response was a code block that strip_rendered_content removed entirely), which Tab5 should interpret as "pop the last AI text bubble". But Dragon was sending media events FIRST (which appended an MSG_IMAGE bubble to the tail), so by the time `text_update` arrived, the "last" bubble was the image — and the empty-string pop would have removed the image, not the raw text bubble. Tab5 additionally rejected empty-string updates in the input validator, so the pop never happened at all.
+- **Fix:** In `server.py` both cloud and TC paths now emit `text_update` BEFORE the media events. The guard `if cleaned != response_text` was also removed — whenever media events fire, text_update must fire (previously when the whole response was ONLY a code block, cleaned == "" != response_text was True but the check still missed the contract). Paired Tab5 fix in `ui_chat.c` accepts empty text and calls `chat_store_pop_last` to remove the raw-markdown bubble.
+- **Prevention:** When replacing content via follow-up WS messages, always send the REPLACEMENT before the new content, so "replace the last element" targets the old one deterministically. Document the message order contract in `docs/protocol.md`.
+
+### 67. Raw <tool> XML leaks into chat when MAX_TOOL_CALLS hits
+- **Date:** 2026-04-20
+- **Symptom:** After 3 tool calls, the LLM's final response (which might STILL contain more tool markup that qwen3:1.7b loves to emit) was yielded raw to the client, so users saw `<tool>web_search</tool><args>{...}</args>` as a chat bubble.
+- **Root Cause:** In `conversation.py process_text_stream`, when `tool_calls_made >= MAX_TOOL_CALLS` OR when `has_tool_call` returned true but `parse_tool_calls` returned empty, the code fell through to the "No tool call" branch and yielded the entire buffered `full_response` via `for token in full_response: yield token`. No stripping happened at this fallthrough path.
+- **Fix:** Added `_TOOL_MARKUP_RE` regex and `_strip_tool_markup()` helper. The fallthrough path now yields `_strip_tool_markup(response_text)` as a single cleaned token instead of raw tokens. Verified via WS-level probe (`tests/audit/test_d5_d6_ws.py`).
+- **Prevention:** Any text that can contain control markers must be stripped at every client-facing emission boundary, not just the parsing one. Never assume "the loop will catch it" — tool-use loops have natural fallthrough cases that bypass the parse.
+- **Known limitation:** qwen3:1.7b (local mode) emits iterative tool calls mid-stream. Each token is sent to the client individually before the full response is assembled for strip. A complete fix requires a server-side token buffer that holds tokens until a non-marker boundary is reached. Filed as follow-up on TinkerTab issue #78.
+
+### 68. sqlite3 IntegrityError on register: hardware_id UNIQUE constraint
+- **Date:** 2026-04-20
+- **Symptom:** Synthetic WS probes connecting to Dragon with a unique `device_id` but empty `hardware_id` tripped `UNIQUE constraint failed: devices.hardware_id` on the second connection — the first probe reserved the empty string; subsequent empty-hw probes collided.
+- **Root Cause:** `devices.hardware_id` has a UNIQUE constraint. Empty string counts as a value. The register handler doesn't fill in a default if the client omits it.
+- **Fix:** Synthetic tests now send `hardware_id: "probe-hw-" + secrets.token_hex(6)` to dodge the constraint. Real Tab5s always send a MAC-derived ID so this doesn't hit in production.
+- **Prevention:** Either make `hardware_id` default to the `device_id` if empty in `_handle_register`, or drop the UNIQUE constraint (device_id is already the PK). For synthetic/integration tests, always generate unique hardware_ids.

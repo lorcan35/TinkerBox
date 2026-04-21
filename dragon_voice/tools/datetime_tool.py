@@ -24,7 +24,11 @@ class DateTimeTool(Tool):
         }
 
     async def execute(self, args: dict) -> dict:
-        now = datetime.now()
+        # Wave 14 W14-M14: datetime.now() without tz is deprecated and
+        # drops the DST offset, which corrupts the strftime("%A") day
+        # on UTC rollover. astimezone() falls back to the system TZ so
+        # user-visible "day" matches their wall clock.
+        now = datetime.now(timezone.utc).astimezone()
         utc = datetime.now(timezone.utc)
         return {
             "date": now.strftime("%Y-%m-%d"),

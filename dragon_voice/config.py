@@ -314,6 +314,21 @@ def load_config(path: Optional[str] = None) -> VoiceConfig:
         config.tts.openrouter_api_key = config.llm.openrouter_api_key
         config.tts.openrouter_url = config.llm.openrouter_url
 
+    # Wave 14 W14-M11: validate at the end of load_config so a bad
+    # backend name fails fast at startup with an actionable message,
+    # instead of deferring the failure until first use (which
+    # produced cryptic cascading init failures under
+    # `VoicePipeline.initialize`).  Errors are logged + raised so the
+    # systemd unit restart-loops with a clear cause rather than
+    # silently running a half-configured pipeline.
+    errors = config.validate()
+    if errors:
+        for err in errors:
+            logger.error("config validation: %s", err)
+        raise ValueError(
+            "Invalid config:\n  - " + "\n  - ".join(errors)
+        )
+
     return config
 
 

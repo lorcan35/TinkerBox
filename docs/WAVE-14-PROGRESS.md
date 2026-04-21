@@ -67,15 +67,15 @@ Each of these removes friction that slows everything after it.
 - [ ] **W14-M03** `[TT]` `volatile` on `s_ws` + `dragon_link.s_state`
 - [ ] **W14-M04** `[TT]` check `fread`/`fwrite` returns in WAV-header repair
 - [ ] **W14-M05** `[TB]` switch `serve_media` to `web.FileResponse` (folded into H08)
-- [ ] **W14-M06** `[TB]` response-headers middleware (CSP, X-CTO, X-Frame-Options, Referrer-Policy)
+- [x] **W14-M06** `[TB]` response-headers middleware (CSP, X-CTO, X-Frame-Options, Referrer-Policy) · outermost middleware stamps on every response incl. 401s; 3 pytest cases; live curl -sI confirms all 4 headers on /health and 401 path.
 - [ ] **W14-M07** `[TB]` TinkerClaw gateway SSE chunk validation + length cap
 - [ ] **W14-M08** `[TT]` log `receipt_attach`/`voice_async_*` OOM drops
 - [ ] **W14-M09** `[TB]` `cancel() + await` `_periodic_purge` (wave 13 H3 pattern)
 - [ ] **W14-M10** `[TB]` ClientTimeout on MediaPipeline session (folded into H09)
-- [ ] **W14-M11** `[TB]` call `config.validate()` at end of `load_config`; raise on error
-- [ ] **W14-M12** `[TB]` `NotesDB.update` single UPDATE with COALESCE; log unknown keys
+- [x] **W14-M11** `[TB]` call `config.validate()` at end of `load_config`; raise on error · load_config now raises ValueError with actionable message on invalid backend string
+- [x] **W14-M12** `[TB]` `NotesDB.update` single UPDATE with COALESCE; log unknown keys · new `_UPDATABLE` frozenset + warning log on dropped keys (atomic write under _write_lock preserved)
 - [ ] **W14-M13** `[TB]` route `PiperBackend._ensure_model` consistently through executor
-- [ ] **W14-M14** `[TB]` `datetime.now(timezone.utc)` + `ClassVar[frozenset]` for CORS allowlist
+- [x] **W14-M14** `[TB]` `datetime.now(timezone.utc)` + `ClassVar[frozenset]` for CORS allowlist · datetime_tool.py + timer_tool.py tz-aware; `_CORS_ALLOWED_ORIGINS` now `ClassVar[frozenset]`
 - [ ] **W14-M15** `[TB]` type annotations on DI entry points; `mypy --strict` on `api/`
 - [ ] **W14-M17** `[OPS]` kill `tinkeraimcp` tunnel; basic_auth on dashboard+gateway
 - [ ] **W14-M18** `[DOC]` update IDF pin references in TinkerTab/CLAUDE.md to 5.5.2
@@ -89,15 +89,15 @@ Each of these removes friction that slows everything after it.
 - [ ] **W14-L01** `[TT]` delete dead `s_rec_paused` + TODO
 - [ ] **W14-L02** `[TT]` bounds-guard size_t→int cast in `voice_ws_send_text`/`_send_binary`
 - [ ] **W14-L03** `[TT]` observability log in `config_update` no-op branch
-- [ ] **W14-L04** `[TB]` clamp + try/except in `parse_pagination`
-- [ ] **W14-L05** `[TB]` `/api/ota/check` read canonical host from config
-- [ ] **W14-L06** `[OPS]` logging.Filter redacting Bearer/sk- patterns
+- [x] **W14-L04** `[TB]` clamp + try/except in `parse_pagination` · non-numeric limit no longer raises 500; negative offset clamped to 0. Live curl `?limit=abc` returns 200.
+- [x] **W14-L05** `[TB]` `/api/ota/check` read canonical host from config · prefer version.json's `url` field; falls back to request.host for back-compat
+- [x] **W14-L06** `[OPS]` logging.Filter redacting Bearer/sk- patterns · installed in `dragon_voice/__main__.py`; covers Bearer tokens, `sk-*` keys, and json `api_token`/`tinkerclaw_token` values
 - [ ] **W14-L07** `[OPS]` `scripts/deploy-firmware.sh` atomic sha+json write
 - [ ] **W14-L08** `[OPS]` `tinkerclaw-mdns` drop-in with `DynamicUser=true`
 - [ ] **W14-L09** `[DOC]` Tab5 CLAUDE.md Key Files sweep against `ls main/`
 - [ ] **W14-L10** `[DOC]` replace Recovery & Rollback section with tag-based rule
 - [ ] **W14-L11** `[DOC]` protocol.md §2.1 add `capabilities.widgets` subsection (folded into H19)
-- [ ] **W14-L12** `[TB]` `conftest.py` for `test_foundation.py` scoped fixture
+- [x] **W14-L12** `[TB]` `conftest.py` for `test_foundation.py` scoped fixture · session-scoped `_session_db_root` autouse fixture in `tests/conftest.py`; CI's multi-file pytest invocation no longer accumulates /tmp noise
 
 ---
 

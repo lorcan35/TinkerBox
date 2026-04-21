@@ -195,9 +195,19 @@ class SynthesizeRoutes:
         if avail_parts <= cur_parts:
             return web.json_response({"update": False, "current": current, "available": available_ver})
 
-        host = request.host
-        scheme = request.scheme
-        firmware_url = f"{scheme}://{host}/api/ota/firmware.bin"
+        # Wave 14 W14-L05: prefer the canonical URL baked into
+        # version.json over request.host.  A misconfigured reverse-
+        # proxy or an unexpected Host header could otherwise trick
+        # Tab5 into downloading firmware from the wrong place.
+        # The SHA256 check in ota.c is the real integrity gate, but
+        # this tightens the layer above.  Fall back to request.host
+        # for back-compat with version.json files that don't include
+        # a url.
+        firmware_url = info.get("url")
+        if not firmware_url:
+            host = request.host
+            scheme = request.scheme
+            firmware_url = f"{scheme}://{host}/api/ota/firmware.bin"
         return web.json_response({
             "update": True, "version": available_ver,
             "url": firmware_url, "sha256": sha256,

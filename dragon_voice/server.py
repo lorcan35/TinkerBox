@@ -16,7 +16,7 @@ import logging
 import os
 import resource
 import time
-from typing import Optional
+from typing import ClassVar, Optional
 
 import aiohttp
 from aiohttp import web, WSMsgType
@@ -96,7 +96,17 @@ class VoiceServer:
         """Create and configure the aiohttp application."""
         app = web.Application(
             client_max_size=32 * 1024 * 1024,  # 32MB for audio uploads
-            middlewares=[self._cors_middleware, self._auth_middleware],
+            # Wave 14 W14-M06: _security_headers_middleware is OUTERMOST
+            # (first in the list) so every response — including the 401
+            # from _auth_middleware before handler even runs — gets the
+            # defensive headers stamped on its way out.  CORS runs next
+            # and can't override because the security middleware uses
+            # `if k not in response.headers` semantics.
+            middlewares=[
+                self._security_headers_middleware,
+                self._cors_middleware,
+                self._auth_middleware,
+            ],
         )
 
         # HTTP routes (legacy)
@@ -123,12 +133,14 @@ class VoiceServer:
         return app
 
     # Allowed CORS origins — only these can make cross-origin API calls
-    _CORS_ALLOWED_ORIGINS = {
+    # Wave 14 W14-M14: frozenset at class scope (ruff RUF012) — no
+    # accidental mutation across instances.
+    _CORS_ALLOWED_ORIGINS: ClassVar[frozenset[str]] = frozenset({
         "http://localhost:3500",
         "http://127.0.0.1:3500",
         "http://192.168.1.90:8080",
         "https://tinkerclaw-dashboard.ngrok.dev",
-    }
+    })
 
     @web.middleware
     async def _cors_middleware(self, request: web.Request, handler):
@@ -152,6 +164,50 @@ class VoiceServer:
             })
         response = await handler(request)
         response.headers["Access-Control-Allow-Origin"] = origin
+        return response
+
+    # ----------------------------------------------------------------- Security headers
+    #
+    # Wave 14 W14-M06: stamp the standard defensive headers on every
+    # response. Amplifies the W14-H02 dashboard XSS sweep (CSP blocks
+    # the payload even if a new innerHTML site slips through the
+    # escHtml gate) and blocks framing + MIME sniffing for free.
+    # /dashboard SPA uses Google Fonts so the CSP allows that origin
+    # specifically; all other sources stay same-origin.
+    _SECURITY_HEADERS = {
+        "X-Content-Type-Options": "nosniff",
+        "X-Frame-Options": "DENY",
+        "Referrer-Policy": "no-referrer",
+        # CSP — intentionally strict.  style-src allows 'unsafe-inline'
+        # because the dashboard inlines its whole stylesheet.  If we
+        # ever extract the CSS to a separate file, tighten this.
+        "Content-Security-Policy": (
+            "default-src 'self'; "
+            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+            "font-src 'self' https://fonts.gstatic.com; "
+            "img-src 'self' data:; "
+            "connect-src 'self'; "
+            "frame-ancestors 'none'; "
+            "base-uri 'self'"
+        ),
+    }
+
+    @web.middleware
+    async def _security_headers_middleware(self, request: web.Request, handler):
+        response = await handler(request)
+        # Only stamp on Response objects — WS upgrade responses are
+        # not subject to CSP and setting these headers on them confuses
+        # some clients. aiohttp WebSocketResponse doesn't expose
+        # .headers until prepare(); the middleware path doesn't touch
+        # it in that case.
+        try:
+            for k, v in self._SECURITY_HEADERS.items():
+                if k not in response.headers:
+                    response.headers[k] = v
+        except (AttributeError, TypeError):
+            # WS responses or streaming responses that don't expose
+            # headers in this phase — skip silently.
+            pass
         return response
 
     # ----------------------------------------------------------------- Auth

@@ -42,9 +42,11 @@ async def test_store_returns_media_id(tmp_path):
     media_id = await store.store(b"hello world", "txt")
     assert isinstance(media_id, str)
     assert media_id.endswith(".txt")
-    # ID part is exactly 12 hex chars + dot + ext
+    # Wave 14 W14-H04: id is the full uuid4 hex (32 chars = 128 bits),
+    # up from the old 12-hex prefix (48 bits) that was too short for a
+    # "authenticated by obscurity" design.
     name_part = media_id.rsplit(".", 1)[0]
-    assert len(name_part) == 12
+    assert len(name_part) == 32
     assert all(c in "0123456789abcdef" for c in name_part)
 
 

@@ -57,10 +57,14 @@ class MessageRoutes:
         if not text:
             return json_error("'text' field is required")
 
+        # Wave 14 W14-H05: drop the hardcoded Access-Control-Allow-Origin: *
+        # — it silently bypassed the 4-origin allowlist enforced by
+        # VoiceServer._cors_middleware.  The middleware stamps the correct
+        # origin on ALLOWED cross-origin requests; non-browser callers don't
+        # need the header at all.
         response = web.StreamResponse(headers={
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
-            "Access-Control-Allow-Origin": "*",
         })
         await response.prepare(request)
 

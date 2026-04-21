@@ -317,16 +317,25 @@ def load_config(path: Optional[str] = None) -> VoiceConfig:
     return config
 
 
+_SECRET_FIELD_MARKERS = ("api_key", "token", "password", "secret")
+
+
 def config_to_dict(config: VoiceConfig, redact_secrets: bool = False) -> dict:
-    """Serialize config back to a plain dict, optionally redacting secrets."""
+    """Serialize config back to a plain dict, optionally redacting secrets.
+
+    Wave 14 W14-H01: the original predicate only matched ``api_key``.  The
+    audit flagged that ``server.api_token`` (DRAGON_API_TOKEN) and
+    ``llm.tinkerclaw_token`` passed through ``GET /api/config`` in
+    cleartext, letting any authenticated caller exfiltrate the gateway
+    token.  Broader predicate covers every secret-ish field shape.
+    """
     from dataclasses import asdict
 
     d = asdict(config)
     if redact_secrets:
-        # Redact anything that looks like an API key
         for section in d.values():
             if isinstance(section, dict):
                 for key in section:
-                    if "api_key" in key and section[key]:
+                    if any(m in key for m in _SECRET_FIELD_MARKERS) and section[key]:
                         section[key] = "***redacted***"
     return d

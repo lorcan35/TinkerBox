@@ -26,16 +26,16 @@ Each of these removes friction that slows everything after it.
 - [x] **W14-C02** `[TT]` `ota.c:90-91` — NULL-guard after second `esp_http_client_init` · verified: `/ota/check` exercised, Tab5 alive post-call
 - [x] **W14-C03** `[TT]` `ui_notes.c:1066-1067` — NULL-guard on transcription-queue HTTP init · verified: transcribe queue task alive (4 notes pending), selftest wifi/voice_ws/sd_card all pass
 - [x] **W14-C04** `[TB+TT]` authenticate `/ws/voice` register frame (bearer OR signed HMAC) · TB server.py `_handle_ws_voice` + TT sdkconfig/Kconfig/voice.c · verified: Dragon rejects no-bearer with HTTP 401, Tab5 flashed with matching token in sdkconfig.local reconnects inside 8 s, `active_connections=1` on Dragon, session resumed cleanly
-- [ ] **W14-C05** `[TB]` port `NotesDB` to `aiosqlite` (or uniform `asyncio.to_thread`)
+- [x] **W14-C05** `[TB]` port `NotesDB` to `aiosqlite` (or uniform `asyncio.to_thread`) · TinkerBox `65c182f` · verified: 8/8 pytest + 5×CRUD sequential live (2→7→2 row cycle), updates/deletes all 200
 - [x] **W14-C06** `[TB]` store + cancel 3 fire-and-forget `asyncio.create_task` sites · same commit as M16 · verified: NotesService._spawn_bg + conn_state["bg_tasks"] both wired; cancelled in shutdown/_handle_disconnect
 
 ## Phase 3 — HIGH security (Dragon)
 
-- [ ] **W14-H01** `[TB]` widen `config_to_dict` redaction predicate to include `token|password|secret`
+- [x] **W14-H01** `[TB]` widen `config_to_dict` redaction predicate to include `token|password|secret` · 5/5 pytest + live `/api/config` both tokens show `***redacted***`
 - [ ] **W14-H02** `[TB]` sweep dashboard innerHTML interpolations through `escHtml`; move `d.id` out of inline `onclick`
-- [ ] **W14-H03** `[TB]` SSRF protection on `MediaPipeline.proxy_image` (reject loopback/link-local/RFC1918, cap redirects, running-byte-counter)
-- [ ] **W14-H04** `[TB]` bind `/api/media/{id}` to session OR issue HMAC-signed URLs; widen id to 128 bits
-- [ ] **W14-H05** `[TB]` drop hardcoded `Access-Control-Allow-Origin: *` from `messages.py`/`completions.py`/`dashboard.py`
+- [x] **W14-H03** `[TB]` SSRF protection on `MediaPipeline.proxy_image` (reject loopback/link-local/RFC1918, cap redirects, running-byte-counter) · 13/13 pytest + stream-read refactor
+- [x] **W14-H04** `[TB]` bind `/api/media/{id}` to session OR issue HMAC-signed URLs; widen id to 128 bits · 11/11 pytest + live 403/200/403 for unsigned/signed/tampered
+- [x] **W14-H05** `[TB]` drop hardcoded `Access-Control-Allow-Origin: *` from `messages.py`/`completions.py`/`dashboard.py` · 3 sites · middleware's origin allowlist now decides
 
 ## Phase 4 — HIGH stability (firmware + server)
 
@@ -108,3 +108,5 @@ _(filled in as we close items — template: `PR#` · branch · items closed · e
 _(append one line per closure with ID + evidence ref)_
 
 **2026-04-21 14:10 — wave-14 branches created; tracker committed.**
+
+**2026-04-21 15:14 — Phase 2b: W14-C05 NotesDB async port committed on feat/audit-wave-14-phase2b (65c182f), 8/8 pytest green, live CRUD green, all 6 CRITICALs now code-complete.**

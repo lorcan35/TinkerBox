@@ -10,9 +10,12 @@ Max 3 media items per response (MAX_MEDIA_PER_RESPONSE = 3).
 """
 
 import io
+import ipaddress
 import re
 import logging
+import socket
 from typing import Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -42,16 +45,78 @@ _RE_IMAGE_URL = re.compile(
 # Max download size for proxied images (10 MB)
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024
 
+# Wave 14 W14-H03: SSRF-protection knobs.  proxy_image is reachable from
+# any LLM output (prompt-injection via web_search or user text), so the
+# fetch has to refuse internal/meta-data addresses and cap redirect chains.
+_SSRF_MAX_REDIRECTS = 2
+# streamed-read chunk — small enough to bail early on oversize but big
+# enough not to dominate aiohttp's per-iter cost
+_PROXY_CHUNK_BYTES = 64 * 1024
+
+
+def _is_public_ip(addr: str) -> bool:
+    """True if *addr* is a globally routable IPv4/IPv6 address.
+
+    Rejects loopback, link-local, RFC1918 private, multicast, reserved,
+    unspecified, and IPv6 site/unique-local ranges — exactly the ranges
+    an attacker would target via prompt-injection (AWS metadata
+    169.254.169.254, internal OpenAI proxies, localhost services like
+    Ollama on 11434, TinkerClaw gateway on 18789, etc.).
+    """
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return False
+    return ip.is_global and not (ip.is_loopback or ip.is_link_local
+                                 or ip.is_private or ip.is_multicast
+                                 or ip.is_reserved or ip.is_unspecified)
+
+
+def _assert_ssrf_safe_url(url: str) -> None:
+    """Raise ValueError if *url* points at an internal-only address.
+
+    Called BEFORE the HTTP fetch and again after any redirect to defend
+    against DNS-rebinding + Location-header tricks.  Resolves the host
+    and checks every returned A/AAAA against the public-IP predicate.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(f"SSRF: rejecting non-http scheme: {parsed.scheme!r}")
+    host = parsed.hostname
+    if not host:
+        raise ValueError("SSRF: URL has no hostname")
+    # Reject the common textual aliases up-front so an attacker can't
+    # exploit the "localhost" resolver behaviour.
+    lowered = host.lower()
+    if lowered in ("localhost", "ip6-localhost", "ip6-loopback"):
+        raise ValueError(f"SSRF: rejecting localhost alias {host!r}")
+    # Resolve and check every IP the host maps to.
+    try:
+        addrs = {r[4][0] for r in socket.getaddrinfo(host, None)}
+    except socket.gaierror as err:
+        raise ValueError(f"SSRF: DNS resolution failed for {host!r}: {err}") from err
+    if not addrs:
+        raise ValueError(f"SSRF: no IPs for host {host!r}")
+    bad = [a for a in addrs if not _is_public_ip(a)]
+    if bad:
+        raise ValueError(
+            f"SSRF: host {host!r} resolves to non-public address(es) {bad}")
+
 
 class MediaPipeline:
     """Analyses a complete LLM response and returns a list of media events.
 
     Args:
         store: A ``MediaStore`` instance used to persist rendered images.
+        url_signer: Optional ``MediaUrlSigner``.  When provided, every
+            media event's ``url`` is signed with ``?exp=&sig=`` (W14-H04).
+            When ``None``, URLs stay unsigned and any GET works — useful
+            for tests that don't want to thread a secret.
     """
 
-    def __init__(self, store) -> None:
+    def __init__(self, store, url_signer=None) -> None:
         self._store = store
+        self._signer = url_signer
         self._session: Optional[object] = None  # aiohttp.ClientSession, lazy-init
 
     # ── Public API ───────────────────────────────────────────────────────────
@@ -79,7 +144,7 @@ class MediaPipeline:
             code = m.group("code")
             try:
                 media_id = await self.render_code_block(code, lang, session_id)
-                events.append(_media_event(media_id, f"Code: {lang}"))
+                events.append(_media_event(media_id, f"Code: {lang}", self._signer))
             except Exception as exc:
                 logger.warning("MediaPipeline: code block render failed: %s", exc)
 
@@ -89,7 +154,7 @@ class MediaPipeline:
             if table_text:
                 try:
                     media_id = await self.render_table(table_text, session_id)
-                    events.append(_media_event(media_id, "Table"))
+                    events.append(_media_event(media_id, "Table", self._signer))
                 except Exception as exc:
                     logger.warning("MediaPipeline: table render failed: %s", exc)
 
@@ -100,7 +165,7 @@ class MediaPipeline:
             url = m.group(0)
             try:
                 media_id = await self.proxy_image(url, session_id)
-                events.append(_media_event(media_id, "Image"))
+                events.append(_media_event(media_id, "Image", self._signer))
             except Exception as exc:
                 logger.warning("MediaPipeline: image proxy failed for %s: %s", url, exc)
 
@@ -132,19 +197,54 @@ class MediaPipeline:
         return await self._store.store(img_bytes, "jpg", session_id)
 
     async def proxy_image(self, url: str, session_id: str = "") -> str:
-        """Download *url*, resize to ≤660 px wide, save as JPEG; return media_id."""
+        """Download *url*, resize to ≤660 px wide, save as JPEG; return media_id.
+
+        Wave 14 W14-H03 hardening:
+          * DNS-resolve the host and reject loopback/link-local/RFC1918/
+            multicast/reserved addresses so prompt-injection can't turn
+            this into an SSRF proxy.
+          * Re-check after redirects and cap the chain at 2 hops.
+          * Stream-read with a running byte counter so an oversize body
+            aborts before the server buffers the whole thing.
+        """
         import aiohttp
 
-        session = await self._get_http_session()
-        timeout = aiohttp.ClientTimeout(total=15)
-        async with session.get(url, timeout=timeout) as resp:
-            resp.raise_for_status()
-            data = await resp.read()
+        # Pre-flight SSRF check BEFORE the fetch.
+        _assert_ssrf_safe_url(url)
 
-        if len(data) > _MAX_IMAGE_BYTES:
-            raise ValueError(
-                f"Image too large: {len(data)} bytes (max {_MAX_IMAGE_BYTES})"
-            )
+        session = await self._get_http_session()
+        timeout = aiohttp.ClientTimeout(total=15, sock_connect=5)
+        # Disable aiohttp's automatic redirect-following — we want to
+        # inspect every hop for SSRF-safe destinations ourselves.
+        current_url = url
+        for hop in range(_SSRF_MAX_REDIRECTS + 1):
+            async with session.get(
+                current_url, timeout=timeout, allow_redirects=False,
+            ) as resp:
+                if resp.status in (301, 302, 303, 307, 308):
+                    loc = resp.headers.get("Location")
+                    if not loc:
+                        raise ValueError("SSRF: redirect with no Location")
+                    if hop >= _SSRF_MAX_REDIRECTS:
+                        raise ValueError(
+                            f"SSRF: too many redirects (limit {_SSRF_MAX_REDIRECTS})")
+                    _assert_ssrf_safe_url(loc)
+                    current_url = loc
+                    continue
+                resp.raise_for_status()
+                # Stream-read with running byte counter; bail before the
+                # full body lands if it exceeds the cap.
+                buf = bytearray()
+                async for chunk in resp.content.iter_chunked(_PROXY_CHUNK_BYTES):
+                    buf.extend(chunk)
+                    if len(buf) > _MAX_IMAGE_BYTES:
+                        raise ValueError(
+                            f"Image too large: > {_MAX_IMAGE_BYTES} bytes "
+                            f"(halted at {len(buf)} bytes)")
+                data = bytes(buf)
+                break
+        else:
+            raise ValueError("SSRF: redirect loop exhausted without a 2xx")
 
         img_bytes = _resize_jpeg(data, TARGET_WIDTH)
         return await self._store.store(img_bytes, "jpg", session_id)
@@ -152,11 +252,19 @@ class MediaPipeline:
     # ── Internal helpers ─────────────────────────────────────────────────────
 
     async def _get_http_session(self):
-        """Lazy-init a cached aiohttp.ClientSession."""
+        """Lazy-init a cached aiohttp.ClientSession.
+
+        Wave 14 W14-M10: give the session a default timeout so any caller
+        that forgets to pass one per-request doesn't block forever on a
+        half-open TCP.  Individual proxy_image calls still override
+        per-call with a tighter total/sock_connect budget.
+        """
         import aiohttp
 
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30, sock_connect=5),
+            )
         return self._session
 
     def strip_rendered_content(self, text: str, events: list[dict]) -> str:
@@ -370,11 +478,14 @@ def _resize_jpeg(img_bytes: bytes, max_width: int) -> bytes:
 
 
 
-def _media_event(media_id: str, alt: str) -> dict:
+def _media_event(media_id: str, alt: str, signer=None) -> dict:
+    # Wave 14 W14-H04: sign the URL when a signer is wired.  Falls back
+    # to the plain /api/media/{id} path when signing is disabled.
+    url = signer.sign(media_id) if signer is not None else f"/api/media/{media_id}"
     return {
         "type": "media",
         "media_type": "image",
-        "url": f"/api/media/{media_id}",
+        "url": url,
         "width": TARGET_WIDTH,
         "height": 0,
         "alt": alt,

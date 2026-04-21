@@ -17,6 +17,8 @@ import socket
 from typing import Optional
 from urllib.parse import urlparse
 
+import aiohttp
+
 logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -142,10 +144,17 @@ class MediaPipeline:
                 break
             lang = m.group("lang").strip() or "text"
             code = m.group("code")
+            # Wave 14 W14-H13: narrow from bare Exception.  render_code_block
+            # invokes Pygments + PIL; the realistic failure set is OSError
+            # (font not installed — wave-5 entry #64), ValueError (malformed
+            # code), and PIL.UnidentifiedImageError.  A TypeError or
+            # AttributeError here signals a bug in the renderer and should
+            # bubble so the watchdog surfaces it instead of turning into a
+            # silent warning.
             try:
                 media_id = await self.render_code_block(code, lang, session_id)
                 events.append(_media_event(media_id, f"Code: {lang}", self._signer))
-            except Exception as exc:
+            except (OSError, ValueError, RuntimeError) as exc:
                 logger.warning("MediaPipeline: code block render failed: %s", exc)
 
         # 2. Markdown tables
@@ -155,7 +164,7 @@ class MediaPipeline:
                 try:
                     media_id = await self.render_table(table_text, session_id)
                     events.append(_media_event(media_id, "Table", self._signer))
-                except Exception as exc:
+                except (OSError, ValueError, RuntimeError) as exc:
                     logger.warning("MediaPipeline: table render failed: %s", exc)
 
         # 3. Image URLs
@@ -163,10 +172,12 @@ class MediaPipeline:
             if len(events) >= MAX_MEDIA_PER_RESPONSE:
                 break
             url = m.group(0)
+            # proxy_image can raise aiohttp.ClientError (network), ValueError
+            # (SSRF/too-large from W14-H03), or OSError (image decode).
             try:
                 media_id = await self.proxy_image(url, session_id)
                 events.append(_media_event(media_id, "Image", self._signer))
-            except Exception as exc:
+            except (aiohttp.ClientError, OSError, ValueError, RuntimeError) as exc:
                 logger.warning("MediaPipeline: image proxy failed for %s: %s", url, exc)
 
         return events
@@ -294,14 +305,17 @@ class MediaPipeline:
 
 def _render_code_pygments(code: str, language: str) -> bytes:
     """Return raw PNG bytes of syntax-highlighted *code* using Pygments."""
+    import pygments.util
     from pygments import highlight
     from pygments.lexers import get_lexer_by_name, TextLexer
     from pygments.formatters import ImageFormatter
     from pygments.styles import get_style_by_name
 
+    # Pygments raises ClassNotFound on an unknown language — that's
+    # the only failure mode here, and the fallback is correct.
     try:
         lexer = get_lexer_by_name(language, stripall=True)
-    except Exception:
+    except pygments.util.ClassNotFound:
         lexer = TextLexer(stripall=True)
 
     formatter = ImageFormatter(

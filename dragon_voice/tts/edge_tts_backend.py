@@ -8,6 +8,7 @@ import asyncio
 import io
 import logging
 
+import aiohttp
 import numpy as np
 
 from dragon_voice.config import TTSConfig
@@ -51,10 +52,14 @@ class EdgeTTSBackend(TTSBackend):
                 )
             self._available = True
             logger.info("Edge TTS initialized — %d voices available", len(voices))
-        except Exception:
+        except (aiohttp.ClientError, TimeoutError, OSError) as exc:
+            # W14-H13: the list_voices probe talks to a Microsoft
+            # endpoint; aiohttp/timeout/OS-level network errors are
+            # the full realistic set.  AttributeError or similar
+            # signals an edge-tts API change — bubble.
             logger.warning(
-                "Edge TTS connectivity check failed — synthesis will be "
-                "attempted but may fail if offline"
+                "Edge TTS connectivity check failed (%s) — synthesis will be "
+                "attempted but may fail if offline", exc
             )
             self._available = True  # Still allow attempts
 

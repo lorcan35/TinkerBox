@@ -92,6 +92,14 @@ class VoiceServer:
         )
         self._media_cleanup_task: Optional[asyncio.Task] = None
 
+        # Wave 15 W15-C01: shared backend pool so STT/TTS/LLM instances
+        # persist across Tab5 WS reconnects.  Key = stable signature
+        # tuple (see pipeline._stt_sig / _tts_sig / _llm_sig).  Every
+        # VoicePipeline takes this dict and borrows/returns backends.
+        # Backends are only shut down on server shutdown; per-pipeline
+        # shutdown is a no-op for pooled instances.
+        self._backend_pool: dict = {}
+
     def create_app(self) -> web.Application:
         """Create and configure the aiohttp application."""
         app = web.Application(
@@ -118,6 +126,11 @@ class VoiceServer:
         app.router.add_post("/debug/widget_media", self._debug_widget_media)
         app.router.add_get("/api/config", self._handle_get_config)
         app.router.add_post("/api/config", self._handle_set_config)
+
+        # Wave 15 W15-C01: tracemalloc-backed mem-diff probe.  Returns
+        # top-N allocation growers since baseline so we can pinpoint
+        # the RSS leak.  Bearer-gated via the auth middleware.
+        app.router.add_get("/debug/mem", self._handle_debug_mem)
 
         # Dashboard proxy — forwards /dashboard* to localhost:3500
         app.router.add_route("*", "/dashboard{path:.*}", self._proxy_dashboard)
@@ -673,6 +686,7 @@ class VoiceServer:
                                     conversation_engine=self._conversation,
                                     session_id=conn.get("session_id", ""),
                                     media_pipeline=self._media_pipeline,
+                                    backend_pool=self._backend_pool,
                                 )
                                 await pipeline.initialize()
                                 conn["pipeline"] = pipeline
@@ -724,6 +738,21 @@ class VoiceServer:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._active_connections.clear()
+
+        # Wave 15 W15-C01: now that no pipelines are holding references,
+        # shut down the shared backend pool.  Per-pipeline shutdowns
+        # above are no-ops for pooled backends (_pooled_* flag), so the
+        # pool is the single owner responsible for final teardown.
+        pool_tasks = []
+        for key, backend in list(self._backend_pool.items()):
+            logger.info("W15-C01: releasing pooled backend %s", key)
+            try:
+                pool_tasks.append(backend.shutdown())
+            except (AttributeError, RuntimeError) as e:
+                logger.warning("W15-C01: pool backend %s shutdown raised: %s", key, e)
+        if pool_tasks:
+            await asyncio.gather(*pool_tasks, return_exceptions=True)
+        self._backend_pool.clear()
 
         # v4·D audit P0 fix: release the inference ThreadPoolExecutor so
         # uvloop can exit cleanly.  Previously zombie threads lingered.
@@ -815,6 +844,105 @@ class VoiceServer:
                 },
             }
         )
+
+    async def _handle_debug_mem(self, request: web.Request) -> web.Response:
+        """W15-C01 mem-diff probe.
+
+        Returns the top-N allocation groups (ranked by growth since
+        baseline) from tracemalloc.  The baseline is taken on first
+        call; subsequent calls diff against the stored baseline.  The
+        ``?reset=1`` query flag replaces the baseline with the current
+        snapshot, so we can bisect leak growth windows.
+
+        Requires ``DRAGON_TRACEMALLOC=1`` in the env — otherwise the
+        endpoint returns 503 with a hint.
+        """
+        import tracemalloc
+        import resource
+        if not tracemalloc.is_tracing():
+            return web.json_response(
+                {
+                    "error": "tracemalloc_disabled",
+                    "hint": "export DRAGON_TRACEMALLOC=1 and restart voice service",
+                },
+                status=503,
+            )
+        snap = tracemalloc.take_snapshot()
+        # Filter out tracemalloc's own frames so the output isn't
+        # dominated by bookkeeping.
+        snap = snap.filter_traces(
+            (
+                tracemalloc.Filter(False, tracemalloc.__file__),
+                tracemalloc.Filter(False, "<frozen importlib._bootstrap>"),
+                tracemalloc.Filter(False, "<frozen importlib._bootstrap_external>"),
+            )
+        )
+        reset = request.query.get("reset", "0") == "1"
+        topn = int(request.query.get("n", "25"))
+        # Current RSS (kilobytes on Linux -> bytes).
+        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        rss_mb = rss_kb / 1024.0
+        out: dict = {
+            "rss_mb": round(rss_mb, 1),
+            "uptime_seconds": round(time.time() - self._start_time, 1),
+            "active_connections": len(self._active_connections),
+            "tracemalloc_peak_mb": round(tracemalloc.get_traced_memory()[1] / 1024 / 1024, 1),
+        }
+        # Optional ?trim=1 to force gc+malloc_trim before snapshot —
+        # tells us how much of RSS is reclaimable vs truly leaked.
+        if request.query.get("trim", "0") == "1":
+            before_rss = rss_mb
+            import ctypes
+            gc.collect()
+            try:
+                libc = ctypes.CDLL("libc.so.6")
+                libc.malloc_trim(0)
+            except (OSError, AttributeError) as e:
+                out["malloc_trim_error"] = str(e)
+            rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            rss_mb = rss_kb / 1024.0
+            out["rss_mb_after_trim"] = round(rss_mb, 1)
+            out["rss_reclaimed_mb"] = round(before_rss - rss_mb, 1)
+
+        baseline = getattr(self, "_mem_baseline", None)
+        if baseline is None or reset:
+            self._mem_baseline = snap
+            self._mem_baseline_rss_mb = rss_mb
+            out["note"] = "baseline set — call again after load to see diff"
+        else:
+            stats = snap.compare_to(baseline, "lineno")
+            out["rss_delta_mb"] = round(rss_mb - self._mem_baseline_rss_mb, 1)
+            out["top"] = [
+                {
+                    "file": f"{s.traceback[0].filename.split('/')[-1]}:{s.traceback[0].lineno}",
+                    "size_mb": round(s.size / 1024 / 1024, 3),
+                    "size_diff_mb": round(s.size_diff / 1024 / 1024, 3),
+                    "count": s.count,
+                    "count_diff": s.count_diff,
+                }
+                for s in stats[:topn]
+            ]
+
+        # gc object counts by type — catches leaks tracemalloc misses
+        # (objects that grow in count, held in long-lived caches).
+        from collections import Counter
+        type_counts = Counter(type(o).__name__ for o in gc.get_objects())
+        # Persist a baseline so we can diff count growth too.
+        base_counts = getattr(self, "_mem_type_counts", None)
+        if base_counts is None or reset:
+            self._mem_type_counts = type_counts
+            out["top_types"] = [
+                {"type": k, "count": v}
+                for k, v in type_counts.most_common(25)
+            ]
+        else:
+            diff = {k: type_counts[k] - base_counts.get(k, 0) for k in type_counts}
+            growers = sorted(diff.items(), key=lambda kv: -kv[1])[:25]
+            out["top_type_growers"] = [
+                {"type": k, "delta": d, "now": type_counts[k]}
+                for k, d in growers if d > 0
+            ]
+        return web.json_response(out)
 
 
     async def _debug_widget_chart(self, request: web.Request) -> web.Response:
@@ -1550,16 +1678,31 @@ class VoiceServer:
                                             })
                                         continue
 
-                                # Also swap ConversationEngine LLM (used by _handle_text)
+                                # Also swap ConversationEngine LLM (used by _handle_text).
+                                # W15-C01: prefer the pooled instance so we don't
+                                # re-load Ollama / re-open the aiohttp session on
+                                # every config_update.  Only the pipeline owns the
+                                # shutdown of a pooled backend.
                                 if self._conversation:
                                     try:
                                         from dragon_voice.llm import create_llm
-                                        if self._conversation._llm:
-                                            await self._conversation._llm.shutdown()
-                                        new_llm = create_llm(conn_config.llm)
-                                        await new_llm.initialize()
+                                        from dragon_voice.pipeline import _llm_sig
+                                        new_key = _llm_sig(conn_config.llm)
+                                        pooled = self._backend_pool.get(new_key)
+                                        old_llm = self._conversation._llm
+                                        if pooled is not None:
+                                            new_llm = pooled
+                                        else:
+                                            new_llm = create_llm(conn_config.llm)
+                                            await new_llm.initialize()
+                                            self._backend_pool[new_key] = new_llm
+                                        # Only shutdown the OLD one if nobody in the
+                                        # pool references it (i.e. it wasn't pooled).
+                                        if old_llm is not None and old_llm not in self._backend_pool.values():
+                                            await old_llm.shutdown()
                                         self._conversation._llm = new_llm
-                                        logger.info("ConversationEngine LLM swapped to %s", new_llm.name)
+                                        logger.info("ConversationEngine LLM swapped to %s%s",
+                                                    new_llm.name, " (pooled)" if pooled else "")
                                     except Exception as e:
                                         logger.exception("ConversationEngine LLM swap failed: %s", e)
 
@@ -1939,6 +2082,7 @@ class VoiceServer:
             conversation_engine=self._conversation,
             session_id=session_id,
             media_pipeline=self._media_pipeline,
+            backend_pool=self._backend_pool,
         )
         try:
             await pipeline.initialize()

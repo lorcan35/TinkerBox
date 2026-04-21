@@ -9,7 +9,9 @@ Usage:
 
 import argparse
 import logging
+import os
 import sys
+import tracemalloc
 
 from dragon_voice.config import load_config
 from dragon_voice.server import run_server
@@ -115,6 +117,18 @@ def main() -> None:
             return True
 
     logging.getLogger().addFilter(_SecretRedactingFilter())
+
+    # Wave 15 W15-C01: opt-in tracemalloc for the RSS leak hunt.
+    # Starts before any module does meaningful allocation so the
+    # baseline snapshot is accurate.  Frame depth 20 to keep traces
+    # deep enough to pin library leaks (aiohttp/onnx) to the caller.
+    # Cost is ~2% CPU overhead on Dragon which is acceptable for
+    # live soak.  Flip DRAGON_TRACEMALLOC=1 in the systemd unit.
+    if os.environ.get("DRAGON_TRACEMALLOC", "0") == "1":
+        tracemalloc.start(20)
+        logging.getLogger("dragon_voice").info(
+            "W15-C01: tracemalloc started (frames=20) for RSS leak diagnosis",
+        )
 
     # Load config
     config = load_config(args.config)

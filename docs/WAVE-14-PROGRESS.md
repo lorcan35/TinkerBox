@@ -62,14 +62,14 @@ Each of these removes friction that slows everything after it.
 
 ## Phase 6 — MEDIUM
 
-- [ ] **W14-M01** `[TT]` mutex coverage for `voice_get_*` readers (copy-under-lock)
-- [ ] **W14-M02** `[TT]` move overflow log outside `s_play_mutex`
-- [ ] **W14-M03** `[TT]` `volatile` on `s_ws` + `dragon_link.s_state`
-- [ ] **W14-M04** `[TT]` check `fread`/`fwrite` returns in WAV-header repair
+- [x] **W14-M01** `[TT]` mutex coverage for `voice_get_*` readers (copy-under-lock) · new `voice_get_{last_transcript,stt_text,llm_text}_copy` helpers; debug_server migrated (httpd task no longer races WS RX)
+- [x] **W14-M02** `[TT]` move overflow log outside `s_play_mutex` · already outside mutex at voice.c:394 — no code change needed; audit was against a stale snapshot
+- [x] **W14-M03** `[TT]` `volatile` on `s_ws` + `dragon_link.s_state` · both decls now `volatile`; use-after-free race on disconnect closed
+- [x] **W14-M04** `[TT]` check `fread`/`fwrite` returns in WAV-header repair · all 4 fseek/fread/fwrite returns checked; garbage-on-short-read corruption vector closed
 - [ ] **W14-M05** `[TB]` switch `serve_media` to `web.FileResponse` (folded into H08)
 - [x] **W14-M06** `[TB]` response-headers middleware (CSP, X-CTO, X-Frame-Options, Referrer-Policy) · outermost middleware stamps on every response incl. 401s; 3 pytest cases; live curl -sI confirms all 4 headers on /health and 401 path.
 - [ ] **W14-M07** `[TB]` TinkerClaw gateway SSE chunk validation + length cap
-- [ ] **W14-M08** `[TT]` log `receipt_attach`/`voice_async_*` OOM drops
+- [x] **W14-M08** `[TT]` log `receipt_attach`/`voice_async_*` OOM drops · `ESP_LOGW` on all 3 drop paths
 - [ ] **W14-M09** `[TB]` `cancel() + await` `_periodic_purge` (wave 13 H3 pattern)
 - [ ] **W14-M10** `[TB]` ClientTimeout on MediaPipeline session (folded into H09)
 - [x] **W14-M11** `[TB]` call `config.validate()` at end of `load_config`; raise on error · load_config now raises ValueError with actionable message on invalid backend string
@@ -86,9 +86,9 @@ Each of these removes friction that slows everything after it.
 
 ## Phase 7 — LOW
 
-- [ ] **W14-L01** `[TT]` delete dead `s_rec_paused` + TODO
-- [ ] **W14-L02** `[TT]` bounds-guard size_t→int cast in `voice_ws_send_text`/`_send_binary`
-- [ ] **W14-L03** `[TT]` observability log in `config_update` no-op branch
+- [x] **W14-L01** `[TT]` delete dead `s_rec_paused` + TODO · variable + 3 callsites removed
+- [x] **W14-L02** `[TT]` bounds-guard size_t→int cast in `voice_ws_send_text`/`_send_binary` · `len > INT_MAX` gate + NULL-arg reject
+- [x] **W14-L03** `[TT]` observability log in `config_update` no-op branch · ESP_LOGD trail when neither voice_mode nor cloud_mode nor error is present
 - [x] **W14-L04** `[TB]` clamp + try/except in `parse_pagination` · non-numeric limit no longer raises 500; negative offset clamped to 0. Live curl `?limit=abc` returns 200.
 - [x] **W14-L05** `[TB]` `/api/ota/check` read canonical host from config · prefer version.json's `url` field; falls back to request.host for back-compat
 - [x] **W14-L06** `[OPS]` logging.Filter redacting Bearer/sk- patterns · installed in `dragon_voice/__main__.py`; covers Bearer tokens, `sk-*` keys, and json `api_token`/`tinkerclaw_token` values

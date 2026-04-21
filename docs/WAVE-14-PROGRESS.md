@@ -54,11 +54,11 @@ Each of these removes friction that slows everything after it.
 
 ## Phase 5 — HIGH docs + protocol
 
-- [ ] **W14-H19** `[DOC]` reconcile `capabilities.widgets` / `widget_capability` / protocol.md §2.1 / §17.12
+- [x] **W14-H19** `[DOC]` reconcile `capabilities.widgets` / `widget_capability` / protocol.md §2.1 / §17.12 · §2.1 register now documents `capabilities.widgets` nested form; §17.12 rewritten as "wave-14 reconciliation note" pointing back; reference table updated
 - [ ] **W14-H20** `[DOC]` `clear_history` → `clear` in TinkerTab/CLAUDE.md
-- [ ] **W14-H21** `[DOC]` delete `conn_mode` paragraph from TinkerBox/CLAUDE.md
+- [x] **W14-H21** `[DOC]` delete `conn_mode` paragraph from TinkerBox/CLAUDE.md · removed from header + table row; voice_mode now includes 0|1|2|3
 - [ ] **W14-H22** `[DOC]` extend TinkerTab/CLAUDE.md NVS keys table with 11 missing entries
-- [ ] **W14-H23** `[DOC]` endpoint count: pick one number or generate from code
+- [x] **W14-H23** `[DOC]` endpoint count: pick one number or generate from code · canonical count is 47 REST endpoints; 3 stale callsites all updated with grep-from-code formula
 
 ## Phase 6 — MEDIUM
 

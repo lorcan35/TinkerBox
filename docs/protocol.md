@@ -101,7 +101,18 @@ On reconnect, Tab5 sends the stored `session_id` in the `register` message to re
     "screen": true,
     "camera": true,
     "sd_card": true,
-    "touch": true
+    "touch": true,
+    "widgets": {
+      "types": ["live","card","list","chart","media","prompt"],
+      "list_max_items": 5,
+      "chart_max_points": 12,
+      "prompt_max_choices": 3,
+      "screen_w": 720,
+      "screen_h": 1280,
+      "media_max_w": 660,
+      "media_max_h": 440,
+      "action_rate_per_sec": 4
+    }
   }
 }
 ```
@@ -116,6 +127,7 @@ On reconnect, Tab5 sends the stored `session_id` in the `register` message to re
 | `platform` | string | yes | Device type identifier (e.g. `"esp32p4-tab5"`). |
 | `session_id` | string or null | no | Previous session ID to resume, or `null` for new session. |
 | `capabilities` | object | yes | Declares device hardware capabilities. |
+| `capabilities.widgets` | object | no | Wave-14 W14-H19: widget capability descriptor. Tab5 advertises widget-renderer limits here instead of as a separate `widget_capability` frame (see below). `types` is the set of widget kinds the renderer supports; the `*_max_*` / `screen_*` numbers let skills downgrade gracefully (e.g. a 20-point chart truncates to 12). |
 
 **When sent:** Immediately after WebSocket connection is established, before any other frames.
 
@@ -1347,7 +1359,7 @@ clients that don't recognize a `widget_*` type simply ignore it.
 | Dragon → Tab5 | `widget_prompt` | Ask one question with typed input |
 | Dragon → Tab5 | `widget_dismiss` | Dismiss any non-live widget by card_id |
 | Tab5 → Dragon | `widget_action` | User tapped action or answered prompt |
-| Tab5 → Dragon | `widget_capability` | Advertise supported widgets / icons (optional) |
+| Tab5 → Dragon | `register.capabilities.widgets` | Widget renderer limits — nested inline in §2.1 `register`, **not** a standalone frame (W14-H19). |
 
 ### 17.2 Live widget — `widget_live`
 
@@ -1536,26 +1548,20 @@ With payload (from prompt answer or list selection):
 Dragon's `widget_action_router` dispatches to the owning skill's
 `on_action(event, payload)` handler. Errors → `widget_card` with `tone=alert`.
 
-### 17.12 Capability advertisement — `widget_capability` (Tab5 → Dragon)
+### 17.12 Capability advertisement — inline in `register` frame
 
-Optional. Extends the existing `register` frame. Sent at registration or on
-firmware upgrade.
+**Wave 14 W14-H19 reconciliation:** this section previously described a
+standalone `{"type":"widget_capability",...}` frame sent separately from
+`register`. That frame was **never implemented**. In reality Tab5 nests
+widget capabilities inside the `register` frame's `capabilities.widgets`
+sub-object (see §2.1). Dragon's register handler reads
+`capabilities.widgets.types` + the `*_max_*` fields and caches them on
+the session; the `SurfaceManager` downgrade path uses those values.
 
-```json
-{
-  "type": "widget_capability",
-  "widgets": ["live", "card", "list", "media", "prompt"],
-  "icons": ["clock","briefcase","laundry","coffee","book","car","pot",
-            "person","droplet","check","alert","sun","moon","cloud",
-            "calendar","star"],
-  "render_mode": "client",
-  "screen": {"w": 720, "h": 1280, "fmt": "rgb565", "touch": true},
-  "input": {"mic": true, "keyboard": true, "imu": true, "camera": true}
-}
-```
-
-Brain stores this per session. Missing = assume full capability (Tab5
-default). Used by `SurfaceManager` to downgrade before emission.
+If you're looking for the shape, see §2.1 — it is canonical. The
+icon list + separate `render_mode` fields from the old spec are not
+plumbed; Dragon assumes `render_mode: "client"` and does not restrict
+icons server-side (unknown icons render blank on Tab5 per §17.13).
 
 ### 17.13 Error handling
 
@@ -1592,5 +1598,5 @@ widget_card is its superset (adds action).
 | `widget_prompt` | D→T | `skill_id`, `card_id`, `question`, `input`, `on_answer` | v1 |
 | `widget_dismiss` | D→T | `card_id` | v1 |
 | `widget_action` | T→D | `card_id`, `event` | v1 |
-| `widget_capability` | T→D | `widgets`, `render_mode` | v1 |
+| (capability) | inline in `register` | `capabilities.widgets.{types, *_max_*, screen_*}` | v1, see §2.1 |
 

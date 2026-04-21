@@ -73,12 +73,7 @@ ssh radxa@192.168.1.91 "sudo systemctl restart tinkerclaw-voice"
   - `tinkerclaw-gateway.ngrok.dev` → 18789 (TinkerClaw)
 
 ## Three-Tier Voice Mode
-Tab5 sends `{"type":"config_update","voice_mode":0|1|2,"llm_model":"...","conn_mode":0|1|2}`. Dragon hot-swaps backends:
-
-**Connection mode (`conn_mode`):** Tab5 sends `conn_mode` in config_update to indicate its network path:
-- `0` = LAN direct (low latency, no proxy)
-- `1` = ngrok tunnel (higher latency, WS keepalive required)
-- `2` = mixed / unknown
+Tab5 sends `{"type":"config_update","voice_mode":0|1|2|3,"llm_model":"..."}`. Dragon hot-swaps backends:
 
 | Mode | voice_mode | STT | LLM | TTS |
 |------|-----------|-----|-----|-----|
@@ -185,7 +180,7 @@ The web dashboard is an 11-tab single-page application served by `dashboard.py` 
 | #16 | Session management infrastructure | DONE (sessions.py, db.py) |
 | #17 | Multi-turn conversation engine | DONE (conversation.py, messages.py) |
 | #18 | Unified voice + text input | DONE (server.py handles both voice and text) |
-| #21 | REST API framework | DONE (api/ package, 52 endpoints) |
+| #21 | REST API framework | DONE (api/ package, 47 endpoints — see header) |
 | #19 | Notes feature | DONE (notes/ module wired into server.py, API routes registered) |
 | — | Cloud mode (OpenRouter STT+TTS) | DONE (openrouter_stt.py, openrouter_tts.py, config_update WS command) |
 | — | Dictation mode + post-processing | DONE (dictation in pipeline.py, auto-generated title/summary) |
@@ -221,7 +216,9 @@ See `schema.sql` — 6 tables: devices, sessions, messages, notes, events, confi
 - Paginate through old sessions via REST API
 - Dashboard shows live conversation via WebSocket events
 
-## API-First Architecture (46 REST endpoints + 1 WebSocket)
+## API-First Architecture (47 REST endpoints + 1 WebSocket)
+
+_Counted from code: `for f in dragon_voice/api/*.py dragon_voice/notes/api.py; do grep -c 'app.router.add_' "$f"; done | paste -sd+ | bc` → 47. Drifted from "46" to "52" and back — see wave-14 H23._
 
 Dragon is an API-first server. Every capability is accessible via REST so any hardware client can use it.
 
@@ -324,7 +321,7 @@ dragon_voice/         — Voice pipeline package (port 3502)
   memory.py           — MemoryService: facts + documents + RAG with Ollama embeddings
   config.py           — Config dataclasses (incl. ToolsConfig, MemoryConfig)
   config.yaml         — Default configuration
-  api/                — Modular REST API package (52 endpoints)
+  api/                — Modular REST API package (47 endpoints, counted from code)
     __init__.py       — setup_all_routes() entry point
     utils.py          — Shared helpers (json_error, pagination)
     sessions.py       — Session CRUD + lifecycle routes

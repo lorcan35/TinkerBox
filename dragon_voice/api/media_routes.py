@@ -106,24 +106,42 @@ class MediaRoutes:
         if len(raw) > _MAX_UPLOAD_BYTES:
             return web.json_response({"error": "payload too large"}, status=413)
 
+        # Wave 15 W15-C03: wrap `Image.open` in a context manager so the
+        # underlying file descriptor is released even when downstream
+        # processing raises.  Before this, every upload leaked one FD
+        # into the PIL lazy-load state, eventually crashing with
+        # "Too many open files" under sustained load.
         try:
-            img = Image.open(io.BytesIO(raw))
-        except Exception as exc:
+            with Image.open(io.BytesIO(raw)) as src:
+                src.load()  # force decode so subsequent ops don't race the FD close
+                # W15-H04: .size access on a partially-constructed Image
+                # can raise — guard it so we return 400, not 500.
+                try:
+                    w, h = src.size
+                except (AttributeError, OSError, ValueError) as exc:
+                    logger.warning("upload_media: size access failed: %s", exc)
+                    return web.json_response({"error": "invalid image"}, status=400)
+
+                # Resize so the longest side is at most _JPEG_MAX_PX
+                if max(w, h) > _JPEG_MAX_PX:
+                    scale = _JPEG_MAX_PX / max(w, h)
+                    img = src.resize(
+                        (int(w * scale), int(h * scale)), Image.LANCZOS
+                    )
+                else:
+                    img = src.copy()
+
+            # Ensure RGB (BMP frames may be RGBA or palette-mode)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=_JPEG_QUALITY)
+            img.close()
+        except (OSError, ValueError) as exc:
             logger.warning("upload_media: could not decode image: %s", exc)
             return web.json_response({"error": "invalid image"}, status=400)
 
-        # Resize so the longest side is at most _JPEG_MAX_PX
-        w, h = img.size
-        if max(w, h) > _JPEG_MAX_PX:
-            scale = _JPEG_MAX_PX / max(w, h)
-            img = img.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
-
-        # Ensure RGB (BMP frames may be RGBA or palette-mode)
-        if img.mode != "RGB":
-            img = img.convert("RGB")
-
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=_JPEG_QUALITY)
         jpeg_bytes = buf.getvalue()
 
         session_id = request.headers.get("X-Session-Id", "")

@@ -477,17 +477,26 @@ def _extract_table(text: str) -> Optional[str]:
 
 
 def _resize_jpeg(img_bytes: bytes, max_width: int) -> bytes:
-    """Resize image data so its width is at most *max_width*; return JPEG bytes."""
+    """Resize image data so its width is at most *max_width*; return JPEG bytes.
+
+    Wave 15 W15-C03: `Image.open` returns a lazy handle that holds a file
+    descriptor on the BytesIO buffer until `.close()` is called.  On the
+    media-rendering hot path (every code block, table, image URL) this
+    was leaking an FD per call.  Now wrapped in a context manager.
+    """
     from PIL import Image
 
-    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    w, h = img.size
-    if w > max_width:
-        new_h = int(h * max_width / w)
-        img = img.resize((max_width, new_h), Image.LANCZOS)
+    with Image.open(io.BytesIO(img_bytes)) as src:
+        src.load()
+        img = src.convert("RGB")
+        w, h = img.size
+        if w > max_width:
+            new_h = int(h * max_width / w)
+            img = img.resize((max_width, new_h), Image.LANCZOS)
 
     buf = io.BytesIO()
     img.save(buf, format="JPEG", quality=80)
+    img.close()
     return buf.getvalue()
 
 

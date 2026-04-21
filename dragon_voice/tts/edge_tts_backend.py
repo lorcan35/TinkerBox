@@ -30,11 +30,11 @@ class EdgeTTSBackend(TTSBackend):
         """Verify edge-tts is installed and reachable."""
         try:
             import edge_tts
-        except ImportError:
+        except ImportError as err:
             raise ImportError(
                 "edge-tts is required for the edge_tts backend. "
                 "Install it: pip install edge-tts"
-            )
+            ) from err
 
         logger.info("Initializing Edge TTS — voice=%s", self._voice)
 

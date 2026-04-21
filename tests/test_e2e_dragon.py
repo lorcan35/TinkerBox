@@ -321,7 +321,7 @@ def main():
     print("-" * 72)
     passed = 0
     failed = 0
-    for test_id, name, status, detail in results:
+    for test_id, name, status, _detail in results:
         flag = " " if status == "PASS" else " <--"
         print(f"{test_id:<10} {name:<42} {status:<6}{flag}")
         if status == "PASS":

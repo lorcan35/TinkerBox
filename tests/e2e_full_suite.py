@@ -567,7 +567,7 @@ try:
     # Check if Tab5 is back online
     max_retries = 10
     tab5_back = False
-    for i in range(max_retries):
+    for _i in range(max_retries):
         try:
             info = tab5_info()
             if "wifi_connected" in info:
@@ -924,7 +924,7 @@ total = len(results)
 # Print table
 print(f"{'US':<8} {'Test Name':<55} {'Result':<8}")
 print("-" * 72)
-for us_id, name, passed, detail in results:
+for us_id, name, passed, _detail in results:
     tag = "PASS" if passed else "FAIL"
     print(f"{us_id:<8} {name[:54]:<55} {tag:<8}")
 

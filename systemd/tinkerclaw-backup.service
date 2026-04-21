@@ -1,0 +1,38 @@
+[Unit]
+# Wave 14 W14-H17 — hourly snapshot of Dragon state.
+# Triggered by tinkerclaw-backup.timer (OnCalendar=hourly).
+# Uses sqlite3 .backup for WAL-consistent snapshots so we can run even
+# while tinkerclaw-voice is holding a write lock.
+Description=Snapshot TinkerClaw DBs + config to /home/radxa/backups
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=radxa
+Group=radxa
+# If the backup itself fails, fail loud: systemctl status tinkerclaw-backup
+# then shows red, and a future alerting hook can watch for that.
+ExecStart=/home/radxa/bin/tinkerclaw-backup.sh
+# Don't let the backup block forever if sqlite can't acquire its lock.
+TimeoutStartSec=300
+# Limit memory so a runaway tar can't OOM the box.
+MemoryMax=512M
+Nice=19
+IOSchedulingClass=idle
+# Hardening (defense-in-depth; we touch /home/radxa only).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/radxa/backups
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+
+[Install]
+WantedBy=multi-user.target

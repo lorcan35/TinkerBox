@@ -38,11 +38,11 @@ class MoonshineBackend(STTBackend):
         try:
             from moonshine_voice import ModelArch, get_model_path, download
             from moonshine_voice.transcriber import Transcriber
-        except ImportError:
+        except ImportError as err:
             raise ImportError(
                 "moonshine-voice is required for the moonshine backend. "
                 "Install it: pip install moonshine-voice"
-            )
+            ) from err
 
         model_size = self._config.model  # "tiny", "small", "medium", "base"
         if model_size not in _MODEL_MAP:

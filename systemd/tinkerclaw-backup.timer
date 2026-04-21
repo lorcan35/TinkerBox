@@ -1,0 +1,16 @@
+[Unit]
+# Wave 14 W14-H17 — hourly trigger for tinkerclaw-backup.service.
+Description=Hourly TinkerClaw snapshot timer
+Requires=tinkerclaw-backup.service
+
+[Timer]
+OnCalendar=hourly
+# Run as soon as possible after boot if we missed a fire (e.g. power cycle).
+Persistent=true
+# Small randomized delay so two Dragons on the same LAN don't hit the disk
+# at the exact same minute.
+RandomizedDelaySec=120
+Unit=tinkerclaw-backup.service
+
+[Install]
+WantedBy=timers.target

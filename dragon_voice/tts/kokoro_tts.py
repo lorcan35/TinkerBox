@@ -31,11 +31,11 @@ class KokoroBackend(TTSBackend):
         """Load the Kokoro model."""
         try:
             import kokoro_onnx
-        except ImportError:
+        except ImportError as err:
             raise ImportError(
                 "kokoro-onnx is required for the kokoro backend. "
                 "Install it: pip install kokoro-onnx"
-            )
+            ) from err
 
         model_path = self._config.kokoro_model_path
         voice = self._config.kokoro_voice

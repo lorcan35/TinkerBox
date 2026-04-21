@@ -29,6 +29,22 @@ class NotesService:
         self._genie_config = config.llm.genie_config
         self._embedding_model = "qwen3-embedding:0.6b"
         self._session: Optional[aiohttp.ClientSession] = None
+        # Wave 14 W14-C06 / W14-M16 RUF006: track fire-and-forget embed tasks
+        # so shutdown can cancel/await them instead of hitting
+        # "Task was destroyed but it is pending" on systemctl restart.
+        self._bg_tasks: set[asyncio.Task] = set()
+
+    def _spawn_bg(self, coro) -> asyncio.Task:
+        """Create a tracked background task.
+
+        The returned task is retained in ``self._bg_tasks`` until it finishes,
+        then auto-discarded via ``add_done_callback``. Shutdown cancels any
+        stragglers.
+        """
+        task = asyncio.create_task(coro)
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        return task
 
     async def initialize(self) -> None:
         self._db.initialize()
@@ -38,6 +54,13 @@ class NotesService:
         logger.info("Notes service initialized")
 
     async def shutdown(self) -> None:
+        # Wave 14 W14-C06: cancel and await in-flight background embed tasks
+        # before closing the http session they depend on, otherwise a racing
+        # task would hit a closed session and log a spurious ConnectionError.
+        if self._bg_tasks:
+            for t in list(self._bg_tasks):
+                t.cancel()
+            await asyncio.gather(*self._bg_tasks, return_exceptions=True)
         if self._session and not self._session.closed:
             await self._session.close()
         self._db.close()
@@ -89,7 +112,8 @@ class NotesService:
         note = self._db.create(note)
 
         # Step 4: Generate embedding (background — don't block response)
-        asyncio.create_task(self._embed_note(note.id, transcript))
+        # Tracked via _spawn_bg so shutdown can cancel in-flight embeds.
+        self._spawn_bg(self._embed_note(note.id, transcript))
 
         return note
 
@@ -106,7 +130,7 @@ class NotesService:
             source="text",
         )
         note = self._db.create(note)
-        asyncio.create_task(self._embed_note(note.id, text))
+        self._spawn_bg(self._embed_note(note.id, text))
         return note
 
     # ── Semantic search ─────────────────────────────────────────────────

@@ -49,7 +49,7 @@ Each of these removes friction that slows everything after it.
 - [x] **W14-H18** `[OPS]` `MemoryMax=4G MemoryHigh=3G` on voice service (bandaid); file the leak as separate issue · drop-in installed live: MemoryHigh=3221225472 MemoryMax=4294967296 TasksMax=512
 - [x] **W14-M09** `[TB]` `cancel() + await` `_periodic_purge` (wave 13 H3 pattern) · also folded memory_monitor cancel+await
 - [ ] **W14-H13** `[TB]` narrow ~17 residual `except Exception` in server/memory/media/tts
-- [ ] **W14-H14** `[OPS]` systemd hardening drop-ins for 6 units
+- [x] **W14-H14** `[OPS]` systemd hardening drop-ins for 6 units · 5 drop-ins installed (voice/dashboard/gateway/ngrok/mdns); iteration-2 notes for known-breaks (SystemCallFilter dropped, AF_NETLINK kept, mdns User=nobody not DynamicUser). systemd-analyze score dropped ~9.6 → 6.5 per unit. Tab5 still WS-connected through the restart cycle.
 - [ ] **W14-H18** `[OPS]` `MemoryMax=4G MemoryHigh=3G` on voice service (bandaid); file the leak as separate issue
 
 ## Phase 5 — HIGH docs + protocol

@@ -7,10 +7,12 @@ Endpoints:
 
 import io
 import logging
+from typing import Optional
 
 from aiohttp import web
 
 from dragon_voice.media.store import MediaStore
+from dragon_voice.media.url_signer import MediaUrlSigner
 
 logger = logging.getLogger(__name__)
 
@@ -27,8 +29,17 @@ _JPEG_QUALITY = 85
 
 
 class MediaRoutes:
-    def __init__(self, media_store: MediaStore) -> None:
+    def __init__(
+        self,
+        media_store: MediaStore,
+        url_signer: Optional[MediaUrlSigner] = None,
+    ) -> None:
         self._store = media_store
+        # Wave 14 W14-H04: optional HMAC signer.  When provided, every
+        # /api/media/{id} GET must carry matching ?exp=&sig= query
+        # parameters signed with the server api_token. When None, the
+        # handler still works (dev/bootstrap mode).
+        self._signer = url_signer
 
     def register(self, app: web.Application) -> None:
         app.router.add_get("/api/media/{media_id}", self.serve_media)
@@ -37,10 +48,23 @@ class MediaRoutes:
     # ── Handlers ────────────────────────────────────────────────────────
 
     async def serve_media(self, request: web.Request) -> web.Response:
-        """GET /api/media/{media_id} — stream a stored media file."""
-        media_id = request.match_info["media_id"]
-        path = await self._store.get_path(media_id)
+        """GET /api/media/{media_id}?exp=<unix>&sig=<hex> — stream a stored file.
 
+        Wave 14 W14-H04: enforce HMAC signature when the signer is
+        configured.  Unsigned requests are rejected with 403.
+        """
+        media_id = request.match_info["media_id"]
+
+        if self._signer is not None and self._signer.enabled:
+            exp = request.query.get("exp")
+            sig = request.query.get("sig")
+            if not self._signer.verify(media_id, exp, sig):
+                logger.info(
+                    "serve_media: rejected unsigned/invalid request for %s from %s",
+                    media_id, request.remote)
+                return web.Response(text="Forbidden", status=403)
+
+        path = await self._store.get_path(media_id)
         if path is None:
             return web.Response(text="Not found", status=404)
 
@@ -48,17 +72,16 @@ class MediaRoutes:
         ext = media_id.rsplit(".", 1)[-1].lower() if "." in media_id else ""
         content_type = _CONTENT_TYPES.get(ext, "application/octet-stream")
 
-        try:
-            with open(path, "rb") as fh:
-                data = fh.read()
-        except OSError as exc:
-            logger.warning("serve_media: could not read %s: %s", path, exc)
-            return web.Response(text="Not found", status=404)
-
-        return web.Response(
-            body=data,
-            content_type=content_type,
-            headers={"Cache-Control": "max-age=3600"},
+        # Wave 14 W14-H08 / W14-M05: the blocking open+fh.read() was
+        # stalling the event loop for up to 10 MB of camera JPEG per
+        # GET. Use web.FileResponse which hands the file off to sendfile
+        # on supporting kernels (zero copy, zero event-loop blocking).
+        return web.FileResponse(
+            path=path,
+            headers={
+                "Content-Type": content_type,
+                "Cache-Control": "max-age=3600",
+            },
         )
 
     async def upload_media(self, request: web.Request) -> web.Response:

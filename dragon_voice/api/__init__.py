@@ -32,6 +32,7 @@ def setup_all_routes(
     tool_registry=None,
     memory_service=None,
     media_store=None,
+    media_url_signer=None,
 ) -> None:
     """Register all API route modules on the aiohttp app.
 
@@ -49,8 +50,10 @@ def setup_all_routes(
         SynthesizeRoutes(voice_config).register(app)
 
     # Media file serving + camera upload (Task 2)
+    # Wave 14 W14-H04: pass the URL signer so /api/media/* requires a
+    # valid HMAC signature + expiry when DRAGON_API_TOKEN is configured.
     if media_store:
-        MediaRoutes(media_store).register(app)
+        MediaRoutes(media_store, url_signer=media_url_signer).register(app)
 
     # Direct LLM completion
     CompletionRoutes(conversation).register(app)

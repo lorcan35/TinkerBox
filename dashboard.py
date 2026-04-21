@@ -120,12 +120,16 @@ async def _proxy_request(request: web.Request) -> web.Response:
         ) as resp:
             resp_content_type = resp.headers.get("Content-Type", "")
 
-            # SSE streaming passthrough
+            # SSE streaming passthrough.
+            # Wave 14 W14-H05: dropped the hardcoded
+            # Access-Control-Allow-Origin: * — the dashboard SPA is served
+            # from the same port as this proxy, so no cross-origin header
+            # is needed.  If a future tool wants CORS access, add a real
+            # allowlist here (mirror the voice server's _cors_middleware).
             if "text/event-stream" in resp_content_type:
                 stream_resp = web.StreamResponse(headers={
                     "Content-Type": "text/event-stream",
                     "Cache-Control": "no-cache",
-                    "Access-Control-Allow-Origin": "*",
                 })
                 await stream_resp.prepare(request)
                 async for chunk in resp.content.iter_any():
@@ -138,7 +142,6 @@ async def _proxy_request(request: web.Request) -> web.Response:
                 body=resp_body,
                 status=resp.status,
                 content_type=resp_content_type.split(";")[0].strip() or "application/json",
-                headers={"Access-Control-Allow-Origin": "*"},
             )
     except asyncio.TimeoutError:
         return web.json_response({"error": "Voice server timeout"}, status=504)

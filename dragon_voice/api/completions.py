@@ -41,10 +41,11 @@ class CompletionRoutes:
         llm = self._conversation.llm
 
         if stream:
+            # Wave 14 W14-H05: drop the hardcoded ACAO: * for the same
+            # reason as messages.py — the CORS middleware already decides.
             response = web.StreamResponse(headers={
                 "Content-Type": "text/event-stream",
                 "Cache-Control": "no-cache",
-                "Access-Control-Allow-Origin": "*",
             })
             await response.prepare(request)
 

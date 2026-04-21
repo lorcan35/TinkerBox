@@ -47,7 +47,8 @@ class NotesService:
         return task
 
     async def initialize(self) -> None:
-        self._db.initialize()
+        # Wave 14 W14-C05: NotesDB.initialize is now async (aiosqlite).
+        await self._db.initialize()
         self._session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=None)
         )
@@ -63,24 +64,27 @@ class NotesService:
             await asyncio.gather(*self._bg_tasks, return_exceptions=True)
         if self._session and not self._session.closed:
             await self._session.close()
-        self._db.close()
+        # Wave 14 W14-C05: close is now async.
+        await self._db.close()
 
-    # ── Note CRUD (sync wrappers for DB) ────────────────────────────────
+    # ── Note CRUD (async wrappers for DB) ───────────────────────────────
+    # Wave 14 W14-C05: every method below now awaits the async NotesDB.
+    # Callers in notes/api.py also had to gain await.
 
-    def create_note(self, note: Note) -> Note:
-        return self._db.create(note)
+    async def create_note(self, note: Note) -> Note:
+        return await self._db.create(note)
 
-    def get_note(self, note_id: str) -> Optional[Note]:
-        return self._db.get(note_id)
+    async def get_note(self, note_id: str) -> Optional[Note]:
+        return await self._db.get(note_id)
 
-    def list_notes(self, limit: int = 50, offset: int = 0) -> tuple[list[Note], int]:
-        return self._db.list_all(limit, offset)
+    async def list_notes(self, limit: int = 50, offset: int = 0) -> tuple[list[Note], int]:
+        return await self._db.list_all(limit, offset)
 
-    def update_note(self, note_id: str, updates: dict) -> Optional[Note]:
-        return self._db.update(note_id, updates)
+    async def update_note(self, note_id: str, updates: dict) -> Optional[Note]:
+        return await self._db.update(note_id, updates)
 
-    def delete_note(self, note_id: str) -> bool:
-        return self._db.delete(note_id)
+    async def delete_note(self, note_id: str) -> bool:
+        return await self._db.delete(note_id)
 
     # ── Audio → Note pipeline ───────────────────────────────────────────
 
@@ -109,7 +113,7 @@ class NotesService:
             source="audio",
             duration_s=duration_s,
         )
-        note = self._db.create(note)
+        note = await self._db.create(note)
 
         # Step 4: Generate embedding (background — don't block response)
         # Tracked via _spawn_bg so shutdown can cancel in-flight embeds.
@@ -129,7 +133,7 @@ class NotesService:
             summary=summary,
             source="text",
         )
-        note = self._db.create(note)
+        note = await self._db.create(note)
         self._spawn_bg(self._embed_note(note.id, text))
         return note
 
@@ -141,7 +145,7 @@ class NotesService:
         if not query_emb:
             return []
 
-        notes = self._db.get_all_with_embeddings()
+        notes = await self._db.get_all_with_embeddings()
         scored = []
         for note in notes:
             if note.embedding:
@@ -260,7 +264,7 @@ class NotesService:
         """Generate and store embedding for a note."""
         embedding = await self._get_embedding(text[:8000])
         if embedding:
-            self._db.update(note_id, {"embedding": embedding})
+            await self._db.update(note_id, {"embedding": embedding})
             logger.info("Embedded note %s (%d dims)", note_id, len(embedding))
 
     async def _get_embedding(self, text: str) -> list[float]:

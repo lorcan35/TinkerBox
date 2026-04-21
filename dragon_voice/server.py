@@ -78,9 +78,18 @@ class VoiceServer:
         self._conversation: Optional[ConversationEngine] = None
         self._notes_svc = None
 
-        # Media handling (rich media detection + user image uploads)
+        # Media handling (rich media detection + user image uploads).
+        # Wave 14 W14-H04: construct the URL signer from server.api_token
+        # so /api/media/{id} URLs are HMAC-signed + time-bounded.  Falls
+        # back to unsigned URLs when api_token is blank (dev bootstrap).
+        from dragon_voice.media.url_signer import MediaUrlSigner
+        self._media_url_signer = MediaUrlSigner(
+            secret=getattr(self._config.server, "api_token", "") or ""
+        )
         self._media_store = MediaStore()
-        self._media_pipeline = MediaPipeline(self._media_store)
+        self._media_pipeline = MediaPipeline(
+            self._media_store, url_signer=self._media_url_signer
+        )
         self._media_cleanup_task: Optional[asyncio.Task] = None
 
     def create_app(self) -> web.Application:
@@ -161,7 +170,12 @@ class VoiceServer:
         # the CORS middleware will bounce the upgrade.
         "/ws/voice",            # auth enforced inside _handle_ws_voice
         "/dashboard",           # proxied to localhost:3500 (separately gated)
-        "/api/media/",          # rendered media fetch — W14-H04 will fix this
+        # Wave 14 W14-H04: /api/media/* remains in the public allowlist
+        # (so Tab5 doesn't need to present the bearer on image fetches),
+        # but the handler itself now requires an HMAC signature in the
+        # query string when server.api_token is configured.  The URLs
+        # emitted in WS media events carry that signature automatically.
+        "/api/media/",
     )
 
     @web.middleware
@@ -369,6 +383,7 @@ class VoiceServer:
             tool_registry=self._tool_registry,
             memory_service=self._memory_service,
             media_store=self._media_store,
+            media_url_signer=self._media_url_signer,
         )
 
         # Notes API routes
@@ -378,7 +393,10 @@ class VoiceServer:
             from dragon_voice.notes.api import setup_routes as setup_notes_routes
 
             notes_db = NotesDB()
-            notes_db.initialize()
+            # Wave 14 W14-C05: NotesDB.initialize is async now. The prior
+            # direct call here was un-awaited, producing a stray coroutine
+            # and an intermittent None-connection race. NotesService.initialize
+            # already calls await self._db.initialize(), so this line is gone.
             notes_svc = NotesService(self._config, notes_db)
             await notes_svc.initialize()
             self._notes_svc = notes_svc  # Store for shutdown

@@ -56,4 +56,8 @@ jobs:
             tests/test_session_cas.py \
             tests/test_media_store.py \
             tests/test_media_pipeline.py \
-            tests/test_mcp_bridge.py
+            tests/test_mcp_bridge.py \
+            tests/test_notes_db_async.py \
+            tests/test_config_redact.py \
+            tests/test_media_url_signer.py \
+            tests/test_proxy_image_ssrf.py

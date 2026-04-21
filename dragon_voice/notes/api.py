@@ -47,7 +47,8 @@ class NotesAPI:
         """GET /api/notes?limit=50&offset=0"""
         limit = int(request.query.get("limit", "50"))
         offset = int(request.query.get("offset", "0"))
-        notes, total = self._svc.list_notes(limit, offset)
+        # Wave 14 W14-C05: service methods are async now (aiosqlite).
+        notes, total = await self._svc.list_notes(limit, offset)
         return web.json_response({
             "notes": [n.to_dict() for n in notes],
             "total": total,
@@ -58,7 +59,7 @@ class NotesAPI:
     async def get_note(self, request: web.Request) -> web.Response:
         """GET /api/notes/{note_id}"""
         note_id = request.match_info["note_id"]
-        note = self._svc.get_note(note_id)
+        note = await self._svc.get_note(note_id)
         if not note:
             return web.json_response({"error": "Not found"}, status=404)
         return web.json_response(note.to_dict())
@@ -76,7 +77,7 @@ class NotesAPI:
         if not updates:
             return web.json_response({"error": "No valid fields to update"}, status=400)
 
-        note = self._svc.update_note(note_id, updates)
+        note = await self._svc.update_note(note_id, updates)
         if not note:
             return web.json_response({"error": "Not found"}, status=404)
         return web.json_response(note.to_dict())
@@ -84,7 +85,7 @@ class NotesAPI:
     async def delete_note(self, request: web.Request) -> web.Response:
         """DELETE /api/notes/{note_id}"""
         note_id = request.match_info["note_id"]
-        deleted = self._svc.delete_note(note_id)
+        deleted = await self._svc.delete_note(note_id)
         if not deleted:
             return web.json_response({"error": "Not found"}, status=404)
         return web.json_response({"status": "deleted", "id": note_id})

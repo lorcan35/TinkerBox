@@ -49,11 +49,20 @@ class MediaStore:
                         future partitioning / logging).
 
         Returns:
-            media_id string of the form ``{12hex}.{ext}``.
+            media_id string of the form ``{32hex}.{ext}``.
+
+        Wave 14 W14-H04: widened the id from 12 → 32 hex chars (48 → 128
+        bits of entropy).  The "authenticated by ID obscurity" posture
+        relied on 48 bits being too many to guess; combined with
+        unauthenticated access at ``/api/media/*`` that's not enough
+        against a motivated scraper that already has a session token.
+        Full uuid4 hex brings us to the conventional 128-bit safety
+        margin; HMAC signing on the URL (see server.py) is the real
+        access control.
         """
         self._media_dir.mkdir(parents=True, exist_ok=True)
 
-        media_id = f"{uuid.uuid4().hex[:12]}.{ext}"
+        media_id = f"{uuid.uuid4().hex}.{ext}"
         dest = self._media_dir / media_id
 
         dest.write_bytes(data)

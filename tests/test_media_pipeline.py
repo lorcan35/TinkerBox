@@ -381,6 +381,32 @@ def test_resize_jpeg_leaves_narrow_image_alone():
 # ── proxy_image (mocked aiohttp) ─────────────────────────────────────────────
 
 
+# Wave 14 W14-H03: proxy_image now (a) resolves the host via socket.getaddrinfo
+# and rejects non-public IPs, and (b) stream-reads with iter_chunked instead
+# of single-shot read().  Tests must monkey-patch DNS + mock the async
+# iterator shape.
+
+def _mock_aiter_chunks(payload: bytes, chunk_size: int = 64 * 1024):
+    """Return an object whose iter_chunked() yields `payload` in chunks."""
+    class _Chunks:
+        def __init__(self, data):
+            self._data = data
+        def iter_chunked(self, n):
+            async def _gen():
+                for i in range(0, len(self._data), n):
+                    yield self._data[i:i + n]
+            return _gen()
+    return _Chunks(payload)
+
+
+def _patch_dns_public():
+    """Make example.com resolve to 1.1.1.1 so the SSRF guard allows it."""
+    from dragon_voice.media import pipeline as pmod
+    def _stub(host, port, *a, **kw):
+        return [(None, None, None, None, ("1.1.1.1", 0))]
+    return patch.object(pmod.socket, "getaddrinfo", _stub)
+
+
 @pytest.mark.asyncio
 async def test_proxy_image_downloads_and_stores():
     from PIL import Image
@@ -395,10 +421,11 @@ async def test_proxy_image_downloads_and_stores():
     p = MediaPipeline(store=store)
 
     # Mock aiohttp session
-    mock_resp = AsyncMock()
+    mock_resp = MagicMock()
     mock_resp.status = 200
-    mock_resp.read = AsyncMock(return_value=fake_img_bytes)
+    mock_resp.content = _mock_aiter_chunks(fake_img_bytes)
     mock_resp.raise_for_status = MagicMock()
+    mock_resp.headers = {}
     mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
     mock_resp.__aexit__ = AsyncMock(return_value=False)
 
@@ -408,23 +435,24 @@ async def test_proxy_image_downloads_and_stores():
 
     p._session = mock_session
 
-    media_id = await p.proxy_image("https://example.com/img.jpg", "sess1")
+    with _patch_dns_public():
+        media_id = await p.proxy_image("https://example.com/img.jpg", "sess1")
     assert isinstance(media_id, str)
     assert media_id.endswith(".jpg")
 
 
 @pytest.mark.asyncio
 async def test_proxy_image_rejects_oversized():
-    from PIL import Image
-
     large_data = b"x" * (11 * 1024 * 1024)  # 11 MB
 
     store = make_mock_store()
     p = MediaPipeline(store=store)
 
-    mock_resp = AsyncMock()
+    mock_resp = MagicMock()
+    mock_resp.status = 200
+    mock_resp.content = _mock_aiter_chunks(large_data)
     mock_resp.raise_for_status = MagicMock()
-    mock_resp.read = AsyncMock(return_value=large_data)
+    mock_resp.headers = {}
     mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
     mock_resp.__aexit__ = AsyncMock(return_value=False)
 
@@ -434,5 +462,16 @@ async def test_proxy_image_rejects_oversized():
 
     p._session = mock_session
 
-    with pytest.raises(ValueError, match="too large"):
-        await p.proxy_image("https://example.com/huge.jpg", "sess1")
+    with _patch_dns_public():
+        with pytest.raises(ValueError, match="too large"):
+            await p.proxy_image("https://example.com/huge.jpg", "sess1")
+
+
+@pytest.mark.asyncio
+async def test_proxy_image_rejects_rfc1918_host():
+    """Wave 14 W14-H03: prompt-injected URL pointing at a private IP
+    is rejected BEFORE the HTTP call even happens."""
+    store = make_mock_store()
+    p = MediaPipeline(store=store)
+    with pytest.raises(ValueError, match="non-public"):
+        await p.proxy_image("http://192.168.1.91:11434/tags.jpg", "sess1")

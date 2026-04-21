@@ -22,10 +22,10 @@ Each of these removes friction that slows everything after it.
 
 ## Phase 2 — CRITICALs
 
-- [ ] **W14-C01** `[TT]` `touch_ws.c:294-297` — copy string literal to stack buffer before `esp_transport_ws_send_raw`
-- [ ] **W14-C02** `[TT]` `ota.c:90-91` — NULL-guard after second `esp_http_client_init`
-- [ ] **W14-C03** `[TT]` `ui_notes.c:1066-1067` — NULL-guard on transcription-queue HTTP init
-- [ ] **W14-C04** `[TB+TT]` authenticate `/ws/voice` register frame (bearer OR signed HMAC)
+- [x] **W14-C01** `[TT]` `touch_ws.c:294-297` — copy string literal to stack buffer before `esp_transport_ws_send_raw` · verified: flashed, 20-tap stress, heap_min 21724696 stable, home screenshot renders clean
+- [x] **W14-C02** `[TT]` `ota.c:90-91` — NULL-guard after second `esp_http_client_init` · verified: `/ota/check` exercised, Tab5 alive post-call
+- [x] **W14-C03** `[TT]` `ui_notes.c:1066-1067` — NULL-guard on transcription-queue HTTP init · verified: transcribe queue task alive (4 notes pending), selftest wifi/voice_ws/sd_card all pass
+- [x] **W14-C04** `[TB+TT]` authenticate `/ws/voice` register frame (bearer OR signed HMAC) · TB server.py `_handle_ws_voice` + TT sdkconfig/Kconfig/voice.c · verified: Dragon rejects no-bearer with HTTP 401, Tab5 flashed with matching token in sdkconfig.local reconnects inside 8 s, `active_connections=1` on Dragon, session resumed cleanly
 - [ ] **W14-C05** `[TB]` port `NotesDB` to `aiosqlite` (or uniform `asyncio.to_thread`)
 - [x] **W14-C06** `[TB]` store + cancel 3 fire-and-forget `asyncio.create_task` sites · same commit as M16 · verified: NotesService._spawn_bg + conn_state["bg_tasks"] both wired; cancelled in shutdown/_handle_disconnect
 

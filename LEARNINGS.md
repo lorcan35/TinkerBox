@@ -584,3 +584,17 @@ sequentially across the whole file (don't restart per section).
 - **Fix:** Added cancel + await-with-suppressed-CancelledError for `_media_cleanup_task` in `_on_shutdown`, matching the sibling cleanup tasks.
 - **Prevention:** Every `asyncio.create_task(...)` that lives past the request must be tracked in a single `self._*_task` field AND cancelled in `_on_shutdown`. Grep for `create_task` before adding a new long-lived task.
 
+
+### 75. TinkerClaw SSE timeout killed long agent work mid-execution
+- **Date:** 2026-04-23 (#58)
+- **Symptom:** Long TC-mode turns that involved agent work (skill authoring, git clone, multi-step planning, exec chains) returned "Response timed out, please try again." on Tab5 even though the gateway was still actively modifying files on Dragon. Gateway logs showed the agent continuing to write config files, restart the bundle, and emit text — 30+ seconds *after* Dragon had already sent the timeout message.
+- **Root Cause:** `TinkerClawLLM._session` was created with `ClientTimeout(total=180, sock_read=90)`. MiniMax-M2.5 can go 2+ minutes between SSE chunks while it's tool-calling. The 90s sock_read limit was an over-conservative guess that predated long-running agent workloads.
+- **Fix:** Bumped `total=180 → 600` and `sock_read=90 → 600` in `dragon_voice/llm/tinkerclaw_llm.py:68`. Also bumped aiohttp `WebSocketResponse.receive_timeout=120 → 600` in `server.py:1368` so Tab5 WS survives long TC turns without heartbeat-triggered disconnect.
+- **Prevention:** Timeouts that guard against network failure should be multiples of the expected workload, not bound to it. When adding a new backend, look up its typical long-tail response time and add 3× headroom.
+
+### 76. ConversationEngine stuck on initial backend's compact tool prompt after mode swap
+- **Date:** 2026-04-23 (#58)
+- **Symptom:** In cloud mode (voice_mode=2) the LLM only "saw" the top-5 compact tool list (web_search, datetime, remember, recall, calculator), even after 9+ other tools were registered (weather, stock_ticker, timesense_timer, quick_poll, note, system_info, unit_converter, forget_fact, convert). Asking "list every tool you have" returned those same 5. Asking it to use e.g. stock_ticker explicitly prompted it to say "I don't have that tool."
+- **Root Cause:** `ConversationEngine._augment_context_with_tools` picks compact-vs-full format via `self._llm_config.backend in ("ollama", "npu_genie", "lmstudio")`. The `config_update` handler in `server.py` swapped `self._conversation._llm` (the backend instance) but *not* `self._conversation._llm_config` (the config object the is-local check reads). So after any swap from the default `ollama` config, `_llm_config.backend` was permanently stuck on `"ollama"` — the is-local check returned True forever, forcing compact format.
+- **Fix:** The config_update handler now updates `self._conversation._llm_config = conn_config.llm` alongside the `_llm` swap (`server.py:1824`). Swap-log line now includes the new backend name so regressions are visible.
+- **Prevention:** When a class holds both a live object and its config, any hot-swap of the live object must also swap its config — or the config should be derived-on-read rather than cached. Grep for `_llm_config` usage any time `_llm` is reassigned.

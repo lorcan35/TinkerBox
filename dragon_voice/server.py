@@ -1579,7 +1579,15 @@ class VoiceServer:
                         device_id = conn_state.get("device_id")
                         if old_sid and self._session_mgr:
                             await self._session_mgr.end_session(old_sid)
-                            session, _ = await self._session_mgr.create_session(
+                            # closes #56: create_session returns a single dict,
+                            # NOT a (dict, bool) tuple — that's
+                            # get_or_create_session.  The old tuple-unpack
+                            # raised ValueError and tore down the WS handler,
+                            # leaving Tab5 dead after a 'clear' + mode-swap
+                            # sequence.  Symptom: Tab5 sat in RECONNECTING and
+                            # every /chat returned 'voice not connected' with
+                            # a blank chat view.
+                            session = await self._session_mgr.create_session(
                                 device_id=device_id, session_type="conversation"
                             )
                             conn_state["session_id"] = session["id"]

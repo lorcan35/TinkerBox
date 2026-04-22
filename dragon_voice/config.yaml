@@ -35,7 +35,7 @@ llm:
   backend: "ollama"  # ollama, openrouter, lmstudio, npu_genie, tinkerclaw
   # ollama
   ollama_url: "http://localhost:11434"
-  ollama_model: "qwen3:1.7b"
+  ollama_model: "qwen3:0.6b"
   # openrouter
   openrouter_api_key: ""  # reads from OPENROUTER_API_KEY env var if empty
   openrouter_model: "anthropic/claude-3.5-haiku"

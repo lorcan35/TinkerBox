@@ -9,6 +9,8 @@ import asyncio
 import logging
 import re
 import time
+
+import aiohttp
 from concurrent.futures import ThreadPoolExecutor
 from typing import Callable, Awaitable, Optional
 
@@ -437,6 +439,15 @@ class VoicePipeline:
         if len(self._segment_buffer) >= 1600:
             audio_data = bytes(self._segment_buffer)
             self._segment_buffer.clear()
+            # Wave 15 W15-H05: narrow `except Exception:` — the expected
+            # failure set is aiohttp.ClientError (cloud STT), TimeoutError
+            # (slow-model stall), and OSError/ValueError (audio decode /
+            # invalid PCM).  A TypeError or AttributeError here signals
+            # a pipeline bug and should surface, not be swallowed behind
+            # "Final dictation segment transcription failed".  Also
+            # surface the failure as a toast-worthy event so the user
+            # knows their last segment did NOT land — silently dropping
+            # a dictation tail was the actual user-visible regression.
             try:
                 transcript = await self._stt.transcribe(
                     audio_data, self._config.audio.input_sample_rate
@@ -447,8 +458,23 @@ class VoicePipeline:
                         "type": "stt_partial",
                         "text": transcript.strip(),
                     })
-            except Exception:
-                logger.exception("Final dictation segment transcription failed")
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+                OSError,
+                ValueError,
+                RuntimeError,
+            ) as exc:
+                logger.exception(
+                    "Final dictation segment transcription failed "
+                    "(session=%s): %s",
+                    self._session_id or "?",
+                    exc,
+                )
+                await self._on_event({
+                    "type": "dictation_warning",
+                    "message": "last segment dropped — transcript may be incomplete",
+                })
         else:
             self._segment_buffer.clear()
 

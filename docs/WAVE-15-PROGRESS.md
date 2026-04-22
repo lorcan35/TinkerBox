@@ -20,12 +20,12 @@ Canonical status for every item in [docs/AUDIT-WAVE-15.md](AUDIT-WAVE-15.md). Up
 
 ## Phase 3 — HIGH
 
-- [ ] **W15-H01** `[TB]` Rate limit state-changing endpoints
-- [ ] **W15-H02** `[TB]` 32 MB app limit vs 10 MB upload cap mismatch
+- [x] **W15-H01** `[TB]` Rate limit state-changing endpoints · verified: TB #54 — _rate_limit_middleware covers DELETE + state-change endpoints, 429 with Retry-After, 4-case regression test
+- [x] **W15-H02** `[TB]` 32 MB app limit vs 10 MB upload cap mismatch · verified: TB #54 — Content-Length pre-read cap on /api/media/upload, 413 in 73 ms before buffering 22 MB
 - [ ] **W15-H03** `[TB]` `_handle_disconnect` bg-task cancel race
 - [x] **W15-H04** `[TB]` `Image.open` decode result not validated · verified: folded into C03 — .size access now in try/except, returns 400 on partial decode
-- [ ] **W15-H05** `[TB]` Broad except in `pipeline.finish_dictation`
-- [ ] **W15-H06** `[TB]` SSE reconnect amplification on `/chat`
+- [x] **W15-H05** `[TB]` Broad except in `pipeline.finish_dictation` · verified: TB #54 — pipeline.finish_dictation narrow-catch + dictation_warning event
+- [x] **W15-H06** `[TB]` SSE reconnect amplification on `/chat` · verified: TB #54 — SSE reconnect covered by same rate-limiter (POST /sessions/* cap 20/60s)
 - [ ] **W15-H07** `[TB]` WS upgrade 401 path lacks integration test
 - [ ] **W15-H08** `[TT]` Dictation buffer overflow in `handle_text_message`
 - [ ] **W15-H09** `[TT]` `widget_store` never freed on deinit

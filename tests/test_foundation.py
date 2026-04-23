@@ -146,6 +146,46 @@ async def test_session_create(db, session_mgr):
     assert session["device_id"] == "dev-001"
     assert session["type"] == "conversation"
     assert len(session["id"]) == 12  # 6 bytes = 12 hex chars
+    # Default mode fingerprint (refs #27)
+    assert session["voice_mode"] == 0
+    assert session["llm_model"] == ""
+
+
+@pytest.mark.asyncio
+async def test_session_mode_fields_roundtrip(db, session_mgr):
+    """Chat v4·C: voice_mode + llm_model round-trip through create→get→update (refs #27)."""
+    await db.upsert_device("dev-mode", "02:02:02:02:02:02")
+
+    # Create with non-default mode fingerprint
+    created = await session_mgr.create_session(
+        device_id="dev-mode",
+        voice_mode=2,
+        llm_model="anthropic/claude-3.5-haiku",
+    )
+    assert created["voice_mode"] == 2
+    assert created["llm_model"] == "anthropic/claude-3.5-haiku"
+
+    # Fetch back and confirm persistence (no SELECT * — explicit projection)
+    loaded = await session_mgr.get_session(created["id"])
+    assert loaded is not None
+    assert loaded["voice_mode"] == 2
+    assert loaded["llm_model"] == "anthropic/claude-3.5-haiku"
+
+    # List path returns the columns too
+    listed = await session_mgr.list_sessions(device_id="dev-mode")
+    assert len(listed) == 1
+    assert listed[0]["voice_mode"] == 2
+    assert listed[0]["llm_model"] == "anthropic/claude-3.5-haiku"
+
+    # Update path — flip to mode 3 + new model
+    updated = await session_mgr.update_session(
+        created["id"],
+        voice_mode=3,
+        llm_model="tinkerclaw/agent",
+    )
+    assert updated is not None
+    assert updated["voice_mode"] == 3
+    assert updated["llm_model"] == "tinkerclaw/agent"
 
 
 @pytest.mark.asyncio

@@ -1742,14 +1742,33 @@ class VoiceServer:
                                 continue
 
                             # Update session system prompt in DB for conversation engine
+                            # Chat v4·C (refs #27): also persist voice_mode + llm_model
+                            # onto the session row so the drawer surfaces the active
+                            # mode fingerprint and pipeline-resume picks the right
+                            # backends without a fresh config_update from the client.
                             sid = conn_state.get("session_id")
                             if sid and self._db:
+                                # Resolve the best "active model" string to persist,
+                                # matching the client-visible payload below.
+                                if voice_mode == 2:
+                                    active_model_db = conn_config.llm.openrouter_model or ""
+                                elif llm_be == "tinkerclaw":
+                                    active_model_db = conn_config.llm.tinkerclaw_model or ""
+                                elif llm_be == "ollama":
+                                    active_model_db = conn_config.llm.ollama_model or ""
+                                else:
+                                    active_model_db = str(llm_model or "")
                                 try:
                                     await self._db.update_session(
-                                        sid, system_prompt=conn_config.llm.system_prompt
+                                        sid,
+                                        system_prompt=conn_config.llm.system_prompt,
+                                        voice_mode=int(voice_mode),
+                                        llm_model=active_model_db[:128],
                                     )
                                 except Exception:
-                                    logger.warning("Failed to update session system_prompt")
+                                    logger.warning(
+                                        "Failed to update session system_prompt / mode"
+                                    )
 
                             # Apply config
                             conn_config.stt.backend = stt_be

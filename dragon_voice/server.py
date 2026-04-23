@@ -486,11 +486,13 @@ class VoiceServer:
             from dragon_voice.tools.unit_converter_tool import UnitConverterTool
             from dragon_voice.tools.note_tool import NoteTool
             from dragon_voice.tools.system_tool import SystemInfoTool
+            from dragon_voice.tools.stock_ticker_tool import StockTickerTool
 
             self._tool_registry.register(WeatherTool())
             self._tool_registry.register(CalculatorTool())
             self._tool_registry.register(UnitConverterTool())
             self._tool_registry.register(SystemInfoTool())
+            self._tool_registry.register(StockTickerTool())
 
             logger.info("Agentic modules initialized (tools: %d, memory: ok)",
                         len(self._tool_registry.list_tools()))

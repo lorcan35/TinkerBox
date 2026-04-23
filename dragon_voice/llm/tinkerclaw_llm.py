@@ -61,11 +61,14 @@ class TinkerClawBackend(LLMBackend):
             headers["Authorization"] = f"Bearer {self._token}"
 
         self._session = aiohttp.ClientSession(
-            # P05: sock_read raised from 30s to 90s. TinkerClaw tool execution
-            # (web_search, memory recall, etc.) can take 10-30s with no SSE
-            # data flowing. The total=180s covers the full agent run including
-            # multiple tool rounds.
-            timeout=aiohttp.ClientTimeout(total=180, sock_read=90),
+            # 2026-04-23 (#58): bumped total 180→600 and sock_read 90→600.
+            # Previous 90 s budget killed TC agents mid-work — any skill that
+            # authored a file, cloned a repo, or did multi-step planning
+            # routinely exceeded 90 s of silent streaming.  User saw
+            # "Response timed out, please try again." on Tab5 while the
+            # agent was actively modifying files on Dragon.  10 min covers
+            # real TC agent workloads with headroom.
+            timeout=aiohttp.ClientTimeout(total=600, sock_read=600),
             headers=headers,
         )
 

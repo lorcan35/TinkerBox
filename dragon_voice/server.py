@@ -1363,7 +1363,13 @@ class VoiceServer:
         ws = web.WebSocketResponse(
             max_msg_size=10 * 1024 * 1024,
             heartbeat=60.0,
-            receive_timeout=120.0,
+            # 2026-04-23 (#58): 120 → 600 s.  Previously Tab5 WS got dropped
+            # mid-turn when TC was running a long agent task — heartbeat
+            # PING goes out every 60 s but if the TC response hasn't started
+            # streaming within 120 s (normal for MiniMax-M2.5 + tools), the
+            # aiohttp server-side receive_timeout would yank the connection
+            # and Tab5 would see the flap as "Dragon unreachable".
+            receive_timeout=600.0,
             autoping=True,
         )
         await ws.prepare(request)
@@ -1816,8 +1822,17 @@ class VoiceServer:
                                         if old_llm is not None and old_llm not in self._backend_pool.values():
                                             await old_llm.shutdown()
                                         self._conversation._llm = new_llm
-                                        logger.info("ConversationEngine LLM swapped to %s%s",
-                                                    new_llm.name, " (pooled)" if pooled else "")
+                                        # 2026-04-23 (#58): also swap _llm_config so the
+                                        # compact-vs-full tool prompt logic in
+                                        # ConversationEngine._augment_context_with_tools
+                                        # picks the right format for the active backend.
+                                        # Without this, cloud-mode agents stayed on the
+                                        # top-5 compact tool list and never saw weather,
+                                        # stock_ticker, timesense_timer, quick_poll, note,
+                                        # system_info, or unit_converter.
+                                        self._conversation._llm_config = conn_config.llm
+                                        logger.info("ConversationEngine LLM swapped to %s%s (backend=%s)",
+                                                    new_llm.name, " (pooled)" if pooled else "", conn_config.llm.backend)
                                     except Exception as e:
                                         logger.exception("ConversationEngine LLM swap failed: %s", e)
 

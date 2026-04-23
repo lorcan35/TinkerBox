@@ -2307,6 +2307,27 @@ class VoiceServer:
                 keepalive_task.cancel()
 
             response_text = "".join(full_response)
+
+            # Wave 15 W15-H09: same empty-response guard as the voice
+            # pipeline.  When MiniMax / the TinkerClaw agent halts after
+            # a failed tool call without formulating a user-facing reply
+            # (e.g. brave_search returns missing_brave_api_key), we'd
+            # otherwise send llm_done with text="" and Tab5 silently
+            # drops the chat bubble.  Emit a fallback so the user always
+            # sees something in the chat view.
+            if not response_text.strip():
+                fallback = (
+                    "Sorry, I couldn't generate a response for that. "
+                    "Please try rephrasing, or try again in a moment."
+                )
+                logger.warning(
+                    "W15-H09: TinkerClaw text path produced zero tokens — "
+                    "emitting fallback response"
+                )
+                if not ws.closed:
+                    await ws.send_json({"type": "llm", "text": fallback})
+                response_text = fallback
+
             logger.info("TinkerClaw text response (%d chars): %s",
                         len(response_text), response_text[:80])
             if not ws.closed:

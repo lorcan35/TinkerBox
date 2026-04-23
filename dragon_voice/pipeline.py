@@ -741,6 +741,29 @@ class VoicePipeline:
             if sentence_buffer.strip() and not self._cancelled:
                 await self._synthesize_and_send(sentence_buffer.strip())
 
+            # Wave 15 W15-H09: empty-response guard.  If the LLM stream
+            # finished without producing any text (common failure mode:
+            # model attempts a tool call, the tool errors out, model
+            # halts without formulating a user-facing answer — seen
+            # today with MiniMax-M2.5 on TinkerClaw when BRAVE_API_KEY
+            # is missing), the user was left staring at "thinking" until
+            # Tab5 timed out and dropped to READY with no audio.  Emit a
+            # fallback sentence so the user ALWAYS hears something.
+            # Skip the fallback if we were cancelled — that's a user
+            # action (stop button, new session) and silence is correct.
+            if not full_response.strip() and not self._cancelled:
+                fallback = (
+                    "Sorry, I couldn't generate a response for that. "
+                    "Please try rephrasing, or try again in a moment."
+                )
+                logger.warning(
+                    "W15-H09: LLM stream produced zero text tokens — "
+                    "emitting fallback response to avoid silent drop"
+                )
+                await self._on_event({"type": "llm", "text": fallback})
+                await self._synthesize_and_send(fallback)
+                full_response = fallback
+
             llm_ms = (time.monotonic() - t0) * 1000
             logger.info("LLM (%.0fms): %s", llm_ms, full_response[:80])
             await self._on_event({"type": "llm_done", "llm_ms": round(llm_ms)})

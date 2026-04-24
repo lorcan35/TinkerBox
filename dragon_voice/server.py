@@ -1558,39 +1558,45 @@ class VoiceServer:
                 r"<tool>[\s\S]*?</tool>\s*<args>[\s\S]*?</args>\s*>?",
                 _re.IGNORECASE,
             )
-            async for token in self._conversation.process_text_stream(
-                session_id=session_id,
-                text=content,
-                input_mode="text",
-                on_tool_call=conn_state.get("on_tool_call"),
-                on_tool_result=conn_state.get("on_tool_result"),
-            ):
-                full_response.append(token)
-                pending += token
-                # Strip any complete tool blocks sitting in the pending
-                # buffer. Substitute in-place so remaining prose still
-                # flushes below.
-                stripped = _TOOL_RE_LOCAL.sub("", pending)
-                if stripped != pending:
-                    pending = stripped
-                # Hold back the tail if it looks like a partial tool
-                # marker so we don't flush `<tool>dat` to the client and
-                # then have to retract it.
-                hold_at = -1
-                for marker in ("<tool>", "<tool", "</tool", "<args", "</args"):
-                    idx = pending.rfind(marker)
-                    if idx >= 0 and idx > hold_at:
-                        hold_at = idx
-                if hold_at >= 0:
-                    flush, pending = pending[:hold_at], pending[hold_at:]
-                else:
-                    flush, pending = pending, ""
-                if flush and not ws.closed:
-                    await ws.send_json({"type": "llm", "text": flush})
-            # End-of-stream: flush whatever remains, stripped one more time.
-            pending = _TOOL_RE_LOCAL.sub("", pending)
-            if pending and not ws.closed:
-                await ws.send_json({"type": "llm", "text": pending})
+            # #75 phase 1a: same PING-during-inference protection used
+            # on the TC + vision paths above.  Local Ollama + ConversationEngine
+            # text turns on 4 B-class models routinely exceed 60 s, which
+            # trips Tab5's PONG-watch (~30 s) without this helper and
+            # triggers the P13 eviction race.
+            async with self._ws_keepalive_during_inference(ws, label="local_text"):
+                async for token in self._conversation.process_text_stream(
+                    session_id=session_id,
+                    text=content,
+                    input_mode="text",
+                    on_tool_call=conn_state.get("on_tool_call"),
+                    on_tool_result=conn_state.get("on_tool_result"),
+                ):
+                    full_response.append(token)
+                    pending += token
+                    # Strip any complete tool blocks sitting in the pending
+                    # buffer. Substitute in-place so remaining prose still
+                    # flushes below.
+                    stripped = _TOOL_RE_LOCAL.sub("", pending)
+                    if stripped != pending:
+                        pending = stripped
+                    # Hold back the tail if it looks like a partial tool
+                    # marker so we don't flush `<tool>dat` to the client and
+                    # then have to retract it.
+                    hold_at = -1
+                    for marker in ("<tool>", "<tool", "</tool", "<args", "</args"):
+                        idx = pending.rfind(marker)
+                        if idx >= 0 and idx > hold_at:
+                            hold_at = idx
+                    if hold_at >= 0:
+                        flush, pending = pending[:hold_at], pending[hold_at:]
+                    else:
+                        flush, pending = pending, ""
+                    if flush and not ws.closed:
+                        await ws.send_json({"type": "llm", "text": flush})
+                # End-of-stream: flush whatever remains, stripped one more time.
+                pending = _TOOL_RE_LOCAL.sub("", pending)
+                if pending and not ws.closed:
+                    await ws.send_json({"type": "llm", "text": pending})
 
             response_text = _TOOL_RE_LOCAL.sub("", "".join(full_response))
 

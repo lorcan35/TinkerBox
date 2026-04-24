@@ -49,6 +49,7 @@ from dragon_voice.middleware import (
 )
 from dragon_voice.pipeline import VoicePipeline
 from dragon_voice.sessions import SessionManager
+from dragon_voice.tools.response_wrap import synthesize_wrap
 
 logger = logging.getLogger(__name__)
 
@@ -1269,6 +1270,14 @@ class VoiceServer:
                 if ws.closed:
                     return
                 await ws.send_json({"type": "tool_result", **result})
+                # #75 phase 1b: remember this result for end-of-turn
+                # template-wrap synthesis in case the LLM produced no
+                # user-facing text (common with FC-trained models that
+                # only emit tool calls and never natural language).
+                try:
+                    conn_state.setdefault("tool_calls_this_turn", []).append(result)
+                except Exception:
+                    logger.debug("tool_calls_this_turn append suppressed", exc_info=True)
                 # v4·D Phase 4c: auto-emit widget_list for web_search results
                 # so the Tab5 home live-slot surfaces the top hits without
                 # the LLM having to orchestrate a widget call itself.
@@ -1414,6 +1423,12 @@ class VoiceServer:
         text = content
         logger.info("Text input on session %s: %s", session_id, text[:80])
 
+        # #75 phase 1b: reset the per-turn tool-call tracker.  Each
+        # incoming text starts a new turn; the `_on_tool_result`
+        # callback accumulates here so the end-of-turn empty-reply guard
+        # can synthesise a template wrap from what actually fired.
+        conn_state["tool_calls_this_turn"] = []
+
         # TinkerClaw mode: bypass ConversationEngine, use ConversationEngine's
         # swapped LLM (not pipeline._llm which may be stale after swap race)
         conn_cfg = conn_state.get("config")
@@ -1449,22 +1464,41 @@ class VoiceServer:
 
             response_text = "".join(full_response)
 
-            # Wave 15 W15-H09: same empty-response guard as the voice
-            # pipeline.  When MiniMax / the TinkerClaw agent halts after
-            # a failed tool call without formulating a user-facing reply
-            # (e.g. brave_search returns missing_brave_api_key), we'd
+            # Wave 15 W15-H09 + #75 phase 1b: empty-response guard.  When
+            # MiniMax / the TinkerClaw agent halts after a failed tool
+            # call without formulating a user-facing reply, OR when an
+            # FC-trained local model (xLAM, functiongemma, …) only
+            # emitted tool calls with no natural-language wrap, we'd
             # otherwise send llm_done with text="" and Tab5 silently
-            # drops the chat bubble.  Emit a fallback so the user always
-            # sees something in the chat view.
+            # drops the chat bubble.
+            #
+            # Preference order:
+            #   1. If any tool fired this turn, synthesise a per-tool
+            #      template wrap from `conn_state["tool_calls_this_turn"]`
+            #      (response_wrap.synthesize_wrap).  Fast, deterministic,
+            #      describes what actually ran — users get a useful ack
+            #      like "Got it — magenta." rather than a frustrating
+            #      "Sorry, I couldn't generate a response."
+            #   2. Fall through to the legacy W15-H09 generic apology
+            #      when there were zero tool fires (e.g. real LLM error).
             if not response_text.strip():
-                fallback = (
-                    "Sorry, I couldn't generate a response for that. "
-                    "Please try rephrasing, or try again in a moment."
-                )
-                logger.warning(
-                    "W15-H09: TinkerClaw text path produced zero tokens — "
-                    "emitting fallback response"
-                )
+                tool_calls = conn_state.get("tool_calls_this_turn") or []
+                if tool_calls:
+                    fallback = synthesize_wrap(tool_calls)
+                    logger.info(
+                        "#75 phase 1b: TC path produced zero LLM tokens but "
+                        "%d tool(s) fired — emitting template wrap (%d chars)",
+                        len(tool_calls), len(fallback),
+                    )
+                else:
+                    fallback = (
+                        "Sorry, I couldn't generate a response for that. "
+                        "Please try rephrasing, or try again in a moment."
+                    )
+                    logger.warning(
+                        "W15-H09: TinkerClaw text path produced zero tokens — "
+                        "emitting fallback response"
+                    )
                 if not ws.closed:
                     await ws.send_json({"type": "llm", "text": fallback})
                 response_text = fallback
@@ -1599,6 +1633,26 @@ class VoiceServer:
                     await ws.send_json({"type": "llm", "text": pending})
 
             response_text = _TOOL_RE_LOCAL.sub("", "".join(full_response))
+
+            # #75 phase 1b: if the local model fired tools but never
+            # produced user-facing text (common with FC-trained small
+            # models like xLAM that emit tool calls then stop), wrap
+            # the tool results in a templated natural-language ack so
+            # Tab5 doesn't render an empty bubble.  Same intent as the
+            # TC-path guard above, just applied to the local/conversation
+            # engine flow.
+            if not response_text.strip():
+                tool_calls = conn_state.get("tool_calls_this_turn") or []
+                if tool_calls:
+                    wrap = synthesize_wrap(tool_calls)
+                    logger.info(
+                        "#75 phase 1b: local text path emitted only tool "
+                        "calls (%d) — sending template wrap (%d chars)",
+                        len(tool_calls), len(wrap),
+                    )
+                    if not ws.closed:
+                        await ws.send_json({"type": "llm", "text": wrap})
+                    response_text = wrap
 
             if not ws.closed:
                 await ws.send_json({"type": "llm_done", "llm_ms": 0})
@@ -1786,6 +1840,9 @@ class VoiceServer:
             ]
         }]
 
+        # #75 phase 1b: reset per-turn tool tracker on this path too.
+        conn_state["tool_calls_this_turn"] = []
+
         full_response = []
         llm = conn_state.get("conversation")
         if llm and hasattr(llm, '_llm'):
@@ -1813,6 +1870,22 @@ class VoiceServer:
             if not ws.closed:
                 await ws.send_json({"type": "error", "message": str(e)})
             return
+
+        # #75 phase 1b: vision path gets the same empty-reply guard as
+        # the text paths.  Multimodal models can fire a tool (e.g.
+        # `note` to save a snapshot caption) and stop without text.
+        if not "".join(full_response).strip():
+            tool_calls = conn_state.get("tool_calls_this_turn") or []
+            if tool_calls:
+                wrap = synthesize_wrap(tool_calls)
+                logger.info(
+                    "#75 phase 1b: vision path emitted only tool calls "
+                    "(%d) — sending template wrap (%d chars)",
+                    len(tool_calls), len(wrap),
+                )
+                if not ws.closed:
+                    await ws.send_json({"type": "llm", "text": wrap})
+                full_response.append(wrap)
 
         if not ws.closed:
             await ws.send_json({"type": "llm_done", "llm_ms": 0})

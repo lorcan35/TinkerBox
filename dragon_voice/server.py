@@ -1165,6 +1165,18 @@ class VoiceServer:
         # Store tool event callbacks per-connection (NOT on shared conversation engine)
         if self._tool_registry:
             async def _on_tool_call(call):
+                # #75 phase 1b: pre-register the call + args in the
+                # per-turn tracker so `_on_tool_result` can merge the
+                # result into the same record.  The wrap synthesiser
+                # reads both sides (e.g. `remember` needs the `fact`
+                # from args to write "Got it — {fact}.").
+                try:
+                    conn_state.setdefault("tool_calls_this_turn", []).append({
+                        "tool": call.get("tool"),
+                        "args": call.get("args") or {},
+                    })
+                except Exception:
+                    logger.debug("tool_calls_this_turn pre-register suppressed", exc_info=True)
                 if not ws.closed:
                     await self._safe_send_json(ws, {
                         "type": "tool_call",
@@ -1176,14 +1188,25 @@ class VoiceServer:
                 if ws.closed:
                     return
                 await ws.send_json({"type": "tool_result", **result})
-                # #75 phase 1b: remember this result for end-of-turn
-                # template-wrap synthesis in case the LLM produced no
-                # user-facing text (common with FC-trained models that
-                # only emit tool calls and never natural language).
+                # #75 phase 1b: merge result into the most-recent
+                # pre-registered call for this tool name (fills the
+                # FIRST pending slot so same-tool-twice-in-one-turn
+                # still maps 1:1).  If no pre-register exists (some
+                # code paths emit tool_result only), append the bare
+                # result so the wrap still has something to describe.
                 try:
-                    conn_state.setdefault("tool_calls_this_turn", []).append(result)
+                    tracker = conn_state.setdefault("tool_calls_this_turn", [])
+                    merged = False
+                    for rec in tracker:
+                        if rec.get("tool") == result.get("tool") and "result" not in rec:
+                            rec["result"] = result.get("result")
+                            rec["execution_ms"] = result.get("execution_ms")
+                            merged = True
+                            break
+                    if not merged:
+                        tracker.append(result)
                 except Exception:
-                    logger.debug("tool_calls_this_turn append suppressed", exc_info=True)
+                    logger.debug("tool_calls_this_turn merge suppressed", exc_info=True)
                 # v4·D Phase 4c: auto-emit widget_list for web_search results
                 # so the Tab5 home live-slot surfaces the top hits without
                 # the LLM having to orchestrate a widget call itself.

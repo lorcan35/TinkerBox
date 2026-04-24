@@ -62,4 +62,5 @@ jobs:
             tests/test_media_url_signer.py \
             tests/test_proxy_image_ssrf.py \
             tests/test_security_headers.py \
-            tests/test_debug_handlers.py
+            tests/test_debug_handlers.py \
+            tests/test_lifecycle_monitors.py

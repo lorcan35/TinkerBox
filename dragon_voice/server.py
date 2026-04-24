@@ -22,14 +22,18 @@ from aiohttp import web, WSMsgType
 from dragon_voice.media.store import MediaStore
 from dragon_voice.media.pipeline import MediaPipeline
 from dragon_voice.config import (
-    VoiceConfig, config_to_dict, load_config,
+    VoiceConfig,
     SYSTEM_PROMPT_LOCAL, SYSTEM_PROMPT_HYBRID, SYSTEM_PROMPT_CLOUD,
     MAX_TOKENS_LOCAL, MAX_TOKENS_HYBRID, MAX_TOKENS_CLOUD,
 )
 from dragon_voice.conversation import ConversationEngine
 from dragon_voice.db import Database
 from dragon_voice.messages import MessageStore
-from dragon_voice.handlers import debug as _handlers_debug
+from dragon_voice.handlers import (
+    config_api as _handlers_config_api,
+    debug as _handlers_debug,
+    status as _handlers_status,
+)
 from dragon_voice.lifecycle import (
     monitors as _lc_monitors,
     purge as _lc_purge,
@@ -266,52 +270,13 @@ class VoiceServer:
 
     # ------------------------------------------------------------------ HTTP
 
-    async def _handle_status(self, request: web.Request) -> web.Response:
-        """Status page with backend info and uptime."""
-        uptime = time.time() - self._start_time
-        hours = int(uptime // 3600)
-        minutes = int((uptime % 3600) // 60)
-        seconds = int(uptime % 60)
+    # Status + health — thin adapters over dragon_voice/handlers/status.py.
 
-        html = f"""<!DOCTYPE html>
-<html>
-<head><title>Dragon Voice Server</title>
-<style>
-  body {{ font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 2em; }}
-  h1 {{ color: #ff6b35; }}
-  .info {{ background: #16213e; padding: 1em; border-radius: 8px; margin: 1em 0; }}
-  .label {{ color: #0f3460; font-weight: bold; }}
-  span.val {{ color: #53d769; }}
-</style>
-</head>
-<body>
-  <h1>Dragon Voice Server</h1>
-  <div class="info">
-    <p>STT Backend: <span class="val">{self._stt_name}</span></p>
-    <p>TTS Backend: <span class="val">{self._tts_name}</span></p>
-    <p>LLM Backend: <span class="val">{self._llm_name}</span></p>
-    <p>Uptime: <span class="val">{hours}h {minutes}m {seconds}s</span></p>
-    <p>Active Connections: <span class="val">{len(self._active_connections)}</span></p>
-    <p>Total Sessions: <span class="val">{self._session_count}</span></p>
-  </div>
-</body>
-</html>"""
-        return web.Response(text=html, content_type="text/html")
+    async def _handle_status(self, request: web.Request) -> web.Response:
+        return await _handlers_status.handle_status(request, server=self)
 
     async def _handle_health(self, request: web.Request) -> web.Response:
-        """Health check endpoint returning JSON."""
-        return web.json_response(
-            {
-                "status": "ok",
-                "uptime_seconds": round(time.time() - self._start_time, 1),
-                "active_connections": len(self._active_connections),
-                "backends": {
-                    "stt": self._stt_name,
-                    "tts": self._tts_name,
-                    "llm": self._llm_name,
-                },
-            }
-        )
+        return await _handlers_status.handle_health(request, server=self)
 
     # Debug / diagnostic handlers — thin adapters over the functions in
     # ``dragon_voice/handlers/debug.py``.  The URL routing + bearer-auth
@@ -344,106 +309,13 @@ class VoiceServer:
 
 
 
+    # Config get/set — thin adapters over dragon_voice/handlers/config_api.py.
+
     async def _handle_get_config(self, request: web.Request) -> web.Response:
-        """Return current config with secrets redacted."""
-        return web.json_response(
-            config_to_dict(self._config, redact_secrets=True)
-        )
+        return await _handlers_config_api.handle_get_config(request, server=self)
 
     async def _handle_set_config(self, request: web.Request) -> web.Response:
-        """Hot-reload configuration.
-
-        Accepts a partial config JSON — only provided sections are updated.
-        Swaps backends on active sessions if needed.
-        """
-        try:
-            body = await request.json()
-        except json.JSONDecodeError:
-            return web.json_response(
-                {"error": "Invalid JSON"}, status=400
-            )
-
-        logger.info("Config update requested: %s", list(body.keys()))
-
-        try:
-            # Reload full config from file first, then apply overrides
-            new_config = load_config()
-
-            # Apply overrides from the request body
-            if "stt" in body:
-                for k, v in body["stt"].items():
-                    if hasattr(new_config.stt, k):
-                        setattr(new_config.stt, k, v)
-            if "tts" in body:
-                for k, v in body["tts"].items():
-                    if hasattr(new_config.tts, k):
-                        setattr(new_config.tts, k, v)
-            if "llm" in body:
-                for k, v in body["llm"].items():
-                    if hasattr(new_config.llm, k):
-                        setattr(new_config.llm, k, v)
-            if "audio" in body:
-                for k, v in body["audio"].items():
-                    if hasattr(new_config.audio, k):
-                        setattr(new_config.audio, k, v)
-
-            # Validate before applying
-            validation_errors = new_config.validate()
-            if validation_errors:
-                return web.json_response(
-                    {"error": "Config validation failed", "details": validation_errors},
-                    status=400,
-                )
-
-            old_config = self._config
-            self._config = new_config
-
-            # Update displayed backend names
-            self._stt_name = new_config.stt.backend
-            self._tts_name = new_config.tts.backend
-            self._llm_name = new_config.llm.backend
-
-            # Swap backends on all active pipelines.
-            # A06: Acquire each connection's conn_lock before swapping to
-            # prevent races with WS config_update on the same connection.
-            # Two concurrent swap_backends() calls would interleave
-            # shutdown/init of backends, causing use-after-free errors.
-            swap_errors = []
-            for ws_id, conn in list(self._active_connections.items()):
-                pipeline = conn.get("pipeline")
-                if pipeline:
-                    lock = conn.get("conn_lock")
-                    logger.info("Swapping backends for connection %s", ws_id)
-                    try:
-                        if lock:
-                            async with lock:
-                                await pipeline.swap_backends(new_config)
-                        else:
-                            await pipeline.swap_backends(new_config)
-                    except Exception as e:
-                        logger.warning("Backend swap failed for %s: %s", ws_id, e)
-                        swap_errors.append(str(e))
-
-            pipelines_with_swap = sum(
-                1 for c in self._active_connections.values() if c.get("pipeline")
-            )
-            return web.json_response(
-                {
-                    "status": "ok",
-                    "message": f"Config updated, {pipelines_with_swap} pipelines reloaded",
-                    "backends": {
-                        "stt": new_config.stt.backend,
-                        "tts": new_config.tts.backend,
-                        "llm": new_config.llm.backend,
-                    },
-                }
-            )
-
-        except Exception as e:
-            logger.exception("Config update failed")
-            return web.json_response(
-                {"error": str(e)}, status=500
-            )
+        return await _handlers_config_api.handle_set_config(request, server=self)
 
     # --------------------------------------------------------------- WebSocket
 

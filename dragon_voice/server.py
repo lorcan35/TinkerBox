@@ -16,7 +16,7 @@ import logging
 import os
 import resource
 import time
-from typing import ClassVar, Optional
+from typing import Optional
 
 import aiohttp
 from aiohttp import web, WSMsgType
@@ -32,6 +32,12 @@ from dragon_voice.config import (
 from dragon_voice.conversation import ConversationEngine
 from dragon_voice.db import Database
 from dragon_voice.messages import MessageStore
+from dragon_voice.middleware import (
+    auth as _mw_auth,
+    cors as _mw_cors,
+    rate_limit as _mw_rate_limit,
+    security_headers as _mw_security_headers,
+)
 from dragon_voice.pipeline import VoicePipeline
 from dragon_voice.sessions import SessionManager
 
@@ -155,226 +161,29 @@ class VoiceServer:
         self._app = app
         return app
 
-    # Allowed CORS origins — only these can make cross-origin API calls
-    # Wave 14 W14-M14: frozenset at class scope (ruff RUF012) — no
-    # accidental mutation across instances.
-    _CORS_ALLOWED_ORIGINS: ClassVar[frozenset[str]] = frozenset({
-        "http://localhost:3500",
-        "http://127.0.0.1:3500",
-        "http://192.168.1.90:8080",
-        "https://tinkerclaw-dashboard.ngrok.dev",
-    })
+    # Middleware — thin adapters over the stateless handlers in
+    # ``dragon_voice/middleware/``.  Each adapter binds instance state
+    # (config, rate-limit buckets) and forwards to the shared handler.
+    # See dragon_voice/middleware/__init__.py for the migration plan.
 
     @web.middleware
     async def _cors_middleware(self, request: web.Request, handler):
-        """Add CORS headers to API responses for allowed origins only (SEC12)."""
-        origin = request.headers.get("Origin", "")
-
-        # If origin is not in the allowlist, skip CORS headers entirely
-        # (browser will block the cross-origin request)
-        if origin not in self._CORS_ALLOWED_ORIGINS:
-            if request.method == "OPTIONS":
-                return web.Response(status=403)
-            return await handler(request)
-
-        # Handle preflight OPTIONS requests for allowed origins
-        if request.method == "OPTIONS":
-            return web.Response(headers={
-                "Access-Control-Allow-Origin": origin,
-                "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type, X-Sample-Rate, Accept, Authorization",
-                "Access-Control-Max-Age": "3600",
-            })
-        response = await handler(request)
-        response.headers["Access-Control-Allow-Origin"] = origin
-        return response
-
-    # ----------------------------------------------------------------- Security headers
-    #
-    # Wave 14 W14-M06: stamp the standard defensive headers on every
-    # response. Amplifies the W14-H02 dashboard XSS sweep (CSP blocks
-    # the payload even if a new innerHTML site slips through the
-    # escHtml gate) and blocks framing + MIME sniffing for free.
-    # /dashboard SPA uses Google Fonts so the CSP allows that origin
-    # specifically; all other sources stay same-origin.
-    _SECURITY_HEADERS = {
-        "X-Content-Type-Options": "nosniff",
-        "X-Frame-Options": "DENY",
-        "Referrer-Policy": "no-referrer",
-        # CSP — intentionally strict.  style-src allows 'unsafe-inline'
-        # because the dashboard inlines its whole stylesheet.  If we
-        # ever extract the CSS to a separate file, tighten this.
-        "Content-Security-Policy": (
-            "default-src 'self'; "
-            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-            "font-src 'self' https://fonts.gstatic.com; "
-            "img-src 'self' data:; "
-            "connect-src 'self'; "
-            "frame-ancestors 'none'; "
-            "base-uri 'self'"
-        ),
-    }
+        return await _mw_cors.handle_cors(request, handler)
 
     @web.middleware
     async def _security_headers_middleware(self, request: web.Request, handler):
-        response = await handler(request)
-        # Only stamp on Response objects — WS upgrade responses are
-        # not subject to CSP and setting these headers on them confuses
-        # some clients. aiohttp WebSocketResponse doesn't expose
-        # .headers until prepare(); the middleware path doesn't touch
-        # it in that case.
-        try:
-            for k, v in self._SECURITY_HEADERS.items():
-                if k not in response.headers:
-                    response.headers[k] = v
-        except (AttributeError, TypeError):
-            # WS responses or streaming responses that don't expose
-            # headers in this phase — skip silently.
-            pass
-        return response
-
-    # ----------------------------------------------------------------- Auth
-    #
-    # Wave 13 C2 security: bearer-token auth on every privileged route.
-    # Matches the scheme docs/protocol.md calls out for Tab5 debug server;
-    # the token is read from config.yaml (reads DRAGON_API_TOKEN env)
-    # and can be rotated without code changes.  Public paths are allowlisted
-    # (health, WS handshake is separately gated via the `register` frame).
-    _AUTH_PUBLIC_PREFIXES = (
-        "/health",              # liveness probe
-        # Wave 14 W14-C04: /ws/voice is allow-listed here (because the
-        # bearer comes from the upgrade header, not the request path),
-        # but _handle_ws_voice itself performs the Authorization check
-        # before ws.prepare().  Do NOT remove /ws/voice from this list or
-        # the CORS middleware will bounce the upgrade.
-        "/ws/voice",            # auth enforced inside _handle_ws_voice
-        "/dashboard",           # proxied to localhost:3500 (separately gated)
-        # Wave 14 W14-H04: /api/media/* remains in the public allowlist
-        # (so Tab5 doesn't need to present the bearer on image fetches),
-        # but the handler itself now requires an HMAC signature in the
-        # query string when server.api_token is configured.  The URLs
-        # emitted in WS media events carry that signature automatically.
-        "/api/media/",
-    )
+        return await _mw_security_headers.handle_security_headers(request, handler)
 
     @web.middleware
     async def _auth_middleware(self, request: web.Request, handler):
-        path = request.path or "/"
-        # Never gate OPTIONS (CORS middleware already answered it).
-        if request.method == "OPTIONS":
-            return await handler(request)
-        if any(path == p or path.startswith(p) for p in self._AUTH_PUBLIC_PREFIXES):
-            return await handler(request)
-        # Resolve the expected token once from config (hot-reload-safe).
         expected = (getattr(self._config.server, "api_token", "") or "").strip()
-        if not expected:
-            # Token not configured — fail closed on private paths to avoid
-            # accidentally exposing everything when a deployer forgets.
-            # During local-dev bootstrap, set `api_token: ""` in config.yaml
-            # explicitly to an empty-string marker + allowlist the paths.
-            return web.json_response(
-                {"error": "dragon_api_token_not_configured",
-                 "message": "Set DRAGON_API_TOKEN in env or api_token in config.yaml"},
-                status=503)
-        auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer "):
-            return web.json_response(
-                {"error": "missing_bearer_token",
-                 "message": "Authorization: Bearer <token> required"},
-                status=401)
-        supplied = auth[7:].strip()
-        # Constant-time compare to avoid timing-oracle credential leaks.
-        import hmac
-        if not hmac.compare_digest(supplied, expected):
-            return web.json_response(
-                {"error": "invalid_bearer_token",
-                 "message": "token rejected"}, status=401)
-        return await handler(request)
-
-    # --------------------------------------------------------------- Rate limit
-
-    # Wave 15 W15-H01 + W15-H06: throttle per-IP + per-path on a small
-    # fixed window.  Keyed on client-IP + method + path so a DELETE to
-    # /api/v1/devices/foo burns budget independently from a POST to
-    # /api/v1/sessions/bar/chat.  State-changing + SSE-streaming
-    # endpoints get tight limits; read-only endpoints are
-    # unthrottled.  In-memory only — if the process restarts the
-    # counters reset, which is fine for this threat model (single-
-    # tenant deployment, we just want to stop loop-bugs and obvious
-    # DoS).
-    _RATE_LIMIT_RULES: ClassVar[tuple[tuple[str, str, int, int], ...]] = (
-        # (method_prefix, path_prefix, max_requests, window_seconds)
-        ("DELETE", "/api/v1/devices/",          20, 60),
-        ("DELETE", "/api/v1/sessions/",         20, 60),
-        ("DELETE", "/api/v1/messages",          20, 60),
-        ("DELETE", "/api/v1/memory/",           30, 60),
-        ("DELETE", "/api/v1/documents/",        10, 60),
-        ("DELETE", "/api/v1/config/",           20, 60),
-        ("POST",   "/api/v1/sessions/",         30, 60),  # /end, /pause, /resume
-        # W15-H06: SSE reconnect amplification — a broken client can
-        # re-open the chat stream 30 times/sec on tab-flap.  Cap at
-        # 20/min per IP + session to give the client room for legit
-        # retries but stop the storm.
-        ("POST",   "/api/v1/sessions/",         20, 60),  # covers /chat too
-        # Upload path — protect against the 10 MB upload × spam DoS
-        ("POST",   "/api/media/upload",         30, 60),
-    )
+        return await _mw_auth.handle_auth(request, handler, expected_token=expected)
 
     @web.middleware
     async def _rate_limit_middleware(self, request: web.Request, handler):
-        # Fast path: only even consider paths that match at least one rule.
-        path = request.path
-        method = request.method
-        # `match_prefix` just walks the rule table — tiny list so this
-        # is cheap even at 1000 req/sec.
-        matched = None
-        for m, p, cap, win in self._RATE_LIMIT_RULES:
-            if method == m and path.startswith(p):
-                # Keep the TIGHTEST matching rule (smallest cap).
-                if matched is None or cap < matched[0]:
-                    matched = (cap, win)
-        if matched is None:
-            return await handler(request)
-
-        # Use peername as the client key; behind ngrok/proxy it's the
-        # proxy IP which is fine for single-tenant threat model.
-        peer = request.transport.get_extra_info("peername") if request.transport else None
-        client = peer[0] if peer else "unknown"
-        cap, win = matched
-        key = (client, method, path)
-
-        now = time.monotonic()
-        bucket = self._rate_buckets.get(key)
-        if bucket is None or now - bucket["window_start"] >= win:
-            self._rate_buckets[key] = {"window_start": now, "count": 1}
-        else:
-            bucket["count"] += 1
-            if bucket["count"] > cap:
-                retry_after = int(win - (now - bucket["window_start"])) + 1
-                logger.warning(
-                    "rate-limit: %s %s from %s (%d/%d in %ds)",
-                    method, path, client, bucket["count"], cap, win,
-                )
-                return web.json_response(
-                    {
-                        "error": "rate_limited",
-                        "message": f"limit {cap} requests per {win} s for this path",
-                        "retry_after_seconds": retry_after,
-                    },
-                    status=429,
-                    headers={"Retry-After": str(retry_after)},
-                )
-
-        # Periodic cheap GC so the dict doesn't grow unbounded over
-        # long uptimes (each entry is ~200 B; 10 000 entries = 2 MB).
-        if len(self._rate_buckets) > 4096:
-            cutoff = now - 600  # anything untouched 10 min gets dropped
-            self._rate_buckets = {
-                k: v for k, v in self._rate_buckets.items()
-                if v["window_start"] > cutoff
-            }
-
-        return await handler(request)
+        return await _mw_rate_limit.handle_rate_limit(
+            request, handler, buckets=self._rate_buckets
+        )
 
     # --------------------------------------------------------------- Dashboard proxy
 

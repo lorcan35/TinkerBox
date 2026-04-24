@@ -10,18 +10,15 @@ refs #16, #17, #18
 
 import asyncio
 import copy
-import gc
 import json
 import logging
 import os
-import resource
 import time
 from typing import Optional
 
 import aiohttp
 from aiohttp import web, WSMsgType
 
-from dragon_voice.api import setup_all_routes
 from dragon_voice.media.store import MediaStore
 from dragon_voice.media.pipeline import MediaPipeline
 from dragon_voice.config import (
@@ -33,6 +30,12 @@ from dragon_voice.conversation import ConversationEngine
 from dragon_voice.db import Database
 from dragon_voice.messages import MessageStore
 from dragon_voice.handlers import debug as _handlers_debug
+from dragon_voice.lifecycle import (
+    monitors as _lc_monitors,
+    purge as _lc_purge,
+    shutdown as _lc_shutdown,
+    startup as _lc_startup,
+)
 from dragon_voice.middleware import (
     auth as _mw_auth,
     cors as _mw_cors,
@@ -231,477 +234,35 @@ class VoiceServer:
             )
 
     # --------------------------------------------------------------- Lifecycle
+    #
+    # Thin adapters over dragon_voice/lifecycle/.  The orchestration
+    # logic (~470 LOC) moved to startup.py, shutdown.py, monitors.py,
+    # purge.py so server.py stays focused on request routing + the
+    # class definition.  These methods preserve the aiohttp on_startup
+    # / on_shutdown signatures expected by ``create_app``.
 
     async def _on_startup(self, app: web.Application) -> None:
-        """Initialize foundation modules on server start."""
-        logger.info("Initializing foundation modules...")
-
-        # Shared client session for dashboard proxy (DQ08)
-        self._proxy_session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=30)
-        )
-
-        # Database
-        self._db = Database()
-        await self._db.initialize()
-
-        # Session manager (with background cleanup)
-        self._session_mgr = SessionManager(self._db)
-        await self._session_mgr.start()
-
-        # Message store
-        self._message_store = MessageStore(self._db)
-
-        # Memory service (agentic: facts + documents + RAG)
-        self._memory_service = None
-        self._tool_registry = None
-        try:
-            from dragon_voice.memory import MemoryService
-            from dragon_voice.tools import ToolRegistry
-            from dragon_voice.tools.web_search import WebSearchTool
-            from dragon_voice.tools.datetime_tool import DateTimeTool
-
-            self._memory_service = MemoryService(
-                self._db,
-                ollama_url=self._config.llm.ollama_url,
-            )
-            await self._memory_service.initialize()
-
-            self._tool_registry = ToolRegistry()
-            self._tool_registry.register(WebSearchTool(
-                searxng_url=getattr(self._config.tools, "searxng_url", "")
-            ))
-            self._tool_registry.register(DateTimeTool())
-
-            # Memory tools need memory_service
-            from dragon_voice.tools.memory_tools import (
-                StoreFactTool, RecallFactsTool, ForgetFactTool,
-            )
-            self._tool_registry.register(StoreFactTool(self._memory_service))
-            self._tool_registry.register(RecallFactsTool(self._memory_service))
-            # v4·D Gauntlet G9: two-step confirm-gated forget_fact tool.
-            self._tool_registry.register(ForgetFactTool(self._memory_service))
-
-            # Tier 1 tools.
-            # Audit D8/K7 dedup (wave 7, 2026-04-20): TimerTool is no
-            # longer registered. TimesenseTool (registered below, after
-            # SurfaceManager init) covers the "set a timer" use case
-            # AND emits widget_live progress.  Keeping both caused the
-            # LLM to pick TimerTool on short phrases ("timer 5 min"),
-            # leaving the whole widget-platform reference flow unreachable
-            # from voice.  TimerTool class file is retained for REST-only
-            # use cases; it's just not wired into the agentic loop.
-            from dragon_voice.tools.weather_tool import WeatherTool
-            from dragon_voice.tools.calculator_tool import CalculatorTool
-            from dragon_voice.tools.unit_converter_tool import UnitConverterTool
-            from dragon_voice.tools.note_tool import NoteTool
-            from dragon_voice.tools.system_tool import SystemInfoTool
-            from dragon_voice.tools.stock_ticker_tool import StockTickerTool
-
-            self._tool_registry.register(WeatherTool())
-            self._tool_registry.register(CalculatorTool())
-            self._tool_registry.register(UnitConverterTool())
-            self._tool_registry.register(SystemInfoTool())
-            self._tool_registry.register(StockTickerTool())
-
-            logger.info("Agentic modules initialized (tools: %d, memory: ok)",
-                        len(self._tool_registry.list_tools()))
-        except Exception as e:
-            logger.warning("Agentic modules not available: %s", e)
-
-        # v4·D Phase 4g stability fix (audit P0 #1): instantiate the
-        # SurfaceManager so Tab5 widget_action events have somewhere to
-        # land.  Previously server.py imported nothing from surfaces/,
-        # and every Tab5 widget tap logged "Unknown command" and died.
-        from dragon_voice.surfaces import SurfaceManager
-        self._surface_mgr = SurfaceManager()
-        logger.info("SurfaceManager initialized")
-        # Audit P0 #1 (2026-04-20): register TimesenseTool - the reference
-        # widget-emitting skill.  Must be registered AFTER surface_mgr init
-        # (it takes the surface manager as constructor arg).  TimerTool and
-        # TimesenseTool have distinct names (timer vs timesense_timer) so
-        # both coexist; LLM picks based on description.
-        if self._tool_registry is not None:
-            try:
-                from dragon_voice.tools.timesense_tool import TimesenseTool
-                self._tool_registry.register(TimesenseTool(self._surface_mgr))
-                logger.info("TimesenseTool registered (widget emitter)")
-                # Wave 12 skill SDK: QuickPollTool is the reference
-                # for docs/SKILL_AUTHORING.md — declarative
-                # surface.prompt(on_action=handler), no imperative
-                # register_action bookkeeping.  ~80 LOC total, a
-                # minimal viable widget skill.
-                from dragon_voice.tools.quick_poll_tool import QuickPollTool
-                self._tool_registry.register(QuickPollTool(self._surface_mgr))
-                logger.info("QuickPollTool registered (declarative widget skill)")
-            except Exception as e:
-                logger.warning("TimesenseTool registration failed: %s", e)
-
-
-        # Conversation engine (shared LLM backend for text/API input)
-        self._conversation = ConversationEngine(
-            self._db, self._message_store, self._config.llm,
-            tool_registry=self._tool_registry,
-            memory_service=self._memory_service,
-        )
-        await self._conversation.initialize()
-
-        # REST API routes (modular package)
-        setup_all_routes(
-            app,
-            db=self._db,
-            session_mgr=self._session_mgr,
-            message_store=self._message_store,
-            conversation=self._conversation,
-            voice_config=self._config,
-            start_time=self._start_time,
-            get_active_connections=lambda: len(self._active_connections),
-            tool_registry=self._tool_registry,
-            memory_service=self._memory_service,
-            media_store=self._media_store,
-            media_url_signer=self._media_url_signer,
-        )
-
-        # Notes API routes
-        try:
-            from dragon_voice.notes.db import NotesDB
-            from dragon_voice.notes.service import NotesService
-            from dragon_voice.notes.api import setup_routes as setup_notes_routes
-
-            notes_db = NotesDB()
-            # Wave 14 W14-C05: NotesDB.initialize is async now. The prior
-            # direct call here was un-awaited, producing a stray coroutine
-            # and an intermittent None-connection race. NotesService.initialize
-            # already calls await self._db.initialize(), so this line is gone.
-            notes_svc = NotesService(self._config, notes_db)
-            await notes_svc.initialize()
-            self._notes_svc = notes_svc  # Store for shutdown
-            setup_notes_routes(app, notes_svc)
-            logger.info("Notes API routes registered")
-
-            # Register note tool now that NotesService is available
-            if self._tool_registry and self._notes_svc:
-                from dragon_voice.tools.note_tool import NoteTool
-                self._tool_registry.register(NoteTool(self._notes_svc))
-                logger.info("Note tool registered (notes service available)")
-        except Exception as e:
-            logger.warning("Notes API not available: %s", e)
-
-        # MCP servers (from config)
-        try:
-            from dragon_voice.mcp.bridge import bridge_mcp_server
-            mcp_servers = getattr(self._config, 'mcp_servers', [])
-            for mcp in mcp_servers:
-                count = await bridge_mcp_server(
-                    self._tool_registry,
-                    name=mcp.get('name', 'mcp'),
-                    url=mcp.get('url'),
-                    token=mcp.get('token'),
-                )
-                logger.info("MCP %s: %d tools bridged", mcp.get('name'), count)
-        except Exception as e:
-            logger.warning("MCP bridge not available: %s", e)
-
-        # Run initial message purge and schedule periodic purge (US-DQ14)
-        retention_days = self._config.database.message_retention_days
-        if retention_days > 0:
-            try:
-                result = await self._db.purge_old_messages(days=retention_days)
-                logger.info(
-                    "Startup purge complete: %d messages, %d events removed (retention=%d days)",
-                    result["messages"], result["events"], retention_days,
-                )
-            except Exception as e:
-                logger.warning("Startup purge failed: %s", e)
-
-            self._purge_task = asyncio.create_task(
-                self._periodic_purge(retention_days)
-            )
-
-        # Media cleanup (hourly, removes expired uploads)
-        self._media_cleanup_task = asyncio.create_task(self._media_cleanup_loop())
-
-        # Start periodic memory monitor (A04)
-        self._memory_monitor_task = asyncio.create_task(self._memory_monitor())
-        rss = self._get_rss_mb()
-        logger.info("Memory monitor started (RSS=%.0f MB, warn=%d MB, crit=%d MB)",
-                     rss, self._mem_warn_mb, self._mem_crit_mb)
-
-        logger.info("Foundation modules initialized")
+        await _lc_startup.run_startup(self, app)
 
     async def _periodic_purge(self, days: int) -> None:
-        """Run message/event purge every 24 hours."""
-        while True:
-            await asyncio.sleep(86400)  # 24 hours
-            if self._db is None:
-                break
-            try:
-                result = await self._db.purge_old_messages(days=days)
-                logger.info(
-                    "Periodic purge: %d messages, %d events removed",
-                    result["messages"], result["events"],
-                )
-            except Exception as e:
-                logger.warning("Periodic purge failed: %s", e)
+        await _lc_purge.periodic_purge_loop(self, days)
 
     async def _media_cleanup_loop(self):
-        """Remove expired media uploads every hour."""
-        while True:
-            await asyncio.sleep(3600)
-            try:
-                await self._media_store.cleanup()
-            except Exception as e:
-                logger.warning("Media cleanup error: %s", e)
+        await _lc_purge.media_cleanup_loop(self)
 
     @staticmethod
     def _get_rss_mb() -> float:
-        """Read current process RSS from /proc/self/status (no psutil dependency)."""
-        try:
-            with open("/proc/self/status") as f:
-                for line in f:
-                    if line.startswith("VmRSS"):
-                        return int(line.split()[1]) / 1024.0  # kB -> MB
-        except Exception:
-            pass
-        return 0.0
+        return _lc_monitors.get_rss_mb()
 
     @staticmethod
     def _get_cpu_temp() -> float:
-        """Read CPU temperature from thermal zone sysfs (DQ03).
-
-        Tries thermal_zone0 first (common on QCS6490), then scans all
-        thermal zones for the highest reading.  Returns 0.0 on failure.
-        """
-        # Try thermal_zone0 first (fastest path)
-        try:
-            with open('/sys/class/thermal/thermal_zone0/temp') as f:
-                temp_mc = int(f.read().strip())
-                return temp_mc / 1000.0
-        except Exception:
-            pass
-
-        # Fallback: scan all thermal zones, return the highest
-        import glob
-        max_temp = 0.0
-        for path in glob.glob('/sys/devices/virtual/thermal/thermal_zone*/temp'):
-            try:
-                with open(path) as f:
-                    temp_mc = int(f.read().strip())
-                    t = temp_mc / 1000.0
-                    if t > max_temp:
-                        max_temp = t
-            except Exception:
-                continue
-        return max_temp
+        return _lc_monitors.get_cpu_temp()
 
     async def _memory_monitor(self) -> None:
-        """Periodic memory check every 5 minutes (A04).
-
-        - Log RSS and CPU temperature at INFO level
-        - If RSS > warn threshold: force gc.collect() and log WARNING
-        - If RSS > critical threshold after GC: gracefully restart all pipelines
-        - DQ03: Log CPU temperature warnings at 80°C and errors at 90°C
-        """
-        while True:
-            await asyncio.sleep(300)  # 5 minutes
-            rss = self._get_rss_mb()
-            if rss <= 0:
-                continue
-
-            active = len(self._active_connections)
-
-            # CPU temperature monitoring (DQ03): detect thermal throttling
-            temp_c = self._get_cpu_temp()
-
-            # FD count monitoring (DQ08): detect file descriptor exhaustion
-            try:
-                fd_count = len(os.listdir(f'/proc/{os.getpid()}/fd'))
-                fd_limit = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
-                fd_pct = (fd_count / fd_limit * 100) if fd_limit > 0 else 0
-            except Exception:
-                fd_count = fd_limit = 0
-                fd_pct = 0.0
-
-            logger.info(
-                "Memory monitor: RSS=%.0f MB, temp=%.1f°C, connections=%d, FDs=%d/%d (%.0f%%)",
-                rss, temp_c, active, fd_count, fd_limit, fd_pct,
-            )
-
-            # DQ03: Thermal warnings — monitoring only, no throttling
-            if temp_c >= 90:
-                logger.error(
-                    "Memory monitor: CPU temp %.1f°C exceeds 90°C — "
-                    "risk of eMMC degradation and component damage!",
-                    temp_c,
-                )
-            elif temp_c >= 80:
-                logger.warning(
-                    "Memory monitor: CPU temp %.1f°C exceeds 80°C — "
-                    "Gold cores likely throttled from 2.7GHz",
-                    temp_c,
-                )
-
-            if fd_pct >= 80:
-                logger.warning(
-                    "Memory monitor: FD usage at %.0f%% (%d/%d) — risk of exhaustion!",
-                    fd_pct, fd_count, fd_limit,
-                )
-
-            if rss > self._mem_warn_mb:
-                logger.warning(
-                    "Memory monitor: RSS %.0f MB exceeds warning threshold (%d MB) — forcing GC",
-                    rss, self._mem_warn_mb,
-                )
-                collected = gc.collect()
-                rss_after = self._get_rss_mb()
-                logger.warning(
-                    "Memory monitor: GC collected %d objects, RSS now %.0f MB",
-                    collected, rss_after,
-                )
-
-                if rss_after > self._mem_crit_mb:
-                    logger.error(
-                        "Memory monitor: RSS %.0f MB exceeds critical threshold (%d MB) "
-                        "after GC — restarting all pipelines",
-                        rss_after, self._mem_crit_mb,
-                    )
-                    # Gracefully restart every active pipeline
-                    for ws_id, conn in list(self._active_connections.items()):
-                        pipeline = conn.get("pipeline")
-                        if pipeline:
-                            try:
-                                await pipeline.shutdown()
-                                conn["pipeline"] = None
-                                logger.info("Memory monitor: shut down pipeline for %s", ws_id)
-                            except Exception as e:
-                                logger.warning("Memory monitor: pipeline shutdown failed for %s: %s", ws_id, e)
-
-                    # Force another GC after pipeline shutdown
-                    gc.collect()
-                    rss_final = self._get_rss_mb()
-                    logger.warning("Memory monitor: post-restart RSS %.0f MB", rss_final)
-
-                    # Re-initialize pipelines for registered connections
-                    for ws_id, conn in list(self._active_connections.items()):
-                        if conn.get("registered") and conn.get("pipeline") is None:
-                            cfg = conn.get("config", self._config)
-                            try:
-                                pipeline = VoicePipeline(
-                                    cfg,
-                                    conn.get("_on_audio"),
-                                    conn.get("_on_event"),
-                                    conversation_engine=self._conversation,
-                                    session_id=conn.get("session_id", ""),
-                                    media_pipeline=self._media_pipeline,
-                                    backend_pool=self._backend_pool,
-                                )
-                                await pipeline.initialize()
-                                conn["pipeline"] = pipeline
-                                logger.info("Memory monitor: re-initialized pipeline for %s", ws_id)
-                            except Exception as e:
-                                logger.error("Memory monitor: pipeline re-init failed for %s: %s", ws_id, e)
+        await _lc_monitors.memory_monitor_loop(self)
 
     async def _on_shutdown(self, app: web.Application) -> None:
-        """Clean up all active sessions and foundation modules on server shutdown."""
-        logger.info("Server shutting down — closing %d connections", len(self._active_connections))
-
-        # Cancel periodic tasks
-        if self._memory_monitor_task and not self._memory_monitor_task.done():
-            self._memory_monitor_task.cancel()
-            # Wave 14 W14-M09 pattern: await so we don't leak the task
-            # across loop shutdown (produces the same "Task was
-            # destroyed but it is pending" warning wave-13 H3 fixed).
-            try:
-                await self._memory_monitor_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        if self._purge_task and not self._purge_task.done():
-            self._purge_task.cancel()
-            # Wave 14 W14-M09: _periodic_purge sleeps 86400 s in one
-            # shot; cancel-without-await left it attached long enough
-            # for aiohttp to close the loop first, producing
-            # "RuntimeError: Event loop is closed" at systemctl restart.
-            try:
-                await self._purge_task
-            except (asyncio.CancelledError, Exception):
-                pass
-        # Wave 13 H3: the media cleanup loop was being left running on shutdown
-        # because it isn't touched here. If it was mid-sleep when the event loop
-        # closes, asyncio logs "Task was destroyed but it is pending" warnings
-        # and the 24h TTL cleaner can orphan partial deletes. Cancel + await.
-        if self._media_cleanup_task and not self._media_cleanup_task.done():
-            self._media_cleanup_task.cancel()
-            try:
-                await self._media_cleanup_task
-            except (asyncio.CancelledError, Exception):
-                pass
-
-        # Shut down pipelines
-        tasks = []
-        for _ws_id, conn in list(self._active_connections.items()):
-            pipeline = conn.get("pipeline")
-            if pipeline:
-                tasks.append(pipeline.shutdown())
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._active_connections.clear()
-
-        # Wave 15 W15-C01: now that no pipelines are holding references,
-        # shut down the shared backend pool.  Per-pipeline shutdowns
-        # above are no-ops for pooled backends (_pooled_* flag), so the
-        # pool is the single owner responsible for final teardown.
-        pool_tasks = []
-        for key, backend in list(self._backend_pool.items()):
-            logger.info("W15-C01: releasing pooled backend %s", key)
-            try:
-                pool_tasks.append(backend.shutdown())
-            except (AttributeError, RuntimeError) as e:
-                logger.warning("W15-C01: pool backend %s shutdown raised: %s", key, e)
-        if pool_tasks:
-            await asyncio.gather(*pool_tasks, return_exceptions=True)
-        self._backend_pool.clear()
-
-        # v4·D audit P0 fix: release the inference ThreadPoolExecutor so
-        # uvloop can exit cleanly.  Previously zombie threads lingered.
-        try:
-            from dragon_voice.pipeline import shutdown_inference_executor
-            shutdown_inference_executor(wait=False)
-            logger.info("Inference executor shut down")
-        except Exception:
-            logger.debug("inference executor shutdown failed", exc_info=True)
-
-        # Close shared proxy session (DQ08)
-        if self._proxy_session and not self._proxy_session.closed:
-            await self._proxy_session.close()
-
-        # Shut down foundation
-        if self._notes_svc:
-            await self._notes_svc.shutdown()
-        if self._media_pipeline:
-            # Wave 14 W14-H12: close the MediaPipeline's shared aiohttp
-            # ClientSession.  Prior behaviour left it dangling across
-            # systemctl restart, logging "Unclosed client session" and
-            # making the wave-13 FD counter noisy.
-            try:
-                await self._media_pipeline.close()
-            except Exception:
-                logger.debug("MediaPipeline shutdown failed", exc_info=True)
-        if self._memory_service:
-            logger.info("Shutting down memory service")
-            # Wave 14 W14-H11: close the shared Ollama HTTP session.
-            try:
-                await self._memory_service.shutdown()
-            except Exception:
-                logger.debug("MemoryService shutdown raised", exc_info=True)
-            self._memory_service = None
-        if self._conversation:
-            await self._conversation.shutdown()
-        if self._session_mgr:
-            await self._session_mgr.stop()
-        if self._db:
-            await self._db.close()
-
-        logger.info("Shutdown complete")
+        await _lc_shutdown.run_shutdown(self, app)
 
     # ------------------------------------------------------------------ HTTP
 

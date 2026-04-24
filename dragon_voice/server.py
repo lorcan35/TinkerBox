@@ -32,6 +32,7 @@ from dragon_voice.config import (
 from dragon_voice.conversation import ConversationEngine
 from dragon_voice.db import Database
 from dragon_voice.messages import MessageStore
+from dragon_voice.handlers import debug as _handlers_debug
 from dragon_voice.middleware import (
     auth as _mw_auth,
     cors as _mw_cors,
@@ -751,220 +752,33 @@ class VoiceServer:
             }
         )
 
+    # Debug / diagnostic handlers — thin adapters over the functions in
+    # ``dragon_voice/handlers/debug.py``.  The URL routing + bearer-auth
+    # middleware wiring still lives in ``create_app``; only the handler
+    # bodies moved.
+
     async def _handle_debug_mem(self, request: web.Request) -> web.Response:
-        """W15-C01 mem-diff probe.
-
-        Returns the top-N allocation groups (ranked by growth since
-        baseline) from tracemalloc.  The baseline is taken on first
-        call; subsequent calls diff against the stored baseline.  The
-        ``?reset=1`` query flag replaces the baseline with the current
-        snapshot, so we can bisect leak growth windows.
-
-        Requires ``DRAGON_TRACEMALLOC=1`` in the env — otherwise the
-        endpoint returns 503 with a hint.
-        """
-        import tracemalloc
-        import resource
-        if not tracemalloc.is_tracing():
-            return web.json_response(
-                {
-                    "error": "tracemalloc_disabled",
-                    "hint": "export DRAGON_TRACEMALLOC=1 and restart voice service",
-                },
-                status=503,
-            )
-        snap = tracemalloc.take_snapshot()
-        # Filter out tracemalloc's own frames so the output isn't
-        # dominated by bookkeeping.
-        snap = snap.filter_traces(
-            (
-                tracemalloc.Filter(False, tracemalloc.__file__),
-                tracemalloc.Filter(False, "<frozen importlib._bootstrap>"),
-                tracemalloc.Filter(False, "<frozen importlib._bootstrap_external>"),
-            )
-        )
-        reset = request.query.get("reset", "0") == "1"
-        topn = int(request.query.get("n", "25"))
-        # Current RSS (kilobytes on Linux -> bytes).
-        rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        rss_mb = rss_kb / 1024.0
-        out: dict = {
-            "rss_mb": round(rss_mb, 1),
-            "uptime_seconds": round(time.time() - self._start_time, 1),
-            "active_connections": len(self._active_connections),
-            "tracemalloc_peak_mb": round(tracemalloc.get_traced_memory()[1] / 1024 / 1024, 1),
-        }
-        # Optional ?trim=1 to force gc+malloc_trim before snapshot —
-        # tells us how much of RSS is reclaimable vs truly leaked.
-        if request.query.get("trim", "0") == "1":
-            before_rss = rss_mb
-            import ctypes
-            gc.collect()
-            try:
-                libc = ctypes.CDLL("libc.so.6")
-                libc.malloc_trim(0)
-            except (OSError, AttributeError) as e:
-                out["malloc_trim_error"] = str(e)
-            rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            rss_mb = rss_kb / 1024.0
-            out["rss_mb_after_trim"] = round(rss_mb, 1)
-            out["rss_reclaimed_mb"] = round(before_rss - rss_mb, 1)
-
-        baseline = getattr(self, "_mem_baseline", None)
-        if baseline is None or reset:
-            self._mem_baseline = snap
-            self._mem_baseline_rss_mb = rss_mb
-            out["note"] = "baseline set — call again after load to see diff"
-        else:
-            stats = snap.compare_to(baseline, "lineno")
-            out["rss_delta_mb"] = round(rss_mb - self._mem_baseline_rss_mb, 1)
-            out["top"] = [
-                {
-                    "file": f"{s.traceback[0].filename.split('/')[-1]}:{s.traceback[0].lineno}",
-                    "size_mb": round(s.size / 1024 / 1024, 3),
-                    "size_diff_mb": round(s.size_diff / 1024 / 1024, 3),
-                    "count": s.count,
-                    "count_diff": s.count_diff,
-                }
-                for s in stats[:topn]
-            ]
-
-        # gc object counts by type — catches leaks tracemalloc misses
-        # (objects that grow in count, held in long-lived caches).
-        from collections import Counter
-        type_counts = Counter(type(o).__name__ for o in gc.get_objects())
-        # Persist a baseline so we can diff count growth too.
-        base_counts = getattr(self, "_mem_type_counts", None)
-        if base_counts is None or reset:
-            self._mem_type_counts = type_counts
-            out["top_types"] = [
-                {"type": k, "count": v}
-                for k, v in type_counts.most_common(25)
-            ]
-        else:
-            diff = {k: type_counts[k] - base_counts.get(k, 0) for k in type_counts}
-            growers = sorted(diff.items(), key=lambda kv: -kv[1])[:25]
-            out["top_type_growers"] = [
-                {"type": k, "delta": d, "now": type_counts[k]}
-                for k, d in growers if d > 0
-            ]
-        return web.json_response(out)
-
+        return await _handlers_debug.handle_debug_mem(request, server=self)
 
     async def _debug_widget_chart(self, request: web.Request) -> web.Response:
-        """POST /debug/widget_chart -- audit B5 evidence. Emits a chart
-        widget on every registered Tab5Surface. Body: {title, values, chart_max}."""
-        try:
-            data = await request.json()
-        except Exception:
-            data = {}
-        title = data.get("title", "Audit chart")
-        values = data.get("values", [3, 7, 12, 9, 15, 18, 22, 16, 11, 8, 14, 20])
-        chart_max = float(data.get("chart_max", 0))
-        if self._surface_mgr is None:
-            return web.json_response({"error": "surface_mgr not ready"}, status=503)
-        count = 0
-        for sid, state in list(self._surface_mgr._sessions.items()):
-            try:
-                await state.surface.chart(title=title, values=values, chart_max=chart_max,
-                                  skill_id="audit", card_id="audit_chart_" + sid[:6])
-                count += 1
-            except Exception as e:
-                logger.warning("debug chart emit failed for %s: %s", sid, e)
-        return web.json_response({"emitted": count, "values": values})
+        return await _handlers_debug.handle_debug_widget_chart(
+            request, surface_mgr=self._surface_mgr,
+        )
 
     async def _debug_widget_prompt(self, request: web.Request) -> web.Response:
-        """POST /debug/widget_prompt -- audit B6/K3 evidence.
-        Emits a widget_prompt on every registered Tab5Surface AND
-        registers a handler so tap round-trips back to Dragon.
-        Body: {title, body, choices: [[text, event], ...]}."""
-        try:
-            data = await request.json()
-        except Exception:
-            data = {}
-        title = data.get("title", "Confirm?")
-        body = data.get("body", "")
-        choices_raw = data.get("choices", [["Yes", "audit_yes"], ["No", "audit_no"]])
-        choices = []
-        for c in choices_raw[:3]:
-            if isinstance(c, (list, tuple)) and len(c) >= 2:
-                choices.append((str(c[0]), str(c[1])))
-        if self._surface_mgr is None:
-            return web.json_response({"error": "surface_mgr not ready"}, status=503)
-        count = 0
-        for sid, state in list(self._surface_mgr._sessions.items()):
-            try:
-                card_id = f"audit_prompt_{sid[:6]}"
-                async def _handle(event: str, payload: dict, _sid=sid, _cid=card_id) -> None:
-                    logger.info("audit widget_prompt tapped: session=%s event=%s payload=%s",
-                                _sid, event, payload)
-                    # Dismiss the card so the tap has an observable effect.
-                    try:
-                        await state.surface.dismiss(_cid)
-                    except Exception:
-                        pass
-                    self._surface_mgr.unregister_action(_sid, _cid)
-                self._surface_mgr.register_action(sid, card_id, _handle)
-                await state.surface.prompt(
-                    title=title, body=body, choices=choices,
-                    skill_id="audit", card_id=card_id,
-                )
-                count += 1
-            except Exception as e:
-                logger.warning("debug prompt emit failed for %s: %s", sid, e)
-        return web.json_response({"emitted": count, "choices": choices})
+        return await _handlers_debug.handle_debug_widget_prompt(
+            request, surface_mgr=self._surface_mgr,
+        )
 
     async def _debug_widget_card(self, request: web.Request) -> web.Response:
-        """POST /debug/widget_card -- audit B2 evidence.
-        Emits a widget_card on every registered Tab5Surface. Cards go
-        to chat (not home). Body: {title, body, tone}."""
-        try:
-            data = await request.json()
-        except Exception:
-            data = {}
-        title = data.get("title", "Workshop draft ready")
-        body = data.get("body", "Two edits queued from yesterday. Review before 10:30.")
-        tone = data.get("tone", "info")
-        if self._surface_mgr is None:
-            return web.json_response({"error": "surface_mgr not ready"}, status=503)
-        count = 0
-        for sid, state in list(self._surface_mgr._sessions.items()):
-            try:
-                await state.surface.card(title=title, body=body, tone=tone,
-                                          skill_id="audit",
-                                          card_id="audit_card_" + sid[:6])
-                count += 1
-            except Exception as e:
-                logger.warning("debug card emit failed for %s: %s", sid, e)
-        return web.json_response({"emitted": count})
+        return await _handlers_debug.handle_debug_widget_card(
+            request, surface_mgr=self._surface_mgr,
+        )
 
     async def _debug_widget_media(self, request: web.Request) -> web.Response:
-        """POST /debug/widget_media -- audit B5 evidence.
-        Emits widget_media pointing at a previously uploaded image.
-        Body: {url, width, height, alt}."""
-        try:
-            data = await request.json()
-        except Exception:
-            data = {}
-        url = data.get("url", "")
-        width = int(data.get("width", 480))
-        height = int(data.get("height", 300))
-        alt = data.get("alt", "Audit media")
-        if not url:
-            return web.json_response({"error": "url required"}, status=400)
-        if self._surface_mgr is None:
-            return web.json_response({"error": "surface_mgr not ready"}, status=503)
-        count = 0
-        for sid, state in list(self._surface_mgr._sessions.items()):
-            try:
-                await state.surface.media(url=url, alt=alt,
-                                          title="Audit media",
-                                          skill_id="audit",
-                                          card_id="audit_media_" + sid[:6])
-                count += 1
-            except Exception as e:
-                logger.warning("debug media emit failed for %s: %s", sid, e)
-        return web.json_response({"emitted": count, "url": url})
+        return await _handlers_debug.handle_debug_widget_media(
+            request, surface_mgr=self._surface_mgr,
+        )
 
 
 

@@ -24,10 +24,42 @@ Companion repo: [TinkerTab](https://github.com/lorcan35/TinkerTab) (ESP32-P4 Tab
 Before writing any fix, CHECK LEARNINGS.md first. Your bug might already be documented. Every bug found, every fix, every gotcha MUST be added to LEARNINGS.md with Date/Symptom/Root Cause/Fix/Prevention.
 
 ## Workflow
-1. **Issue first** — Create a GitHub issue before starting work (`gh issue create`)
-2. **Branch** — Create a feature/fix branch from main
-3. **Commit with issue ref** — Every commit must reference an issue (`refs #N` or `closes #N`)
-4. **Push and merge** — Push to origin, merge to main
+
+### Basic flow
+1. **Issue first** — Create a GitHub issue before starting work (`gh issue create`).  Cross-stack audit items already have Wave IDs (`W14-C01`, `W15-H09`, …) — reuse them instead of opening a duplicate.
+2. **Branch** — `feat/<slug>`, `fix/<slug>`, `chore/<slug>`, `docs/<slug>`, `investigate/<slug>`.  Branch from main.
+3. **Commit** — Conventional-commit prefix (`feat:`, `fix:`, `chore:`, `docs:`, `test:`, `refactor:`) + one-line subject + `closes #N` or `refs #N`.  One logical change per commit.  One feature or refactor per PR.
+4. **Push, open PR** — Let CI run (see "CI gates" below).  Squash-merge.  Delete the branch.  Don't force-push shared branches.
+
+### PR scope discipline (the one that saves review hours)
+- **One concern per PR.**  Refactors don't contain bug fixes.  Bug fixes don't contain "while we're here" cleanups.  Doc updates don't contain behavior changes.  If you find something else that needs fixing mid-PR, open a new issue and move on.
+- **Extract before decompose.**  When splitting a large file, the first PR *moves* code to its new home with identical behavior — no restructuring of the internals.  Decomposing the internals is follow-up PRs.  This keeps each diff reviewable in minutes rather than hours.
+- **Tests move with code.**  If the thing you're extracting has tests, move them in the same commit.  If it has no tests, add at least one before the extraction lands — otherwise you're trading "untested big file" for "untested small files" and the net test coverage drops.
+- **Small is kind.**  Prefer 5 small PRs over 1 big one.  Reviewers are more generous to a 200-line diff than a 2,000-line diff, and bisecting a regression across 5 commits beats bisecting across 1.
+
+### CI gates (enforced by `.github/workflows/ci.yml`)
+- **Ruff** with a narrow gate: `F821,F722,F811,F823,B006,B904,E722,B007,RUF006`.  This is the real-bug gate — not a style gate.  Adding codes is a two-line change to `ci.yml`; prove a code catches a real bug before promoting it.
+- **Named unit tests only.**  E2E (`test_api_e2e.py`, `test_e2e_dragon.py`) run locally, not in CI.  When you add a new test file that can run without a live server, add it to the CI test list in `ci.yml`.
+- **CI uses `DRAGON_API_TOKEN=ci-bearer-token` + `TINKERCLAW_TOKEN=ci-tc-token`.**  Tests that need tokens must read them from env, not hardcoded.
+
+### Local pre-push (takes ~10 s)
+```bash
+ruff check --select F821,F722,F811,F823,B006,B904,E722,B007,RUF006 dragon_voice/ dashboard.py tests/
+pytest -q tests/test_auth_middleware.py tests/test_media_pipeline.py tests/test_session_cas.py  # or whatever your PR touches
+```
+If you touched middleware, run `test_auth_middleware` + `test_security_headers` + `test_rate_limit`.  If you touched media, run `test_media_*`.  Don't run the E2E suite unless you've booted a local server.
+
+### Anti-slop rules (applies to human and AI contributors equally)
+- **No defensive code for impossible scenarios.**  Trust internal callers.  Validate at system boundaries (HTTP request, WS frame, NVS read) — not between two functions in the same module.
+- **Delete, don't comment out.**  Git remembers.  `# TODO: remove this` is a lie; either fix it in this PR or open an issue.
+- **No comments that restate well-named code.**  Comments exist to explain *why*, or to warn about non-obvious constraints.  `# increment counter` above `counter += 1` is noise.
+- **No speculative abstractions.**  A factory class with one caller is a one-caller class pretending to be a factory.  Build it when the second caller arrives, not before.
+- **No "helpful" refactors next to the feature.**  If it's worth doing, it's worth a separate PR.  If it isn't, drop it.
+- **Name things for the reader, not the writer.**  Method names describe what the caller gets; variable names describe what the thing *is*.  `_handle_ws_voice` is a better name than `_process_incoming_voice_socket_request_with_fallback`.
+- **LEARNINGS.md is not optional.**  Every bug fix with a non-obvious root cause adds an entry with Date / Symptom / Root Cause / Fix / Prevention.  Skip it only if the fix is genuinely one-line and self-explaining.
+
+### File-split smell test (for refactoring PRs like the `server.py` decomposition)
+A file is too big when it has more than one *reason to change*.  Before extracting, answer: "what stakeholder cares about the code I'm moving?"  If it's the same stakeholder as the rest of the file, don't extract yet.  Good candidates: middleware (ops/security), debug endpoints (dev/diagnostics), lifecycle (ops/reliability), business endpoints (product).
 
 ## Dragon Access
 - **Host:** 192.168.1.91 (static IP on LAN)

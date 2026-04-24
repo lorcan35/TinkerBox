@@ -34,7 +34,7 @@ Before writing any fix, CHECK LEARNINGS.md first. Your bug might already be docu
 - **User:** radxa
 - **Password:** `<DRAGON_SSH_PASSWORD>`
 - **SSH:** `ssh radxa@192.168.1.91  # password in ~/.ssh/config or use key auth`
-- **OS:** Debian (Radxa Zero 3W, ARM64)
+- **OS:** Ubuntu (Dragon Q6A — Qualcomm QCS6490, ARM64)
 - **Connection:** Ethernet only (WiFi disabled). Static IP on enp1s0.
 - **Services stripped:** gdm3, snapd, ollama, nanobot masked. Only tinkerclaw-voice, tinkerclaw-dashboard, tinkerclaw-ngrok run.
 
@@ -163,12 +163,12 @@ The web dashboard is an 11-tab single-page application served by `dashboard.py` 
 
 | Model | tok/s | Tool Calling | RAM |
 |-------|-------|-------------|-----|
-| qwen3:0.6b | 11.8 | Untested | 0.5GB |
-| qwen3:1.7b | 7.1 | Good (current default) | 1.4GB |
+| qwen3:0.6b | 11.8 | Acceptable (current default) | 0.5GB |
+| qwen3:1.7b | 7.1 | Good (was default in early March; switched to 0.6b in Wave 15-OPS — 1.7b never installed cleanly, ollama pull would hang for 30 s) | 1.4GB |
 | qwen3:4b | 3.0 | Excellent (97.5%) | 2.5GB |
 | gemma3:4b | 3.4 | OK format, bad answers | 3.3GB |
 
-**Current default:** `qwen3:1.7b` — best balance of speed and tool-calling accuracy for the Dragon's ARM64 CPU. Tool calling quality tested across 12 scenarios (web search, memory store/recall, datetime, multi-tool chains).
+**Current default:** `qwen3:0.6b` — verified in `dragon_voice/config.yaml` (`ollama_model: "qwen3:0.6b"`).  Picked over the bigger 1.7b/4b models because the larger ones either failed to install on this Dragon (1.7b ollama-pull hang) or are too slow for interactive voice (4b at 3 tok/s).  Tool-calling accuracy at 0.6b is workable for short prompts; long agentic chains usually go to mode 2 (Cloud) or mode 3 (TinkerClaw Gateway).
 
 ## Current Sprint: Complete (April 2026)
 
@@ -192,7 +192,7 @@ The web dashboard is an 11-tab single-page application served by `dashboard.py` 
 | — | Settings crash fix (WDT) | DONE (f_getfree cached at boot, esp_task_wdt_reset fed between settings sections) |
 | — | Tolerant tool parser | DONE (handles stray `>`, missing `</args>`, small model XML quirks) |
 | — | Response timeout (local mode) | DONE (disabled/5 min for local mode, 35s for cloud mode) |
-| — | Default local LLM | DONE (qwen3:1.7b set as default, 7.1 tok/s, good tool calling) |
+| — | Default local LLM | DONE (qwen3:0.6b, 11.8 tok/s) — switched from earlier 1.7b plan in Wave 15-OPS after 1.7b ollama-pull hung on Dragon |
 | — | Rich Media Chat | DONE (MediaPipeline renders code/tables/images as JPEG, MediaStore with 24h cleanup, camera uploads, 44 tests) |
 
 ### Architecture Decisions (from scaffolding research)

@@ -193,14 +193,56 @@ The web dashboard is an 11-tab single-page application served by `dashboard.py` 
 
 ## Local LLM Benchmarks (Dragon Q6A, ARM64 CPU via Ollama)
 
-| Model | tok/s | Tool Calling | RAM |
-|-------|-------|-------------|-----|
-| qwen3:0.6b | 11.8 | Acceptable (current default) | 0.5GB |
-| qwen3:1.7b | 7.1 | Good (was default in early March; switched to 0.6b in Wave 15-OPS — 1.7b never installed cleanly, ollama pull would hang for 30 s) | 1.4GB |
-| qwen3:4b | 3.0 | Excellent (97.5%) | 2.5GB |
-| gemma3:4b | 3.4 | OK format, bad answers | 3.3GB |
+**Re-benchmarked 2026-04-24** (TinkerTab audit gauntlet).  The old 4-row table
+was kept from early March and had two stale claims: it said `qwen3:1.7b` "never
+installed cleanly, ollama pull would hang" (it's installed and responsive
+today) and didn't mention Dragon's ~30 s WS keepalive as the hard ceiling that
+eliminates every 4B-class model.  11 models were tested against the same 5
+tool-forcing prompts (see `docs/AUDIT.md` for the gauntlet table and raw
+Dragon log lines); this table is the summary.
 
-**Current default:** `qwen3:0.6b` — verified in `dragon_voice/config.yaml` (`ollama_model: "qwen3:0.6b"`).  Picked over the bigger 1.7b/4b models because the larger ones either failed to install on this Dragon (1.7b ollama-pull hang) or are too slow for interactive voice (4b at 3 tok/s).  Tool-calling accuracy at 0.6b is workable for short prompts; long agentic chains usually go to mode 2 (Cloud) or mode 3 (TinkerClaw Gateway).
+| Model | Size | Median latency (gauntlet) | Tool fires | Mem-DB writes | Verdict |
+|-------|------|---------------------------|------------|---------------|---------|
+| **ministral-3:3b** ⭐ | 2.8 GB | 67 s | **3/5** | **1/5** | **Current default.** Only model that (a) fit in keepalive, (b) did the math right (456×789 = 359,784 — others hallucinated), (c) memstore without leaking past-session "amber" context. |
+| gemma3:4b | 3.1 GB | 60 s | 3/5 | 1/5 | Also fires tools cleanly, but produces empty user-visible replies on 4/5 prompts.  CLAUDE.md previously wrote it off as "OK format, bad answers" — the format is actually fine; the text-response path is the broken part. |
+| qwen2.5:3b (HF) | ~2 GB | 62 s | 1/5 | 1/5 | Fluent, occasionally honest ("I can't set timers directly"), but arithmetic wrong (356,184) and leaks `[datetime]` templates. |
+| llama3.2:3b | 1.9 GB | 44 s | 0/5 | 0 | Fast and verbose but never uses a tool.  Hallucinates with confidence: wrong math (359,964), fake timer acks, leaked "amber" favorite color from a prior session. |
+| hermes3:3b (HF) | 2.0 GB | 52 s | 0/5 | 0 | Same class as llama3.2 — talks well, tools zero. Math wrong (356,664). |
+| phi4-mini:latest | 2.3 GB | 93 s | 0/5 | 0 | Slow AND hallucinates. Says "nine-ninthths and eleven-sixteenths" then still lands on 122 °F; fakes timer notifications. |
+| qwen3:1.7b | 1.4 GB | 36 s | 0/5 | 0 | Hallucinated current time (said "3:45 PM Sunday", actual was Fri 4:01 PM UTC). Prior audit saw occasional fires on simpler prompts; gauntlet was harder. |
+| qwen3:0.6b (old default) | 0.5 GB | 18 s | 1/5 | 0 | Fastest by far, but emits malformed XML (`<tool>datetime</` leak) and goes silent on most tool prompts.  OK only when no tool is needed. |
+| qwen3:4b | 2.5 GB | 95 s 💀 | 0/5 | 0 | **Too slow.** Keepalive expires, Tab5 reconnects, P13 evicts the in-flight stream. Response generated, dropped on floor. |
+| qwen3.5:4b | 3.2 GB | 95 s 💀 | 0/5 | 0 | Same speed problem. |
+| nemotron-3-nano:4b | 2.6 GB | 95 s 💀 | 0/5 | 0 | Same speed problem. |
+
+Median-latency figures are per-prompt wall-clock with 120 s cap; "95 s 💀"
+means every prompt hit the cap and never completed within keepalive.
+
+**Three failure classes observed:**
+1. **Too small to tool-call** — qwen3 0.6b/1.7b emit malformed XML or give up.
+2. **Too slow for keepalive** — 4B-class models can't respond within Tab5's
+   ~30 s WS PONG window; reconnect triggers P13 eviction and drops the reply.
+3. **Fluent hallucinators** — llama3.2:3b / hermes3:3b / phi4-mini write
+   confident chatty answers that never actually invoke a tool.  Dangerous
+   because replies look right at a glance (wrong math, fake timers, recalled
+   "memories" that were never stored).
+
+**Current default:** `ministral-3:3b` — set in `dragon_voice/config.yaml`
+(`ollama_model: "ministral-3:3b"`).  ~3/5 tool-calling reliability on the
+gauntlet (best of the 11), fits the keepalive ceiling, and is the only model
+whose mem-DB writes match its user-visible acknowledgements.  Known gaps: G1
+`datetime` still fails (the tool almost never fires), and G5 `timesense`
+widget emission works on zero of the tested models — that's a system-prompt /
+tool-format issue upstream of model choice, not a model limit.  See
+`docs/AUDIT.md` for the full audit matrix and follow-up issue list.
+
+**When to use what:**
+- Short-prompt non-tool turns → stays on `ministral-3:3b`.
+- Agentic chains where reliability matters → mode 2 (Cloud, OpenRouter model
+  picked per `llm_model`) or mode 3 (TinkerClaw Gateway).
+- Voice latency-critical turns → the NPU Genie path (docs/npu-setup.md) is
+  still the real escape hatch; until it lands, Local mode is inherently
+  second-best on accuracy and third-best on speed behind mode 2/3.
 
 ## Current Sprint: Complete (April 2026)
 
@@ -224,7 +266,7 @@ The web dashboard is an 11-tab single-page application served by `dashboard.py` 
 | — | Settings crash fix (WDT) | DONE (f_getfree cached at boot, esp_task_wdt_reset fed between settings sections) |
 | — | Tolerant tool parser | DONE (handles stray `>`, missing `</args>`, small model XML quirks) |
 | — | Response timeout (local mode) | DONE (disabled/5 min for local mode, 35s for cloud mode) |
-| — | Default local LLM | DONE (qwen3:0.6b, 11.8 tok/s) — switched from earlier 1.7b plan in Wave 15-OPS after 1.7b ollama-pull hung on Dragon |
+| — | Default local LLM | DONE (ministral-3:3b, ~67 s median gauntlet latency) — switched from qwen3:0.6b on 2026-04-24 after the 11-model re-benchmark (see Local LLM Benchmarks section).  0.6b was fast but silent on tool prompts; 1.7b/4b either never fired tools or were too slow for Tab5's WS keepalive. |
 | — | Rich Media Chat | DONE (MediaPipeline renders code/tables/images as JPEG, MediaStore with 24h cleanup, camera uploads, 44 tests) |
 
 ### Architecture Decisions (from scaffolding research)

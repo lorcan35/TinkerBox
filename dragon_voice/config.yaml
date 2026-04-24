@@ -35,7 +35,16 @@ llm:
   backend: "ollama"  # ollama, openrouter, lmstudio, npu_genie, tinkerclaw
   # ollama
   ollama_url: "http://localhost:11434"
-  ollama_model: "qwen3:0.6b"
+  # Default local LLM for voice_mode=0 (Local) and the LLM side of mode 1 (Hybrid).
+  # Selected 2026-04-24 from the 11-model gauntlet audit: ministral-3:3b was the
+  # only tested model that (a) fit inside Tab5's ~30 s WS keepalive ceiling, (b)
+  # fired the calculator tool with the correct answer on a non-memorized number
+  # (456*789=359,784), (c) cleanly stored a fact to the memory DB without leaking
+  # prior-session context, and (d) produced a user-visible reply on 4/5 prompts.
+  # See CLAUDE.md "Local LLM Benchmarks" + LEARNINGS.md 2026-04-24 entry for
+  # the full gauntlet table, the three failure classes (too-small / too-slow /
+  # fluent-hallucinator) we ruled out, and the re-benchmark methodology.
+  ollama_model: "ministral-3:3b"
   # openrouter
   openrouter_api_key: ""  # reads from OPENROUTER_API_KEY env var if empty
   openrouter_model: "anthropic/claude-3.5-haiku"

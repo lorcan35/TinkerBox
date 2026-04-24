@@ -445,3 +445,75 @@ infra / CI / deploy, `DOC` = documentation drift.
 
 Raw agent outputs retained at `/tmp/audit_wave14_{dragon_sec,fw_quality,py_quality,docs,ops}.md`
 for context beyond the summaries above.
+
+---
+
+# Local-mode model gauntlet (2026-04-24)
+
+Driven from the TinkerTab side as part of the TinkerClaw + Local mode stress
+audit.  Goal: re-benchmark every sub-4B Ollama model installed on Dragon (plus
+two HF-pulled tool-calling candidates) against the same 5 tool-forcing
+prompts, crossed against the memory DB to distinguish real tool fires from
+verbal acknowledgements.
+
+## Methodology
+
+**Driver:** `/tmp/gauntlet.sh` (bash helper kept in audit-artifacts drive).
+For each model: `sed` swap of `dragon_voice/config.yaml` `ollama_model`,
+`systemctl restart tinkerclaw-voice`, then 5 prompts via Tab5's `/chat` HTTP
+endpoint (not on-screen keyboard — the tool-call path is Dragon-side so input
+method doesn't change the outcome, but this way the gauntlet ran across 11
+models in ~45 min wall-clock).
+
+**Prompts (all 5 independent, clear-started between):**
+1. G1 — `What time is it right now` (expects `datetime` tool)
+2. G2 — `What is four hundred fifty six times seven hundred eighty nine` (expects `calculator`; actual answer **359,784** — deliberately not a memorized number)
+3. G3 — `Remember my favorite color is magenta` (expects `store_fact`; verified via `GET /api/v1/memory`)
+4. G4 — `Convert fifty celsius to fahrenheit` (expects `unit_converter`; correct = 122 °F)
+5. G5 — `Set a timer for ten seconds` (expects `timesense` tool → `widget_live` on Tab5 home)
+
+**Scoring:**
+- Tool fires = `tools=N` log lines with N ≥ 1 from `dragon_voice.conversation` during the window.
+- Mem-DB writes = new rows in `facts` whose `content` mentions "magenta" during the window.
+- Median latency = middle value of the 5 per-prompt wall-clocks (capped at 120 s).
+
+## Results
+
+| Model | Size | Median latency | Tool fires | Mem-DB | Notes |
+|-------|------|----------------|------------|--------|-------|
+| **ministral-3:3b** ⭐ | 2.8 GB | 67 s | **3/5** | **1/5** | Correct math (359,784), clean memstore (no amber leak), correct units.  **← NEW DEFAULT** |
+| gemma3:4b | 3.1 GB | 60 s | 3/5 | 1/5 | Fires tools fine, but empty text replies on 4/5 prompts. Prior "bad answers" note was misleading — text path is the broken part. |
+| qwen2.5:3b (HF pull) | ~2 GB | 62 s | 1/5 | 1/5 | One real tool fire (memstore). Math wrong (356,184).  Leaked `[datetime]` template. Honest refusal on timer. |
+| llama3.2:3b | 1.9 GB | 44 s | 0/5 | 0 | Verbose fluent hallucinator. Math wrong (359,964). Leaked "amber" from a prior session. Fake timer ack. |
+| hermes3:3b (HF pull) | 2.0 GB | 52 s | 0/5 | 0 | Same class as llama3.2. Math 356,664. |
+| phi4-mini:latest | 2.3 GB | 93 s | 0/5 | 0 | Slow AND garbled ("nine-ninthths"). Fake timer notifications. |
+| qwen3:1.7b | 1.4 GB | 36 s | 0/5 | 0 | Hallucinated current time (said "3:45 PM Sunday", actual Fri 4:01 PM UTC). |
+| qwen3:0.6b (old default) | 0.5 GB | 18 s | 1/5 | 0 | Fastest. Emits malformed XML (`<tool>datetime</` leak). Silent on most tool prompts. OK only when no tool is needed. |
+| qwen3:4b | 2.5 GB | 95 s 💀 | 0/5 | 0 | P13 eviction race; Tab5 reconnects, in-flight stream dropped. |
+| qwen3.5:4b | 3.2 GB | 95 s 💀 | 0/5 | 0 | Same speed-ceiling failure. |
+| nemotron-3-nano:4b | 2.6 GB | 95 s 💀 | 0/5 | 0 | Same speed-ceiling failure. |
+
+## Three failure classes observed
+
+1. **Too small to tool-call** (qwen3:0.6b, qwen3:1.7b) — malformed XML or give up silently.
+2. **Too slow for keepalive** (every 4B-class model) — Tab5's ~30 s WS PONG window is a hard wall; P13 guard evicts the reconnecting Tab5 and drops the in-flight reply.
+3. **Fluent hallucinators** (llama3.2:3b, hermes3:3b, phi4-mini) — confident chatty answers that never invoke a tool. **Most dangerous class** — silent-fail models are obviously broken; hallucinators feel reliable until you verify the numbers.
+
+## Resolution
+
+- Default swapped to **ministral-3:3b** (2026-04-24, W15-OPS-2 in `WAVE-15-PROGRESS.md`).
+- CLAUDE.md "Local LLM Benchmarks" section rewritten with all 11 rows.
+- LEARNINGS.md entry **#78** documents the keepalive-ceiling insight and the prevention rules (non-memorized test inputs, cross-check against memory DB, screen for the three failure classes).
+- Known gap: G5 `timesense` / `widget_live` emission works on zero of the tested models.  That's a system-prompt / tool-format issue upstream of model choice — filed as follow-up, not a local-model problem.
+- Known gap: G1 `datetime` works on ministral-3 sometimes, fails silently other times. Current 3/5 fire-rate ceiling is upstream of this recommendation; further improvement requires either (a) switching tool format out of XML for local models, or (b) trying purpose-built function-calling models (see "Not yet tested" below).
+
+## Not yet tested (parked for follow-up)
+
+- `xlam:1b` — Salesforce function-calling specialist.  Not in Ollama library; would need manual GGUF conversion from HF.
+- `functionary-small-v3.2` (3.1 B) — tool-calling fine-tune, HF-only.
+- `gorilla-openfunctions-v2-3B` — Gorilla's latest small, HF-only.
+- `granite3.1-dense:2b` — IBM's small; in Ollama but wasn't prioritized after ministral-3 won.
+
+None of these is needed now that ministral-3 is working.  They're the natural
+next candidates if we want to push tool reliability above the current ~3/5
+fire rate without resorting to Cloud or TinkerClaw modes.

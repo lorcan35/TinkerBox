@@ -296,7 +296,7 @@ tts:
 llm:
   backend: "openrouter"         # ollama, openrouter, lmstudio, npu_genie
   ollama_url: "http://localhost:11434"
-  ollama_model: "llama3.2:latest"
+  ollama_model: "ministral-3:3b"  # see CLAUDE.md "Local LLM Benchmarks" for model choice
   openrouter_api_key: ""        # reads from OPENROUTER_API_KEY env var if empty
   openrouter_model: "anthropic/claude-3.5-haiku"
   openrouter_url: "https://openrouter.ai/api/v1"
@@ -359,7 +359,7 @@ environment variables.
 # Swap to a different LLM backend at runtime
 curl -X POST http://dragon:3502/api/config \
   -H "Content-Type: application/json" \
-  -d '{"llm": {"backend": "ollama", "ollama_model": "gemma3:4b"}}'
+  -d '{"llm": {"backend": "ollama", "ollama_model": "ministral-3:3b"}}'
 
 # Response includes the number of active pipelines that were reloaded
 # {"status": "ok", "message": "Config updated, 1 pipelines reloaded", ...}

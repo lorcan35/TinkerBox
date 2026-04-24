@@ -9,6 +9,7 @@ audio and streams text.
 import asyncio
 import json
 import logging
+import re
 from typing import AsyncIterator, Optional
 
 import aiohttp
@@ -25,6 +26,62 @@ logger = logging.getLogger(__name__)
 _SSE_MAX_LINE_BYTES = 256 * 1024          # 256 KiB — one SSE "data: ..." frame
 _SSE_MAX_STREAM_BYTES = 16 * 1024 * 1024  # 16 MiB — whole response total
 _SSE_MAX_TOKENS = 50_000                  # ~200 KB of text, generous
+
+# #B1 (TinkerTab audit 2026-04-24): chain-of-thought / tool-loop preamble
+# that TinkerClaw agents routinely leak into the user-facing reply when a
+# tool fails ("That didn't work well. Let me try another approach:…Let me
+# try a simpler web search:…").  These phrases are the agent's internal
+# reasoning between tool calls — on a successful turn they're usually
+# followed by a real final answer, but when tools fail outright they ARE
+# the whole response and land in the chat bubble as if they were the
+# answer.  See `sanitize_tinkerclaw_reply` below.
+_COT_PREAMBLE_PATTERNS = [
+    # "That didn't work (well)."
+    re.compile(r"^(that\s+(?:didn't|did\s+not)\s+work(?:\s+well)?[\.!]?\s*)", re.IGNORECASE),
+    # "Let me try another approach/way/search/path:"
+    re.compile(r"^(let\s+me\s+try\s+(?:another|a\s+(?:simpler|different))\s+(?:approach|way|search|path)[:\.,]?\s*)", re.IGNORECASE),
+    # "Let me try/check/look/search/fetch/see …<60 chars>…:"
+    re.compile(r"^(let\s+me\s+(?:try|check|look|search|fetch|see)[^.\n]{0,80}[:\.]\s*)", re.IGNORECASE),
+    # "Browser/Search/Fetch (is/'s) (currently)? down/failing/not working[ …]."
+    re.compile(
+        r"^((?:browser|search|web\s+search|fetch)(?:'s|\s+is)?\s*(?:currently\s+)?"
+        r"(?:down|failing|not\s+working|unavailable|timing\s+out)[^.\n]*[\.!]?\s*)",
+        re.IGNORECASE,
+    ),
+    # "Browser's down but I can …:"   <-- leading into CoT fallback
+    re.compile(
+        r"^((?:browser|search|fetch)(?:'s|\s+is)?\s+(?:down|failing)\s+but\s+i\s+can[^.\n]{0,80}[:\.]\s*)",
+        re.IGNORECASE,
+    ),
+    # "Hmm/OK/Okay/Right/Alright, …"
+    re.compile(r"^((?:hmm|ok|okay|right|alright|well)[,.]?\s+)", re.IGNORECASE),
+]
+
+
+def sanitize_tinkerclaw_reply(text: str) -> str:
+    """Strip leading chain-of-thought / tool-loop preamble from a TC reply.
+
+    Runs once on the full accumulated response.  Repeatedly peels known
+    "Let me try / That didn't work / Browser's down" preamble sentences
+    off the front until none match.  If NOTHING remains after peeling —
+    meaning the whole response was agent self-talk with no final answer
+    — returns a generic "couldn't complete that" message so the user
+    doesn't see raw reasoning in the chat bubble.
+    """
+    if not text:
+        return text
+    work = text.lstrip()
+    # Bound the stripping loop so a pathological pattern match can't
+    # spin forever.
+    for _ in range(20):
+        before = work
+        for pat in _COT_PREAMBLE_PATTERNS:
+            work = pat.sub("", work, count=1).lstrip()
+        if work == before:
+            break
+    if not work.strip():
+        return "I couldn't complete that — a tool I needed came back empty. Want to try a different way?"
+    return work
 
 
 class TinkerClawBackend(LLMBackend):
@@ -150,6 +207,15 @@ class TinkerClawBackend(LLMBackend):
                 token_count = 0
                 total_bytes = 0  # W14-M07: running total of SSE body bytes
                 consecutive_errors = 0  # P11: detect HTML error pages from proxy
+                # #B1 TinkerTab audit 2026-04-24: buffer the whole response
+                # so we can post-process chain-of-thought leakage before
+                # emitting it to the voice pipeline.  We lose token-level
+                # streaming for TC mode, but gain the ability to strip the
+                # "Let me try another approach:" preamble that TC agents
+                # emit when tools fail mid-loop.  For well-behaved replies
+                # this is a near no-op (sanitize is idempotent on clean
+                # text).  See sanitize_tinkerclaw_reply above.
+                accumulated: list[str] = []
 
                 # W14-M07: use readline with explicit byte cap so one
                 # pathologically long SSE frame can't blow memory.
@@ -209,9 +275,17 @@ class TinkerClawBackend(LLMBackend):
                                 "M07: SSE token count exceeded %d — aborting",
                                 _SSE_MAX_TOKENS,
                             )
+                            # Flush whatever we buffered so the user sees
+                            # *something* before the abort notice.
+                            if accumulated:
+                                yield sanitize_tinkerclaw_reply("".join(accumulated))
+                                accumulated.clear()
                             yield " ... (response aborted: too many tokens)"
                             return
-                        yield token
+                        # #B1: buffer instead of yielding directly so we can
+                        # strip the "Let me try another approach:" preamble
+                        # once the full reply is in hand.
+                        accumulated.append(token)
 
                 # A07: Truncation detection — stream ended without [DONE]
                 if not saw_done:
@@ -221,6 +295,9 @@ class TinkerClawBackend(LLMBackend):
                             "— response may be truncated (TinkerClaw crash?)",
                             token_count,
                         )
+                        if accumulated:
+                            yield sanitize_tinkerclaw_reply("".join(accumulated))
+                            accumulated.clear()
                         yield " ... (response interrupted)"
                     else:
                         logger.warning(
@@ -228,6 +305,11 @@ class TinkerClawBackend(LLMBackend):
                             "— connection may have dropped before any response"
                         )
                         yield "I'm having trouble connecting to my agent system. Please try again in a moment."
+                else:
+                    # #B1 happy path: clean and yield the full reply.
+                    if accumulated:
+                        yield sanitize_tinkerclaw_reply("".join(accumulated))
+                        accumulated.clear()
 
         except asyncio.TimeoutError:
             logger.error("TinkerClaw SSE stream timed out (sock_read=90s)")

@@ -95,12 +95,14 @@ class QuickPollTool(Tool):
 
 ## 3. Registration
 
-Add one line to `server.py` `_on_startup` after `SurfaceManager` is instantiated:
+Add one line to `dragon_voice/lifecycle/startup.py`'s `run_startup`, in the block that registers widget-emitting tools *after* `SurfaceManager` is instantiated (look for the `TimesenseTool` / `QuickPollTool` registration):
 
 ```python
 from dragon_voice.tools.quick_poll_tool import QuickPollTool
-self._tool_registry.register(QuickPollTool(self._surface_mgr))
+server._tool_registry.register(QuickPollTool(server._surface_mgr))
 ```
+
+(Before the #65 refactor this lived in `server.py`'s `_on_startup` — same code, same order, just moved to its own module.)
 
 Verify it's live:
 

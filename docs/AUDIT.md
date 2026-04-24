@@ -517,3 +517,106 @@ models in ~45 min wall-clock).
 None of these is needed now that ministral-3 is working.  They're the natural
 next candidates if we want to push tool reliability above the current ~3/5
 fire rate without resorting to Cloud or TinkerClaw modes.
+
+---
+
+# Local-mode gauntlet Round 2 + 3 (2026-04-24, later same day)
+
+Round 1 (above) left the hypothesis that the ceiling was model choice.
+Rounds 2 and 3 pulled the top HuggingFace function-calling fine-tunes
+and some bonus candidates to test it.  Key finding: **the ceiling was
+the parser, not the model**.
+
+## Round 2 — FC-trained models from the HuggingFace function-calling tag
+
+Pulled via `ollama pull hf.co/<repo>:Q4_K_M`.  Same 5-prompt gauntlet as Round 1.
+
+### Raw results (old parser — `<tool>NAME</tool><args>{json}</args>` only)
+
+| Model | Size | Tool fires (old parser) | Notes |
+|-------|------|------------------------|-------|
+| Salesforce/xLAM-2-1b-fc-r-gguf | 1.3 GB | 2/5 | Emits `[tool>NAME</tool><args>{json}</args>` — stray brackets on the opening tag defeat the strict-`<tool>` regex.  Correct JSON content. |
+| NovachronoAI/LFM2.5-1.2B-Nova-Function-Calling-GGUF | 730 MB | 0/5 | Emits `<tool_call>{"name": "X", "arguments": {...}}</tool_call>` — the industry-standard dialect.  Zero chance of matching the legacy parser. |
+
+### Parser patch (committed on `feat/tool-call-standard-parser`)
+
+1. Open-tag regex widened from `<tool>` to `[<\[]tool[>\]]` — accepts
+   `<tool>`, `[tool>`, `<tool]`, and `[tool]`.  Closing `</tool>` is
+   always intact so no ambiguity.
+2. New anchor pass for the standard dialect
+   `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`.
+   Whitespace / newlines between the tag and the JSON tolerated.
+3. 11 unit tests cover both dialects + all four bracket quirks + mixed
+   chains + malformed input rejection.
+
+### Raw results (new parser)
+
+| Model | Tool fires (new parser) | Delta |
+|-------|-------------------------|-------|
+| Salesforce/xLAM-2-1b-fc-r-gguf | **4/5** | +2 |
+| NovachronoAI/LFM2.5-1.2B-Nova-FC | 0/5 | unchanged — emits a *third* dialect (`<tool_X>{json}</tool_X>`, name-in-tag) that this PR intentionally does not support |
+| ministral-3:3b (baseline) | 2/5 | unchanged (backward-compat, same as pre-patch) |
+
+### Why xLAM isn't the new default despite firing more tools
+
+xLAM is a **tool-caller with no conversational head** — after the tool
+executes, the model has nothing to say back to the user.  `last_llm_text`
+is empty on 5/5 gauntlet turns, which means Tab5's chat bubble is blank
+even when the tool correctly fired and stored a fact.  In voice UX,
+"user sees nothing in their chat bubble" is a worse experience than
+"user sees a wordy ack for a tool that sometimes didn't fire."
+
+ministral-3:3b fires fewer tools but always produces a natural
+conversational wrap (`"Got it, magenta's your jam! Ready to help with
+anything else?"`).  Keeping ministral-3 as the default.
+
+xLAM becomes valuable in a **dual-model pipeline**: xLAM picks the tool,
+a second small model (ministral / cloud) wraps the result in natural
+language.  This PR unblocks that architecture without locking it in.
+
+## Round 3 — HuggingFaceTB + LiquidAI + prism-ml candidates
+
+Follow-up pull list from HF browse:
+
+| Model | Classification | Tested? | Result |
+|-------|----------------|---------|--------|
+| HuggingFaceTB/SmolLM3-3B | Text LLM, FC-trained | ✅ via `ggml-org/SmolLM3-3B-GGUF:Q4_K_M` | 0/5 tool fires, 65-95 s latency, verbose `<think></think>` reasoning-mode tokens burn capacity with nothing inside the think block.  `/no_think` via system prompt might help but wasn't wired in this round. |
+| HuggingFaceTB/SmolLM3-3B | (same, unsloth quant) | ✅ via `unsloth/SmolLM3-3B-GGUF:Q4_K_M` | 2/5 tool fires (partial data — Dragon lost network mid-run before we could cross-reference logs), math answer wrong (357,924 vs actual 359,784), hallucinated current time as "10:00 PM on April 24, 2024" — a year off. |
+| prism-ml/Bonsai-1.7B-gguf | Qwen3-1.7B fine-tune, Q1_0 (1-bit) quant | ✅ — pulled (248 MB) | **Every prompt: Ollama error 500.** The 1-bit quant format isn't supported by this Ollama build.  Research-grade artifact, not production-viable. |
+| LiquidAI/LFM2.5-VL-450M | VLM (vision-language) with text-only FC | ✅ attempted pull | `:Q4_K_M` tag not published; `:latest` downloaded but manifest errored 400 — VLM projector/encoder not Ollama-compatible.  Ollama supports LLava-family VLMs only. |
+| HuggingFaceTB/SmolVLM-256M-Instruct | Image-only VLM, no text-only mode, no FC | ❌ skipped | Model card explicitly requires image input in every message.  No text-only path to exercise. |
+
+## Running leaderboard (after all three rounds)
+
+Tool fires shown as [old parser / new parser] where retested.
+
+| Model | Size | Tool fires | Mem-DB | User reply | Median latency | Recommendation |
+|-------|------|------------|--------|------------|----------------|----------------|
+| **ministral-3:3b** ⭐ | 2.8 GB | 2/5 / 2/5 | 1/5 | natural, warm | 67 s | **Current Local default.** Conversational reply quality wins the UX vote even when tool hit rate is lower. |
+| Salesforce/xLAM-2-1b-fc-r | 1.3 GB | 2/5 / 4/5 ⬆ | 1/5 | empty bubbles | 20 s | Great for a tool-selection head in a dual-model pipeline.  Bad as a standalone default because users see empty replies. |
+| gemma3:4b | 3.1 GB | 3/5 / (not retested) | 1/5 | empty on 4/5 | 60 s | Fires tools but text path is broken. |
+| qwen2.5:3b | 2.0 GB | 1/5 / (not retested) | 1/5 | fluent, math wrong | 62 s | Honest refusal on timer (only model that doesn't fake timers). |
+| llama3.2:3b | 1.9 GB | 0/5 | 0 | fluent hallucinator | 44 s | Wrong math, fake timer acks, leaked prior-session facts. |
+| unsloth/SmolLM3-3B | 1.9 GB | 2/5 | (unknown — Dragon dropped) | chatty w/ `<think>` | ~90 s | Wrong math (357,924), year-off time.  Reasoning-mode tokens waste context. |
+| ggml-org/SmolLM3-3B | 1.9 GB | 0/5 | 0 | `<think></think>` empty + honest refusals | 65-95 s | Same architecture different quant; similar behavior, 0/5 fires in this run. |
+| hermes3:3b | 2.0 GB | 0/5 | 0 | fluent hallucinator | 52 s | Math 356,664 (wrong). |
+| phi4-mini:latest | 2.5 GB | 0/5 | 0 | garbled ("nine-ninthths") | 93 s | Slow AND nonsense. |
+| qwen3:1.7b | 1.4 GB | 0/5 | 0 | hallucinated time wrong day | 36 s | "3:45 PM Sunday" on a Friday. |
+| qwen3:0.6b | 0.5 GB | 1/5 | 0 | raw XML leaks | 18 s | Fastest; OK only when no tool is needed. |
+| qwen3:4b / qwen3.5:4b / nemotron-3-nano:4b | 2.5-3.2 GB | 0/5 | 0 | 💀 empty (P13 eviction) | 95 s+ | Architecturally dead in Local mode — too slow for Tab5 WS keepalive. |
+| LFM2.5-1.2B-Nova-FC | 730 MB | 0/5 | 0 | chatty | 31 s | Emits third-dialect `<tool_X>{...}</tool_X>` shape the parser does not support. |
+| prism-ml/Bonsai-1.7B | 248 MB | error 500 | — | — | — | 1-bit Q1_0 quant not supported by current Ollama build. |
+| LiquidAI/LFM2.5-VL-450M | 102 MB | manifest 400 | — | — | — | VLM; Ollama manifest layer doesn't accept non-Llava VLMs. |
+| HuggingFaceTB/SmolVLM-256M | — | skipped | — | — | — | Image-only, no text mode to test. |
+
+## What's actually blocking Local-mode from being great
+
+After three rounds, the pattern is clear and it's NOT "we haven't found the right model":
+
+1. **Dragon's ~30 s WS keepalive** kills every 4B-class model regardless of accuracy.  Fix is either a keepalive bump on Tab5 or P13-eviction grace-period on Dragon.
+2. **Small models that are trained for function-calling** don't also generate a conversational wrap.  Fix is a dual-model pipeline (tool-caller + responder) or a conversation-engine change that generates natural-language wrap from tool results.
+3. **Tool-call dialect fragmentation** was partially addressed by PR #74 (legacy + standard dialects).  Third-dialect models (`<tool_X>...`) remain unsupported on purpose — supporting them requires either name-collision disambiguation or a Jinja template per model that coerces the output.
+
+Model choice alone will never get tool-fire reliability above ~80 % on
+sub-4B CPU-only inference.  The three fixes above are what move the
+needle.

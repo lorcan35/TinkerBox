@@ -144,13 +144,13 @@ When `voice_mode=3` is active, Dragon delegates all intelligence to the TinkerCl
 Dragon renders rich content (code blocks, markdown tables, image URLs) from LLM responses as JPEG images and serves them to Tab5 for inline display in chat.
 
 - **MediaPipeline:** After `llm_done`, `process_response()` scans the full response text. Regex detects code blocks (```lang...```), markdown tables (|col|), and image URLs (.jpg/.png/.gif/.webp). Code blocks are rendered via Pygments `ImageFormatter` (native style, dark theme). Tables are drawn as styled grids (accent orange headers, dark bg) via Pillow. Image URLs are downloaded via aiohttp, resized to 660px max width, JPEG quality 80. Max 3 media items per response.
-- **MediaStore:** Disk-backed storage at `/home/radxa/media/`. 24-hour auto-cleanup via hourly task in `server.py`. 500MB max capacity.
+- **MediaStore:** Disk-backed storage at `/home/radxa/media/`. 24-hour auto-cleanup via hourly `media_cleanup_loop` in `dragon_voice/lifecycle/purge.py` (was inline in `server.py` before #65). 500MB max capacity.
 - **`strip_rendered_content()`:** After media items are rendered, code blocks that were converted to images are stripped from the text. The cleaned text is sent as a `text_update` message so Tab5 replaces the last AI bubble.
 - **Camera uploads:** Tab5 can send camera photos via `user_media` WebSocket message. Dragon receives the `media_id` from a prior `POST /api/media/upload`, loads the image, and passes it to the LLM for multimodal analysis.
 - **Protocol messages (Dragon → Tab5):** `media` (rendered image), `card` (rich card), `audio_clip` (audio player), `text_update` (replace AI bubble text). See `docs/protocol.md` for full spec.
 - **Protocol messages (Tab5 → Dragon):** `user_media` (camera photo for multimodal LLM). See `docs/protocol.md`.
 - **Dependencies:** Pillow (existing), Pygments>=2.17.0 (new — syntax highlighting). System font `fonts-dejavu-core` required on Dragon for Pygments.
-- **Both code paths:** Media detection runs in both ConvEngine and TinkerClaw (voice_mode 3) paths in `server.py`. The TinkerClaw path has an early `return` — media detection is placed before it.
+- **Both code paths:** Media detection runs in both ConvEngine and TinkerClaw (voice_mode 3) paths, inside the WS voice handler in `dragon_voice/server.py`. The TinkerClaw path has an early `return` — media detection is placed before it.
 
 ## OTA Firmware Endpoints
 Dragon serves firmware updates for Tab5 via two endpoints:
@@ -336,15 +336,25 @@ The LLM uses XML markers to invoke tools: `<tool>name</tool><args>{"key":"value"
 All embeddings (memory facts, document chunks, search queries) use **Ollama nomic-embed-text** (768-dimensional vectors). Runs locally on Dragon via Ollama on port 11434. No cloud API required.
 
 ### File Structure
+
+Refactor note (umbrella #65, closed 2026-04-24): the 2,747-LOC monolithic
+`server.py` was decomposed into four sibling packages — `middleware/`
+(request-filter concerns), `handlers/` (diagnostic + status + config
+endpoints), `lifecycle/` (boot/shutdown/monitors), and the slimmed
+`server.py` itself (now 1,803 LOC — holds the `VoiceServer` class +
+`create_app` wiring + the big WS-voice-handler family).  The extracted
+modules take deps explicitly (server handle or specific args), so each
+can be unit-tested without instantiating the full server.
+
 ```
 schema.sql            — Database schema (9 tables: 6 foundation + 3 memory)
-dragon_server.py      — CDP streaming + touch WebSocket (port 3501)
-dashboard.py          — Web dashboard (port 3500, aggregates 3501+3502)
-udp_streamer.py       — UDP JPEG streaming for low-latency display
+dashboard.py          — Web dashboard (port 3500, aggregates device state + voice state)
 dragon_voice/         — Voice pipeline package (port 3502)
   __init__.py         — Package init
   __main__.py         — Entry point: python3 -m dragon_voice
-  server.py           — aiohttp WebSocket server + HTTP + CORS middleware + agentic wiring
+  server.py           — VoiceServer class + create_app wiring + WS-voice handler family
+                        (register / text / user_media / disconnect / audio + event hooks).
+                        1,803 LOC after #65 decomposition.
   pipeline.py         — STT→LLM→TTS orchestration with VAD + dictation + post-processing
   conversation.py     — Multi-turn ConversationEngine with tool-calling + memory-augmented context
   sessions.py         — SessionManager (create/resume/pause/end lifecycle)
@@ -353,6 +363,24 @@ dragon_voice/         — Voice pipeline package (port 3502)
   memory.py           — MemoryService: facts + documents + RAG with Ollama embeddings
   config.py           — Config dataclasses (incl. ToolsConfig, MemoryConfig)
   config.yaml         — Default configuration
+  middleware/         — aiohttp request middleware (each stateless, explicit deps)
+    __init__.py       — Re-exports submodules
+    cors.py           — handle_cors + DEFAULT_ALLOWED_ORIGINS (SEC12)
+    security_headers.py — handle_security_headers + SECURITY_HEADERS (W14-M06)
+    auth.py           — handle_auth + PUBLIC_PREFIXES (Wave 13 C2 bearer-token gate)
+    rate_limit.py     — handle_rate_limit + DEFAULT_RATE_LIMIT_RULES (W15-H01, W15-H06)
+  handlers/           — HTTP endpoint handlers extracted from VoiceServer
+    __init__.py       — Re-exports submodules
+    debug.py          — handle_debug_mem + handle_debug_widget_{chart,prompt,card,media}
+                        (tracemalloc/RSS/gc probe + audit B2/B5/B6/K3 widget emitters)
+    status.py         — handle_status (HTML) + handle_health (JSON liveness)
+    config_api.py     — handle_get_config (redacted dump) + handle_set_config (hot-reload + pipeline backend swap, A06 lock-guarded)
+  lifecycle/          — Boot / shutdown / long-running monitors
+    __init__.py       — Re-exports submodules
+    monitors.py       — get_rss_mb, get_cpu_temp, memory_monitor_loop (A04 — 5-min RSS/temp/FD sample + pipeline drain on crit)
+    purge.py          — periodic_purge_loop (US-DQ14 message retention) + media_cleanup_loop (W13-H3 mid-sleep cancel fix preserved)
+    startup.py        — run_startup(server, app): DB → sessions → memory + tools → surfaces → conversation → REST routes → notes → MCP → periodic tasks
+    shutdown.py       — run_shutdown(server, app): cancel+await monitors (W14-M09) → drain pipelines → release backend pool (W15-C01) → close HTTP clients (W14-H12)
   api/                — Modular REST API package (47 endpoints, counted from code)
     __init__.py       — setup_all_routes() entry point
     utils.py          — Shared helpers (json_error, pagination)
@@ -367,13 +395,19 @@ dragon_voice/         — Voice pipeline package (port 3502)
     tools.py          — Tool listing + execution routes
     memory_routes.py  — Memory facts CRUD + search routes
     documents.py      — Document ingest + listing + search routes
-  tools/              — Tool-calling infrastructure
+    media_routes.py   — GET /api/media/{id} (serve), POST /api/media/upload (Tab5 camera)
+  tools/              — Tool-calling infrastructure (~15 tools)
     __init__.py       — Exports ToolRegistry, Tool
     base.py           — Tool abstract base class
     registry.py       — ToolRegistry: register, parse XML markers, execute
-    web_search.py     — DuckDuckGo web search (no API key)
-    memory_tools.py   — remember + recall tools (interface to MemoryService)
+    web_search.py     — SearXNG-backed web search (falls back to DuckDuckGo)
+    memory_tools.py   — StoreFactTool + RecallFactsTool + ForgetFactTool (G9 confirm-gated)
     datetime_tool.py  — Current date/time tool
+    calculator_tool.py, unit_converter_tool.py, weather_tool.py
+    system_tool.py, stock_ticker_tool.py
+    timesense_tool.py — Pomodoro + widget_live emitter (registered after SurfaceManager)
+    quick_poll_tool.py — Wave 12 declarative widget-skill reference
+    note_tool.py      — NoteTool (registered after NotesService)
   stt/                — STT backends (moonshine, whisper_cpp, vosk, openrouter)
   tts/                — TTS backends (piper, kokoro, edge_tts, openrouter)
   llm/                — LLM backends (ollama, openrouter, lmstudio, npu_genie, tinkerclaw)
@@ -382,16 +416,35 @@ dragon_voice/         — Voice pipeline package (port 3502)
     __init__.py       — Package exports (MediaStore, MediaPipeline)
     store.py          — MediaStore: disk-backed media file storage, 24h auto-cleanup, 500MB max
     pipeline.py       — MediaPipeline: detects code/tables/image URLs in LLM output, renders JPEG via Pygments/Pillow
-  api/media_routes.py — MediaRoutes: GET /api/media/{id} (serve), POST /api/media/upload (Tab5 camera)
-tests/                — E2E test suite
-  test_api_e2e.py     — 29 live-device tests (14 single-step, 8 multi-step, 7 complex chained)
-  test_media_store.py — 12 unit tests for MediaStore
-  test_media_pipeline.py — 29 unit tests for MediaPipeline
+    url_signer.py     — MediaUrlSigner: HMAC-signed + time-bounded /api/media/{id} URLs (W14-H04)
+  surfaces/           — Tab5 widget-surface abstraction (widget_live/card/list/chart/media/prompt)
+  mcp/                — Model Context Protocol client + bridge
+tests/                — Test suite (19 unit/smoke tests in CI + 29 E2E locally)
+  test_api_e2e.py               — 29 live-device tests (local-only, not CI)
+  test_e2e_dragon.py            — Dragon end-to-end (local-only, not CI)
+  test_auth_middleware.py       — 6 tests for bearer-token gate (CI)
+  test_rate_limit.py            — 4 tests for per-IP+path throttle (CI)
+  test_security_headers.py      — 3 tests for CSP/XFO/nosniff stamping (CI)
+  test_debug_handlers.py        — 7 tests for handlers/debug.py (CI, added in #67)
+  test_lifecycle_monitors.py    — 5 tests for lifecycle/monitors.py (CI, added in #68)
+  test_status_handlers.py       — 3 tests for handlers/status.py (CI, added in #69)
+  test_config_api_handlers.py   — 4 tests for handlers/config_api.py (CI, added in #69)
+  test_media_store.py, test_media_pipeline.py, test_media_url_signer.py,
+  test_proxy_image_ssrf.py, test_config_redact.py, test_session_cas.py,
+  test_mcp_bridge.py, test_notes_db_async.py, test_backend_pool.py,
+  test_media_fd_leak.py, test_foundation.py       — all in CI named set
 docs/
   protocol.md         — WebSocket protocol spec (Tab5 ↔ Dragon)
   npu-setup.md        — Qualcomm NPU / QAIRT SDK setup guide
+  AUDIT.md / AUDIT-WAVE-15.md / WAVE-14-PROGRESS.md / WAVE-15-PROGRESS.md
+                      — Wave audit tracking; note that file:line citations for
+                        server.py from before 2026-04-24 pre-date the #65
+                        refactor and may need mapping to the new module paths
+  SKILL_AUTHORING.md  — Skill SDK reference (uses tools/quick_poll_tool.py as example)
 LEARNINGS.md          — Institutional knowledge (MANDATORY reading)
 ```
+
+**Note on legacy files:** `dragon_server.py` (CDP browser streaming on port 3501) and `udp_streamer.py` (UDP JPEG streaming) were retired on the Tab5 side in #155 ("voice-first is the product").  If copies still exist on a deployed Dragon they're no longer wired up by systemd; the active dashboard now aggregates state from `dragon_voice` directly.
 
 ## Testing
 

@@ -9,12 +9,13 @@ refs #16, #17, #18
 """
 
 import asyncio
+import contextlib
 import copy
 import json
 import logging
 import os
 import time
-from typing import Optional
+from typing import AsyncIterator, Optional
 
 import aiohttp
 from aiohttp import web, WSMsgType
@@ -358,6 +359,99 @@ class VoiceServer:
         except Exception as e:
             logger.debug("_safe_send_bytes suppressed: %s", e)
             return False
+
+    @staticmethod
+    @contextlib.asynccontextmanager
+    async def _ws_keepalive_during_inference(
+        ws: web.WebSocketResponse,
+        *,
+        interval_s: float = 5.0,
+        ping_timeout_s: float = 5.0,
+        label: str = "inference",
+    ) -> AsyncIterator[None]:
+        """Fire WS-level PING frames every `interval_s` seconds while the
+        context is active.  Keeps Tab5's WS library from tripping its
+        PONG-watch timeout (and triggering a reconnect → P13 eviction)
+        when an LLM stream takes longer than Tab5's own tolerance window.
+
+        The outer `web.WebSocketResponse(heartbeat=...)` timer is sized
+        for idle sockets (60 s between pings).  That cadence is too slow
+        for a 90 s Ollama turn on a local 4 B model — the event loop
+        gets starved, the heartbeat task doesn't tick, Tab5 declares
+        Dragon dead, Tab5 reconnects, and the P13 "Device already has
+        connection" guard evicts the original WS mid-stream.  This
+        helper pings 12× more often, only during inference, and stops
+        the moment the caller exits the `async with`.
+
+        Usage::
+
+            async with self._ws_keepalive_during_inference(ws):
+                async for token in llm.generate_stream_with_messages(...):
+                    await self._safe_send_json(ws, {"type": "llm", "text": token})
+
+        Parameters
+        ----------
+        ws : WebSocketResponse
+            The live WS to ping.  If already closed, the helper is a no-op.
+        interval_s : float, default 5.0
+            Seconds between PING frames.  5 s is safely under every
+            Tab5 firmware revision's PONG-watch window (30–45 s).
+        ping_timeout_s : float, default 5.0
+            How long to wait for the individual `ws.ping()` call to
+            return before treating it as a failed ping.  Short so GIL
+            contention from inference doesn't pile up.
+        label : str, default "inference"
+            Free-form tag used in the exit log so multiple concurrent
+            helpers are distinguishable.
+
+        Notes
+        -----
+        * Replaces and generalises the ad-hoc `_keepalive()` pattern
+          that was previously inlined in `_handle_text` (TC path only).
+        * Safe to use on a WS that has no in-flight work; the helper
+          runs its own task that simply exits on context exit.
+        * Exceptions from `ws.ping()` (connection reset, cancelled)
+          are swallowed — the surrounding inference loop's own
+          `ws.closed` check is the authoritative closure signal.
+        """
+        if ws.closed:
+            yield
+            return
+
+        alive = True
+
+        async def _tick() -> None:
+            while alive:
+                try:
+                    await asyncio.sleep(interval_s)
+                except asyncio.CancelledError:
+                    break
+                if not alive or ws.closed:
+                    break
+                try:
+                    await asyncio.wait_for(ws.ping(), timeout=ping_timeout_s)
+                except asyncio.TimeoutError:
+                    logger.debug(
+                        "ws_keepalive(%s) ping timeout after %.1fs — event loop stalled?",
+                        label, ping_timeout_s,
+                    )
+                    # Keep trying; caller's loop is the real arbiter of
+                    # whether the stream is still worth waiting for.
+                    continue
+                except (ConnectionResetError, RuntimeError):
+                    break
+                except Exception as e:
+                    logger.debug("ws_keepalive(%s) suppressed: %s", label, e)
+                    break
+
+        task = asyncio.create_task(_tick())
+        try:
+            yield
+        finally:
+            alive = False
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
 
     async def _handle_ws_voice(self, request: web.Request) -> web.WebSocketResponse:
         """Main voice WebSocket endpoint.
@@ -1335,32 +1429,23 @@ class VoiceServer:
             if not ws.closed:
                 await ws.send_json({"type": "llm", "text": ""})
 
-            # Also start a keepalive task that pings every 10s during processing.
-            # 5s timeout on each send prevents blocking if the event loop is
-            # delayed by inference GIL contention (US-DQ05).
-            keepalive_active = True
-            async def _keepalive():
-                while keepalive_active:
-                    await asyncio.sleep(10)
-                    if keepalive_active and not ws.closed:
-                        try:
-                            await asyncio.wait_for(ws.ping(), timeout=5.0)
-                        except (asyncio.TimeoutError, Exception):
-                            break
-
-            keepalive_task = asyncio.create_task(_keepalive())
-
+            # #75 phase 1a: WS-level PING every 5 s while the LLM is
+            # generating.  Previously inlined here as `_keepalive()` at
+            # 10 s; now the shared helper lives on the class so the
+            # vision-upload path (below in _handle_user_media) gets the
+            # same protection instead of running bare.  5 s is safely
+            # under every Tab5 firmware's PONG-watch window (30–45 s);
+            # the outer `WebSocketResponse(heartbeat=60)` timer is too
+            # slow for a 90 s 4 B-class Ollama turn.  See docs/AUDIT.md
+            # "Local-mode gauntlet" for the observed P13-eviction race.
             full_response = []
-            try:
+            async with self._ws_keepalive_during_inference(ws, label="tc_text"):
                 async for token in llm.generate_stream_with_messages([
                     {"role": "user", "content": text}
                 ]):
                     full_response.append(token)
                     if not ws.closed:
                         await ws.send_json({"type": "llm", "text": token})
-            finally:
-                keepalive_active = False
-                keepalive_task.cancel()
 
             response_text = "".join(full_response)
 
@@ -1708,10 +1793,15 @@ class VoiceServer:
             return
 
         try:
-            async for token in llm_backend.generate_stream_with_messages(messages):
-                full_response.append(token)
-                if not ws.closed:
-                    await ws.send_json({"type": "llm", "text": token})
+            # #75 phase 1a: same PING-during-inference protection as the
+            # TC text path above — vision-upload LLM turns can run 30+ s
+            # on multimodal models, long enough for Tab5's PONG-watch to
+            # trip without the helper.
+            async with self._ws_keepalive_during_inference(ws, label="vision"):
+                async for token in llm_backend.generate_stream_with_messages(messages):
+                    full_response.append(token)
+                    if not ws.closed:
+                        await ws.send_json({"type": "llm", "text": token})
         except Exception as e:
             logger.error("user_media LLM failed: %s", e)
             if not ws.closed:

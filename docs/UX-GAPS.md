@@ -46,7 +46,7 @@ Per user direction:
 | L4 | Cancel ack — late `llm` events arrive after Tab5 went READY | LOW | ~30 min | 1 | **MERGED #92 + TinkerTab#194** |
 | H1 | Tokens buffered for full LLM phase during tool turns | HIGH | ~90 min | 2 | OPEN |
 | H2 | TTS sentence-boundary delay (incl. code-block false splits) | HIGH | ~110 min | 2 | OPEN |
-| H4 | Dictation post-process silent (no event during 10-20 s wait) | HIGH | ~95 min | 2 | OPEN |
+| H4 | Dictation post-process silent (no event during 10-20 s wait) | HIGH | ~95 min | 2 | **MERGED #95 + TinkerTab#195** |
 | L3 | Piper TTS not killed on timeout | LOW | ~35 min | 2 | OPEN |
 | H8 | Raw error strings on wrong UI surface (voice caption vs toast) | HIGH | ~4 h | 3 | OPEN |
 | M1 | Tool parser silent on malformed JSON args | MED | ~3 h | 3 | OPEN |

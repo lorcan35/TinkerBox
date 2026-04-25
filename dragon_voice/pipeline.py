@@ -510,6 +510,19 @@ class VoicePipeline:
             prev = self._post_process_task
             if prev and not prev.done():
                 prev.cancel()
+                # Phase 2 H4 (issue #94): tell Tab5 the prior post-process
+                # was abandoned for the new one.  Without this, a user who
+                # rapidly stops + restarts dictation could see a stale
+                # summary land on top of their new transcript a few seconds
+                # later.
+                await self._on_event({"type": "dictation_postprocessing_cancelled"})
+            # Phase 2 H4 (issue #94): emit a "still working" event so Tab5
+            # can show "Generating summary..." instead of leaving the user
+            # staring at the bare transcript for 10-20 s while the LLM
+            # writes the title + summary.  Pre-fix, the only events between
+            # `stt` (line 490) and `dictation_summary` were silence —
+            # users assumed the device had hung.
+            await self._on_event({"type": "dictation_postprocessing"})
             self._post_process_task = asyncio.ensure_future(
                 self._post_process_dictation(full_text)
             )
@@ -537,6 +550,15 @@ class VoicePipeline:
 
         if not llm:
             logger.warning("No LLM available for dictation post-processing")
+            # Phase 2 H4 (issue #94): tell Tab5 the post-process won't run.
+            # Pre-fix this would silently log and leave Tab5 waiting for a
+            # `dictation_summary` event that never arrives — UI gets stuck
+            # on the "Generating summary..." caption forever.
+            await self._on_event({
+                "type": "dictation_postprocessing_error",
+                "error": "no_llm_available",
+                "message": "Note saved — summary unavailable (LLM offline)",
+            })
             return
 
         prompt = (
@@ -568,8 +590,24 @@ class VoicePipeline:
                 "title": title,
                 "summary": summary,
             })
-        except Exception:
+        except asyncio.CancelledError:
+            # Phase 2 H4 (issue #94): the cancelled-side event is emitted
+            # by `finish_dictation` BEFORE it spawns a new task — we don't
+            # double-emit here.  Just propagate.  (Caller handles via
+            # add_done_callback.)
+            raise
+        except Exception as e:
             logger.exception("Dictation post-processing failed")
+            # Phase 2 H4 (issue #94): user-visible error so Tab5 can clear
+            # the "Generating summary..." caption + show a toast.  The
+            # transcript is already in the chat from the prior `stt` event,
+            # so the user hasn't lost data — they just don't get the
+            # auto-generated title/summary.
+            await self._on_event({
+                "type": "dictation_postprocessing_error",
+                "error": type(e).__name__,
+                "message": "Note saved — summary generation failed",
+            })
 
     # ── Ask mode (existing) ────────────────────────────────────────
 

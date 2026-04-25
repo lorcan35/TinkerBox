@@ -67,7 +67,7 @@ Per user direction:
 |---|---|---|---|---|
 | α-arch | WS dispatcher async-task discipline | C1, C2, L2, parts of M5 | 1 | **MERGED #92** |
 | β-arch | Progress event bus (single channel for all phases) | H1, H2, H4, future tool/TTS feedback | 6 | OPEN |
-| γ-arch | `DragonError` taxonomy (severity + scope) | H8, M1, M2, M5, M6 | 3 | OPEN (bundled) |
+| γ-arch | `DragonError` taxonomy (severity + scope) | H8, M1, M2, M5, M6 | 3 | **γ1 MERGED #102** (γ2 + γ3 OPEN) |
 | δ-arch | Declarative retention policy framework | H6, H7, D-mem, D-docs | 6 | OPEN |
 
 ---
@@ -125,7 +125,7 @@ affects the whole protocol.  Cleaner if dispatcher cleanup landed first.
 
 | PR | Scope | Effort |
 |---|---|---|
-| γ1 | `DragonError` class with `severity: TRANSIENT|FATAL` + `scope`; audit ~12 emission sites | ~5.5 h |
+| γ1 | `DragonError` class with `severity: TRANSIENT|FATAL` + `scope`; audit ~12 emission sites | **MERGED #102** |
 | γ2 | H8 route to correct surface (toast vs caption); H1 `tool_failed`; M5 `device_evicted` frame; M6 fast-fail TC health check | ~10 h combined |
 | γ3 | M2 WS upgrade JSON responses + Tab5 401-stops-retrying | ~3 h |
 

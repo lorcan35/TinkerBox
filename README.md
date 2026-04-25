@@ -117,12 +117,12 @@ Tab5 (ESP32-P4)                         Dragon Q6A (this repo)
 
 | Service | Port | systemd Unit | Description |
 |---------|------|-------------|-------------|
-| Dashboard | 3500 | `tinkerbox-dashboard` | Web UI for status, config, device management |
-| Dragon CDP | 3501 | `tinkerbox-dragon` | MJPEG screencast + touch relay via Chrome DevTools Protocol |
-| Voice + API | 3502 | `tinkerbox-voice` | Voice pipeline (STT/LLM/TTS), sessions, REST API, Notes API |
+| Dashboard | 3500 | `tinkerclaw-dashboard` | Web UI for status, config, device management |
+| Dragon CDP | 3501 | `tinkerclaw` | MJPEG screencast + touch relay via Chrome DevTools Protocol |
+| Voice + API | 3502 | `tinkerclaw-voice` | Voice pipeline (STT/LLM/TTS), sessions, REST API, Notes API |
 | Telegram Bot | -- | `tinkerclaw-telegram` | Isolated Telegram chat bot using OpenRouter |
 | mDNS | -- | `tinkerclaw-mdns` | Advertises `_tinkerclaw._tcp` for Tab5 auto-discovery |
-| Chromium | 9222 | (launched by `tinkerbox-dragon`) | CDP target browser for screen streaming |
+| Chromium | 9222 | (launched by `tinkerclaw`) | CDP target browser for screen streaming |
 | Ollama | 11434 | `ollama` | Local LLM inference (CPU fallback, ~0.24 tok/s) |
 | SearXNG | 8888 | `searxng` | Self-hosted metasearch engine (web_search tool backend) |
 | NPU Genie | -- | (via voice pipeline) | Llama 3.2 1B on QCS6490 Hexagon DSP (~8 tok/s) |
@@ -246,7 +246,7 @@ python3 -m dragon_voice &     # Voice server (separate terminal)
 python3 dashboard.py &        # Dashboard (separate terminal)
 
 # Or install as systemd services for auto-start on boot:
-sudo ./install-services.sh
+# (see "Deployment → systemd Services" below for the install commands)
 ```
 
 ### Deploy from a workstation
@@ -258,7 +258,7 @@ sshpass -p 'radxa' scp dashboard.py dragon_server.py schema.sql radxa@192.168.1.
 
 # Restart the voice service
 sshpass -p 'radxa' ssh radxa@192.168.1.91 \
-  "echo 'radxa' | sudo -S systemctl restart tinkerbox-voice"
+  "echo 'radxa' | sudo -S systemctl restart tinkerclaw-voice"
 ```
 
 ---
@@ -701,32 +701,52 @@ This switches STT back to `moonshine` and TTS back to `piper`.
 
 ### systemd Services
 
-The `install-services.sh` script creates and enables four systemd units:
+The canonical unit files live in [`systemd/`](systemd/) and use the
+`tinkerclaw-*` naming convention.  Install them by copying the files in
+that directory to `/etc/systemd/system/` (or run the matching install
+helper if your branch ships one):
 
 ```bash
-sudo ./install-services.sh
+sudo install -m 644 systemd/tinkerclaw-voice.service        /etc/systemd/system/
+sudo install -m 644 systemd/tinkerclaw-gateway.service      /etc/systemd/system/
+sudo install -m 644 systemd/tinkerclaw-ngrok.service        /etc/systemd/system/
+sudo install -m 644 systemd/tinkerclaw-backup.service       /etc/systemd/system/
+sudo install -m 644 systemd/tinkerclaw-backup.timer         /etc/systemd/system/
+# Plus any drop-ins from systemd/*.service.d/
+sudo systemctl daemon-reload
 ```
 
-This installs:
-- `tinkerbox-chromium` -- Chromium with CDP enabled
-- `tinkerbox-dragon` -- CDP streaming server (port 3501)
-- `tinkerbox-voice` -- Voice pipeline server (port 3502)
-- `tinkerbox-dashboard` -- Web dashboard (port 3500)
+The active units on a deployed Dragon (verified 2026-04-25):
+
+- `tinkerclaw` -- Dragon CDP streaming server (port 3501) + Chromium child process
+- `tinkerclaw-voice` -- Voice pipeline (STT/LLM/TTS, port 3502, REST API, Notes API)
+- `tinkerclaw-dashboard` -- Web dashboard (port 3500)
+- `tinkerclaw-mdns` -- mDNS advertisement (`_tinkerclaw._tcp`)
+- `tinkerclaw-gateway` -- Optional TinkerClaw agent runner (port 18789, localhost only)
+- `tinkerclaw-ngrok` -- ngrok tunnels (Dashboard + Voice + Gateway)
+- `tinkerclaw-backup.timer` -- Hourly snapshot timer (DB + config)
+
+> **Note:** The legacy `install-services.sh` script in the repo root
+> generates units named `tinkerbox-*`, which **do not match** the
+> canonical names in `systemd/` or what's actually deployed.  Prefer
+> the explicit `install` calls above; the script is kept around for
+> historical reference and will be retired or rewritten in a future
+> change (tracked in #86 follow-up).
 
 Manage the services:
 
 ```bash
-# Start all services
-sudo systemctl start tinkerbox-chromium tinkerbox-dragon tinkerbox-voice tinkerbox-dashboard
+# Start the voice service
+sudo systemctl start tinkerclaw-voice
 
 # Check status
-sudo systemctl status tinkerbox-voice
+sudo systemctl status tinkerclaw-voice
 
 # View logs
-journalctl -u tinkerbox-voice -f
+journalctl -u tinkerclaw-voice -f
 
 # Restart after code changes
-sudo systemctl restart tinkerbox-voice
+sudo systemctl restart tinkerclaw-voice
 ```
 
 The optional Telegram bot runs as a separate unit:
@@ -760,7 +780,7 @@ sshpass -p 'radxa' scp dashboard.py dragon_server.py schema.sql \
 
 # Restart the voice service
 sshpass -p 'radxa' ssh radxa@192.168.1.91 \
-  "echo 'radxa' | sudo -S systemctl restart tinkerbox-voice"
+  "echo 'radxa' | sudo -S systemctl restart tinkerclaw-voice"
 ```
 
 ### Python Package Notes
@@ -898,7 +918,7 @@ TinkerBox/
 |-- telegram.env.example           Example Telegram bot environment
 |-- setup.sh                       Dependency installer
 |-- start.sh                       One-command launcher (Chromium + Dragon)
-|-- install-services.sh            systemd service installer
+|-- systemd/                       systemd unit files (canonical install path)
 |-- launch-chromium.sh             Chromium CDP launcher
 |-- start-chat.sh                  Chat launcher script
 |-- CLAUDE.md                      Developer guide, sprint status, architecture

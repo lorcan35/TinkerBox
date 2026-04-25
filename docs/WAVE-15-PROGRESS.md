@@ -1,5 +1,12 @@
 # Wave 15 — Progress Tracker
 
+> **Active wave.**  Per-item state for Wave 15 (post-2026-04-21).  This
+> file complements (does not replace) [`../CLAUDE.md`](../CLAUDE.md)
+> "Current Sprint" — CLAUDE.md is the higher-level "what shipped vs
+> what's coming"; this doc is the granular checklist with PR + evidence
+> citations per item.  Wave 14's equivalent tracker is preserved at
+> [`./WAVE-14-PROGRESS.md`](./WAVE-14-PROGRESS.md) (closed).
+
 Canonical status for every item in [docs/AUDIT-WAVE-15.md](AUDIT-WAVE-15.md). Update in the same commit that closes an item. Format: one line per ID with status, branch name, PR#, and one-sentence proof.
 
 **Legend:** `[ ]` open · `[~]` in progress · `[x]` closed · `[-]` deferred

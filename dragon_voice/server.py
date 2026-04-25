@@ -814,18 +814,70 @@ class VoiceServer:
                             logger.info("Connection %s: conversation history cleared", ws_id)
 
                     elif cmd_type == "cancel":
+                        # Phase 1 (issue #91): cancel needs to reach in-flight
+                        # text/media handler tasks too, not just the voice
+                        # pipeline.  Today text/media are awaited inline above
+                        # which blocks the WS read loop — a cancel frame from
+                        # Tab5 sits in the TCP buffer until the inline await
+                        # returns, by which point the response has already
+                        # finished and Tab5 sees the cancelled tokens
+                        # materialise after the user gave up.
                         pipeline = conn_state.get("pipeline")
-                        if pipeline:
-                            logger.info("Connection %s: cancel", ws_id)
+                        cancelled_what: list[str] = []
+                        handler_tasks = conn_state.setdefault("handler_tasks", {})
+                        for slot in ("text", "media", "config"):
+                            t = handler_tasks.get(slot)
+                            if t and not t.done():
+                                t.cancel()
+                                try:
+                                    await t
+                                except (asyncio.CancelledError, Exception):
+                                    # task may have raised mid-cancel; we
+                                    # logged it; don't propagate to the WS
+                                    # loop or the loop dies on us
+                                    pass
+                                handler_tasks[slot] = None
+                                cancelled_what.append(slot)
+                        # Pipeline is the voice path's authority; cancel
+                        # whether or not we cancelled a handler task above
+                        # (handler-task cancel might have been mid-TTS, which
+                        # owns Piper subprocesses on the pipeline side).
+                        if pipeline and (pipeline._processing or not cancelled_what):
+                            logger.info("Connection %s: cancel → pipeline.cancel", ws_id)
                             await pipeline.cancel()
+                            cancelled_what.append("pipeline")
+                        # Send ack so Tab5 has a positive signal that cancel
+                        # landed — matters because Tab5 transitions to READY
+                        # locally on cancel-send and may otherwise see late
+                        # `llm` tokens that were already in TCP flight.
+                        # Tab5-side fix at voice.c:752 covers the late-token
+                        # case directly; this ack is the protocol-clean half
+                        # of the same change.
+                        await self._safe_send_json(ws, {
+                            "type": "cancel_ack",
+                            "cancelled": cancelled_what,
+                        })
 
                     elif cmd_type == "text":
-                        async with conn_lock:  # US-P10: serialize with voice
-                            await self._handle_text(ws, conn_state, cmd)
+                        # Phase 1 (issue #91): spawn as a task so the WS read
+                        # loop stays free for cancel/ping/voice frames.
+                        # `conn_lock` is acquired INSIDE the task to preserve
+                        # the prior US-P10 serialization with voice/segment
+                        # paths.  If a previous text turn is still running
+                        # (Tab5 normally queues with "+1 QUEUED" but be
+                        # defensive) we wait for it before queuing the next.
+                        await self._spawn_handler_task(
+                            conn_state, "text",
+                            self._handle_text, ws, conn_state, cmd,
+                            conn_lock=conn_lock,
+                        )
 
                     elif cmd_type == "user_media":
-                        async with conn_lock:
-                            await self._handle_user_media(ws, conn_state, cmd)
+                        await self._spawn_handler_task(
+                            conn_state, "media",
+                            self._handle_user_media, ws, conn_state, cmd,
+                            conn_lock=conn_lock,
+                        )
 
                     elif cmd_type == "record_start" or cmd_type == "record_stop":
                         # Superseded by dictation mode (start with mode=dictate)
@@ -836,319 +888,23 @@ class VoiceServer:
                         await ws.send_json({"type": "pong"})
 
                     elif cmd_type == "config_update":
-                        # v4·D audit P1: rate-limit config_update to 2/sec/conn.
-                        # A buggy skill or trigger-happy test harness could
-                        # storm mode swaps that each do heavy backend init.
-                        _now_cfg = time.monotonic()
-                        _last_cfg = conn_state.get("_last_config_update_ts", 0.0)
-                        if _now_cfg - _last_cfg < 0.5:
-                            logger.debug("config_update rate-limited on %s", ws_id)
-                            continue
-                        conn_state["_last_config_update_ts"] = _now_cfg
-                        # US-P01: Acquire conn_lock to serialize with stop/text
-                        # handlers. Prevents swap_backends() from running while
-                        # start_processing() or finish_dictation() is in flight.
-                        # Three-tier voice mode: 0=local, 1=hybrid, 2=cloud
-                        voice_mode = cmd.get("voice_mode")
-                        llm_model = cmd.get("llm_model")
-                        # Backward compat: old binary cloud_mode toggle
-                        cloud_mode = cmd.get("cloud_mode")
-                        if cloud_mode is not None and voice_mode is None:
-                            voice_mode = 2 if cloud_mode else 0
-
-                        if voice_mode is not None:
-                            # STT+TTS: local for mode 0, cloud for mode 1+2+3
-                            if voice_mode == 0:
-                                stt_be, tts_be = "moonshine", "piper"
-                            elif voice_mode == 3:
-                                # TinkerClaw mode: default local STT/TTS
-                                # "cloud" suffix in llm_model → use OpenRouter STT/TTS
-                                if llm_model and "cloud" in llm_model.lower():
-                                    stt_be, tts_be = "openrouter", "openrouter"
-                                else:
-                                    stt_be, tts_be = "moonshine", "piper"
-                            else:
-                                stt_be, tts_be = "openrouter", "openrouter"
-
-                            # LLM backend selection
-                            if voice_mode == 3:
-                                # TinkerClaw mode — gateway handles everything
-                                llm_be = "tinkerclaw"
-                                if llm_model:
-                                    conn_config.llm.tinkerclaw_model = llm_model
-                            elif voice_mode == 2:
-                                llm_be = "openrouter"
-                                if llm_model:
-                                    conn_config.llm.openrouter_model = llm_model
-                            else:
-                                llm_be = conn_config.llm.local_backend or "ollama"
-                                if llm_model and llm_be == "ollama" and "/" not in llm_model:
-                                    conn_config.llm.ollama_model = llm_model
-                                    logger.info("Local model switched to: %s", llm_model)
-
-                            # Apply mode-aware system prompt and max_tokens
-                            # Mode 3 (TinkerClaw): skip — TinkerClaw owns personality
-                            if voice_mode == 3:
-                                pass  # TinkerClaw manages its own prompts and limits
-                            elif voice_mode == 0:
-                                conn_config.llm.system_prompt = SYSTEM_PROMPT_LOCAL
-                                conn_config.llm.max_tokens = MAX_TOKENS_LOCAL
-                            elif voice_mode == 1:
-                                conn_config.llm.system_prompt = SYSTEM_PROMPT_HYBRID
-                                conn_config.llm.max_tokens = MAX_TOKENS_HYBRID
-                            else:
-                                conn_config.llm.system_prompt = SYSTEM_PROMPT_CLOUD
-                                conn_config.llm.max_tokens = MAX_TOKENS_CLOUD
-
-                            logger.info("Connection %s: voice_mode=%d → stt=%s tts=%s llm=%s model=%s tokens=%d",
-                                        ws_id, voice_mode, stt_be, tts_be, llm_be,
-                                        conn_config.llm.openrouter_model if voice_mode == 2 else "(local)",
-                                        conn_config.llm.max_tokens)
-
-                            # Validate TinkerClaw gateway is reachable before switching to mode 3
-                            if voice_mode == 3:
-                                try:
-                                    tc_url = (conn_config.llm.tinkerclaw_url or "http://localhost:18789").rstrip("/")
-                                    async with aiohttp.ClientSession(
-                                        timeout=aiohttp.ClientTimeout(total=5)
-                                    ) as tc_session:
-                                        async with tc_session.get(f"{tc_url}/health") as tc_resp:
-                                            if tc_resp.status != 200:
-                                                logger.error("TinkerClaw health check returned %d", tc_resp.status)
-                                                raise RuntimeError(f"health check returned {tc_resp.status}")
-                                    logger.info("TinkerClaw gateway health OK at %s", tc_url)
-                                except Exception as tc_err:
-                                    logger.error("TinkerClaw gateway not reachable: %s", tc_err)
-                                    # Audit G5 (2026-04-20): revert to Local so Tab5 doesn't
-                                    # sit wedged on mode 3 showing an error. Matches the
-                                    # OpenRouter-key-missing path below.
-                                    if not ws.closed:
-                                        await ws.send_json({
-                                            "type": "config_update",
-                                            "error": "TinkerClaw gateway is not reachable",
-                                            "voice_mode": 0,
-                                        })
-                                    continue
-
-                            # Validate API key for cloud modes (1=Hybrid, 2=Cloud need OpenRouter)
-                            # Mode 3 (TinkerClaw) doesn't need Dragon's OpenRouter key — uses own gateway
-                            if voice_mode in (1, 2) and not conn_config.llm.openrouter_api_key:
-                                logger.error("Cloud mode requested but no API key configured")
-                                if not ws.closed:
-                                    await ws.send_json({
-                                        "type": "config_update",
-                                        "error": "No OpenRouter API key configured",
-                                        "voice_mode": 0,
-                                    })
-                                continue
-
-                            # Update session system prompt in DB for conversation engine
-                            # Chat v4·C (refs #27): also persist voice_mode + llm_model
-                            # onto the session row so the drawer surfaces the active
-                            # mode fingerprint and pipeline-resume picks the right
-                            # backends without a fresh config_update from the client.
-                            sid = conn_state.get("session_id")
-                            if sid and self._db:
-                                # Resolve the best "active model" string to persist,
-                                # matching the client-visible payload below.
-                                if voice_mode == 2:
-                                    active_model_db = conn_config.llm.openrouter_model or ""
-                                elif llm_be == "tinkerclaw":
-                                    active_model_db = conn_config.llm.tinkerclaw_model or ""
-                                elif llm_be == "ollama":
-                                    active_model_db = conn_config.llm.ollama_model or ""
-                                else:
-                                    active_model_db = str(llm_model or "")
-                                try:
-                                    await self._db.update_session(
-                                        sid,
-                                        system_prompt=conn_config.llm.system_prompt,
-                                        voice_mode=int(voice_mode),
-                                        llm_model=active_model_db[:128],
-                                    )
-                                except Exception:
-                                    logger.warning(
-                                        "Failed to update session system_prompt / mode"
-                                    )
-
-                            # Apply config
-                            conn_config.stt.backend = stt_be
-                            conn_config.tts.backend = tts_be
-                            conn_config.llm.backend = llm_be
-
-                            # Propagate API keys for cloud STT/TTS backends (modes 1-2, or mode 3 with cloud STT)
-                            if voice_mode in (1, 2) or (voice_mode == 3 and stt_be == "openrouter"):
-                                conn_config.stt.openrouter_api_key = conn_config.llm.openrouter_api_key
-                                conn_config.stt.openrouter_url = conn_config.llm.openrouter_url
-                                conn_config.tts.openrouter_api_key = conn_config.llm.openrouter_api_key
-                                conn_config.tts.openrouter_url = conn_config.llm.openrouter_url
-
-                            # US-P01: Acquire conn_lock to serialize the swap with
-                            # stop/text handlers. Without this, start_processing()
-                            # could run concurrently with swap_backends().
-                            async with conn_lock:
-                                # Hot-swap backends on pipeline AND conversation engine
-                                pipeline = conn_state.get("pipeline")
-                                if pipeline:
-                                    try:
-                                        # swap_backends() now handles cancel internally
-                                        # and sets _swapping flag to drop audio during swap
-                                        await pipeline.swap_backends(conn_config)
-                                        # Inject session key for TinkerClaw conversation continuity
-                                        if llm_be == "tinkerclaw" and hasattr(pipeline, '_llm'):
-                                            if hasattr(pipeline._llm, 'set_session_key'):
-                                                pipeline._llm.set_session_key(
-                                                    conn_state.get("session_id", ""))
-                                    except Exception as e:
-                                        logger.exception(
-                                            "Backend swap failed for %s",
-                                            conn_state.get("ws_id", "?"),
-                                        )
-                                        # W15-C04: `_safe_send_json` owns the
-                                        # closed-check + send atomically and
-                                        # doesn't raise if the socket closed
-                                        # after our swap started.  The old
-                                        # `if not ws.closed: send_json(...)`
-                                        # pattern had a TOCTOU window where
-                                        # TCP FIN could land between check
-                                        # and send and raise inside the
-                                        # except handler, hiding the original
-                                        # backend-swap error.
-                                        await self._safe_send_json(ws, {
-                                            "type": "config_update",
-                                            "error": f"Backend swap failed: {e}",
-                                            "voice_mode": 0,
-                                        })
-                                        continue
-
-                                # Also swap ConversationEngine LLM (used by _handle_text).
-                                # W15-C01: prefer the pooled instance so we don't
-                                # re-load Ollama / re-open the aiohttp session on
-                                # every config_update.  Only the pipeline owns the
-                                # shutdown of a pooled backend.
-                                if self._conversation:
-                                    try:
-                                        from dragon_voice.llm import create_llm
-                                        from dragon_voice.pipeline import _llm_sig
-                                        new_key = _llm_sig(conn_config.llm)
-                                        pooled = self._backend_pool.get(new_key)
-                                        old_llm = self._conversation._llm
-                                        if pooled is not None:
-                                            new_llm = pooled
-                                        else:
-                                            new_llm = create_llm(conn_config.llm)
-                                            await new_llm.initialize()
-                                            self._backend_pool[new_key] = new_llm
-                                        # Only shutdown the OLD one if nobody in the
-                                        # pool references it (i.e. it wasn't pooled).
-                                        if old_llm is not None and old_llm not in self._backend_pool.values():
-                                            await old_llm.shutdown()
-                                        self._conversation._llm = new_llm
-                                        # 2026-04-23 (#58): also swap _llm_config so the
-                                        # compact-vs-full tool prompt logic in
-                                        # ConversationEngine._augment_context_with_tools
-                                        # picks the right format for the active backend.
-                                        # Without this, cloud-mode agents stayed on the
-                                        # top-5 compact tool list and never saw weather,
-                                        # stock_ticker, timesense_timer, quick_poll, note,
-                                        # system_info, or unit_converter.
-                                        self._conversation._llm_config = conn_config.llm
-                                        logger.info("ConversationEngine LLM swapped to %s%s (backend=%s)",
-                                                    new_llm.name, " (pooled)" if pooled else "", conn_config.llm.backend)
-                                    except Exception as e:
-                                        logger.exception("ConversationEngine LLM swap failed: %s", e)
-
-                            # Update displayed names
-                            self._stt_name = stt_be
-                            self._tts_name = tts_be
-                            self._llm_name = llm_be
-
-                            # Confirm to Tab5
-                            if not ws.closed:
-                                # Report actual model for any mode
-                                if voice_mode == 2:
-                                    active_model = conn_config.llm.openrouter_model
-                                elif llm_be == "tinkerclaw":
-                                    active_model = conn_config.llm.tinkerclaw_model
-                                elif llm_be == "ollama":
-                                    active_model = conn_config.llm.ollama_model
-                                else:
-                                    active_model = ""
-                                await ws.send_json({
-                                    "type": "config_update",
-                                    "config": {
-                                        "stt": stt_be, "tts": tts_be,
-                                        "llm": llm_be,
-                                        "llm_model": active_model,
-                                        "voice_mode": voice_mode,
-                                        "cloud_mode": voice_mode >= 1,
-                                    },
-                                })
-
-                                # v4·D Phase 4b vision capability advertisement.
-                                # Tab5's camera screen renders a "VISION · <model>
-                                # READY" chip based on this.  A model is
-                                # vision-capable when:
-                                #   1. cloud mode (2) + OpenRouter model matches
-                                #      a known vision id (gpt-4o, sonnet, etc)
-                                #   2. OR local mode (0) using ollama and the
-                                #      ollama_model name contains "vision"
-                                #      or "llava"
-                                # Per-frame cost estimates are rough mils-per-
-                                # frame for the Tab5 1280x720 capture sent as
-                                # a ~60 KB JPEG (= ~1500 image tokens at most
-                                # vendors).
-                                try:
-                                    vm = conn_config.llm.openrouter_model.lower() \
-                                        if voice_mode == 2 else ""
-                                    om = conn_config.llm.ollama_model.lower() \
-                                        if voice_mode == 0 else ""
-                                    vision_model = ""
-                                    per_frame_mils = 0
-                                    if voice_mode == 2:
-                                        if "gpt-4o" in vm:
-                                            vision_model = active_model
-                                            per_frame_mils = 1200  # ~$0.012/frame
-                                        elif "sonnet" in vm:
-                                            vision_model = active_model
-                                            per_frame_mils = 4500  # ~$0.045/frame
-                                        elif "haiku" in vm:
-                                            # Haiku 3.5 supports vision per OR
-                                            vision_model = active_model
-                                            per_frame_mils = 400
-                                    elif voice_mode == 0:
-                                        if "vision" in om or "llava" in om:
-                                            vision_model = active_model
-                                            per_frame_mils = 0  # local = free
-                                    await ws.send_json({
-                                        "type":           "vision_capability",
-                                        "can_see":        bool(vision_model),
-                                        "model":          vision_model,
-                                        "per_frame_mils": per_frame_mils,
-                                    })
-                                except Exception:
-                                    logger.exception("vision_capability emit failed")
-
-                            # v4·D Gauntlet G7-F: speak a short alert when the
-                            # Tab5 auto-downgrades because the daily cap was
-                            # hit.  The Tab5 tags its config_update with
-                            # reason="cap_downgrade" so the user hears why
-                            # their next turn is free even with the screen off.
-                            try:
-                                if cmd.get("reason") == "cap_downgrade":
-                                    pipeline = conn_state.get("pipeline")
-                                    if pipeline and hasattr(pipeline, "speak_system"):
-                                        # Wave 14 W14-C06: track the task so
-                                        # _handle_disconnect can cancel it if
-                                        # the user closes mid-utterance.
-                                        bg = conn_state["bg_tasks"]
-                                        t = asyncio.create_task(pipeline.speak_system(
-                                            "Daily budget cap reached. Switched back to local mode."
-                                        ))
-                                        bg.add(t)
-                                        t.add_done_callback(bg.discard)
-                            except Exception:
-                                logger.exception("cap_downgrade alert failed")
+                        # Phase 1 (issue #91): config_update body extracted
+                        # to _handle_config_update + spawned as task so the
+                        # WS read loop stays free during the (potentially
+                        # ~13 s) backend-swap window.  `conn_lock` is
+                        # acquired inside the handler — same US-P01
+                        # serialization with text/voice as before; the
+                        # difference is cancel/ping/voice frames stay
+                        # responsive instead of queueing.
+                        # Coalesce: if a previous config_update is still
+                        # in-flight, cancel it (last-write-wins matches
+                        # user intent — the latest mode toggle is the one
+                        # they want).
+                        await self._spawn_handler_task(
+                            conn_state, "config",
+                            self._handle_config_update, ws, conn_state, conn_config, cmd,
+                            conn_lock=conn_lock, coalesce=True,
+                        )
 
                     elif cmd_type == "widget_action":
                         # v4·D Phase 4g (audit P0 fix): Tab5 fires this
@@ -1484,6 +1240,87 @@ class VoiceServer:
 
         conn_state["pipeline"] = pipeline
         logger.info("Pipeline ready for %s", ws_id)
+
+    async def _spawn_handler_task(
+        self,
+        conn_state: dict,
+        slot: str,
+        coro_func,
+        *args,
+        conn_lock: asyncio.Lock | None = None,
+        coalesce: bool = False,
+    ) -> None:
+        """Spawn a per-connection command handler as an asyncio task.
+
+        Phase 1 of the UX-gap remediation (issue #91, see docs/UX-GAPS.md).
+        The text/media/config handlers used to be awaited inline in the
+        WS read loop, blocking it from receiving cancel/ping/voice frames
+        for the full duration of the handler.  This helper detaches them
+        as tracked tasks in `conn_state["handler_tasks"][slot]` so the
+        cancel handler can selectively kill any of them, and so
+        `_handle_disconnect` can clean them up on WS close.
+
+        Args:
+            conn_state: per-connection state dict (lives across the WS handler).
+            slot: name of the task slot ("text", "media", "config").
+            coro_func: the handler coroutine function to invoke.
+            *args: positional args passed to the handler.
+            conn_lock: if provided, acquired inside the spawned task before
+                       calling the handler (preserves prior US-P10 serialization
+                       semantics with the voice path).
+            coalesce: if True, cancel any in-flight task in the same slot
+                      before spawning the new one (last-write-wins — matches
+                      user intent for config_update mode toggles).  If False
+                      (default) the new task simply waits for `prev` to
+                      finish before starting (matches Tab5's "+1 QUEUED"
+                      stash semantics for text input).
+        """
+        handler_tasks = conn_state.setdefault("handler_tasks", {})
+        prev = handler_tasks.get(slot)
+        if prev and not prev.done():
+            if coalesce:
+                prev.cancel()
+                try:
+                    await prev
+                except (asyncio.CancelledError, Exception):
+                    # cancellation may surface as the underlying handler's
+                    # exception; suppressed because we're about to replace
+                    # it anyway.
+                    pass
+            else:
+                # Wait for the previous handler in this slot to finish before
+                # spawning the new one (preserves ordering for text turns).
+                try:
+                    await prev
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+        async def _run() -> None:
+            try:
+                if conn_lock is not None:
+                    async with conn_lock:
+                        await coro_func(*args)
+                else:
+                    await coro_func(*args)
+            except asyncio.CancelledError:
+                # Cancelled mid-handler — let it propagate so the task
+                # transitions to CANCELLED state.  Resource cleanup is
+                # the handler's responsibility (we've already cancelled
+                # any pipeline TTS subprocess in the cancel cmd path).
+                raise
+            except Exception:
+                # Handler raised — already logged inside the handler's
+                # own try/except.  Don't propagate to the WS loop or
+                # the loop dies on us; the WS catch at the outer
+                # `async for msg in ws` is for transport-level errors,
+                # not handler-level ones.
+                logger.exception(
+                    "handler_tasks[%s] raised — task will exit",
+                    slot,
+                )
+
+        task = asyncio.create_task(_run(), name=f"ws_handler:{slot}")
+        handler_tasks[slot] = task
 
     async def _handle_text(
         self, ws: web.WebSocketResponse, conn_state: dict, cmd: dict
@@ -1883,6 +1720,320 @@ class VoiceServer:
                 await ws.send_json({"type": "error", "code": "llm_failed",
                                     "message": "Text processing failed"})
 
+    async def _handle_config_update(
+        self,
+        ws: web.WebSocketResponse,
+        conn_state: dict,
+        conn_config: VoiceConfig,
+        cmd: dict,
+    ) -> None:
+        """Apply a Tab5 config_update — mode swap, model swap, key updates.
+
+        Phase 1 (issue #91): extracted from the inline WS dispatcher so it
+        can run as a tracked asyncio task without blocking the WS read loop.
+        Behavior is identical to the prior inline body — only difference is
+        former `continue` (skip remaining loop iterations) is now `return`
+        (exit this handler invocation).
+
+        C3 note (audit was wrong direction): the swap acquires `conn_lock`
+        which serializes it with text/voice paths.  Swap WAITS for any
+        in-flight inference to complete before running — never races it.
+        After Phase 1's task discipline, the WS read loop stays free even
+        while this handler is awaiting `conn_lock`, so cancel/ping/voice
+        frames remain responsive.
+        """
+        ws_id = conn_state.get("ws_id", "?")
+
+        # v4·D audit P1: rate-limit config_update to 2/sec/conn.  A buggy
+        # skill or trigger-happy test harness could storm mode swaps that
+        # each do heavy backend init.
+        _now_cfg = time.monotonic()
+        _last_cfg = conn_state.get("_last_config_update_ts", 0.0)
+        if _now_cfg - _last_cfg < 0.5:
+            logger.debug("config_update rate-limited on %s", ws_id)
+            return
+        conn_state["_last_config_update_ts"] = _now_cfg
+
+        # Three-tier voice mode: 0=local, 1=hybrid, 2=cloud, 3=tinkerclaw
+        voice_mode = cmd.get("voice_mode")
+        llm_model = cmd.get("llm_model")
+        # Backward compat: old binary cloud_mode toggle
+        cloud_mode = cmd.get("cloud_mode")
+        if cloud_mode is not None and voice_mode is None:
+            voice_mode = 2 if cloud_mode else 0
+
+        if voice_mode is not None:
+            # STT+TTS: local for mode 0, cloud for mode 1+2+3
+            if voice_mode == 0:
+                stt_be, tts_be = "moonshine", "piper"
+            elif voice_mode == 3:
+                # TinkerClaw mode: default local STT/TTS
+                # "cloud" suffix in llm_model → use OpenRouter STT/TTS
+                if llm_model and "cloud" in llm_model.lower():
+                    stt_be, tts_be = "openrouter", "openrouter"
+                else:
+                    stt_be, tts_be = "moonshine", "piper"
+            else:
+                stt_be, tts_be = "openrouter", "openrouter"
+
+            # LLM backend selection
+            if voice_mode == 3:
+                # TinkerClaw mode — gateway handles everything
+                llm_be = "tinkerclaw"
+                if llm_model:
+                    conn_config.llm.tinkerclaw_model = llm_model
+            elif voice_mode == 2:
+                llm_be = "openrouter"
+                if llm_model:
+                    conn_config.llm.openrouter_model = llm_model
+            else:
+                llm_be = conn_config.llm.local_backend or "ollama"
+                if llm_model and llm_be == "ollama" and "/" not in llm_model:
+                    conn_config.llm.ollama_model = llm_model
+                    logger.info("Local model switched to: %s", llm_model)
+
+            # Apply mode-aware system prompt and max_tokens
+            # Mode 3 (TinkerClaw): skip — TinkerClaw owns personality
+            if voice_mode == 3:
+                pass  # TinkerClaw manages its own prompts and limits
+            elif voice_mode == 0:
+                conn_config.llm.system_prompt = SYSTEM_PROMPT_LOCAL
+                conn_config.llm.max_tokens = MAX_TOKENS_LOCAL
+            elif voice_mode == 1:
+                conn_config.llm.system_prompt = SYSTEM_PROMPT_HYBRID
+                conn_config.llm.max_tokens = MAX_TOKENS_HYBRID
+            else:
+                conn_config.llm.system_prompt = SYSTEM_PROMPT_CLOUD
+                conn_config.llm.max_tokens = MAX_TOKENS_CLOUD
+
+            logger.info("Connection %s: voice_mode=%d → stt=%s tts=%s llm=%s model=%s tokens=%d",
+                        ws_id, voice_mode, stt_be, tts_be, llm_be,
+                        conn_config.llm.openrouter_model if voice_mode == 2 else "(local)",
+                        conn_config.llm.max_tokens)
+
+            # Validate TinkerClaw gateway is reachable before switching to mode 3
+            if voice_mode == 3:
+                try:
+                    tc_url = (conn_config.llm.tinkerclaw_url or "http://localhost:18789").rstrip("/")
+                    async with aiohttp.ClientSession(
+                        timeout=aiohttp.ClientTimeout(total=5)
+                    ) as tc_session:
+                        async with tc_session.get(f"{tc_url}/health") as tc_resp:
+                            if tc_resp.status != 200:
+                                logger.error("TinkerClaw health check returned %d", tc_resp.status)
+                                raise RuntimeError(f"health check returned {tc_resp.status}")
+                    logger.info("TinkerClaw gateway health OK at %s", tc_url)
+                except Exception as tc_err:
+                    logger.error("TinkerClaw gateway not reachable: %s", tc_err)
+                    # Audit G5 (2026-04-20): revert to Local so Tab5 doesn't
+                    # sit wedged on mode 3 showing an error. Matches the
+                    # OpenRouter-key-missing path below.
+                    if not ws.closed:
+                        await ws.send_json({
+                            "type": "config_update",
+                            "error": "TinkerClaw gateway is not reachable",
+                            "voice_mode": 0,
+                        })
+                    return
+
+            # Validate API key for cloud modes (1=Hybrid, 2=Cloud need OpenRouter)
+            # Mode 3 (TinkerClaw) doesn't need Dragon's OpenRouter key — uses own gateway
+            if voice_mode in (1, 2) and not conn_config.llm.openrouter_api_key:
+                logger.error("Cloud mode requested but no API key configured")
+                if not ws.closed:
+                    await ws.send_json({
+                        "type": "config_update",
+                        "error": "No OpenRouter API key configured",
+                        "voice_mode": 0,
+                    })
+                return
+
+            # Update session system prompt in DB for conversation engine
+            # Chat v4·C (refs #27): also persist voice_mode + llm_model
+            # onto the session row so the drawer surfaces the active
+            # mode fingerprint and pipeline-resume picks the right
+            # backends without a fresh config_update from the client.
+            sid = conn_state.get("session_id")
+            if sid and self._db:
+                # Resolve the best "active model" string to persist,
+                # matching the client-visible payload below.
+                if voice_mode == 2:
+                    active_model_db = conn_config.llm.openrouter_model or ""
+                elif llm_be == "tinkerclaw":
+                    active_model_db = conn_config.llm.tinkerclaw_model or ""
+                elif llm_be == "ollama":
+                    active_model_db = conn_config.llm.ollama_model or ""
+                else:
+                    active_model_db = str(llm_model or "")
+                try:
+                    await self._db.update_session(
+                        sid,
+                        system_prompt=conn_config.llm.system_prompt,
+                        voice_mode=int(voice_mode),
+                        llm_model=active_model_db[:128],
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to update session system_prompt / mode"
+                    )
+
+            # Apply config
+            conn_config.stt.backend = stt_be
+            conn_config.tts.backend = tts_be
+            conn_config.llm.backend = llm_be
+
+            # Propagate API keys for cloud STT/TTS backends (modes 1-2, or mode 3 with cloud STT)
+            if voice_mode in (1, 2) or (voice_mode == 3 and stt_be == "openrouter"):
+                conn_config.stt.openrouter_api_key = conn_config.llm.openrouter_api_key
+                conn_config.stt.openrouter_url = conn_config.llm.openrouter_url
+                conn_config.tts.openrouter_api_key = conn_config.llm.openrouter_api_key
+                conn_config.tts.openrouter_url = conn_config.llm.openrouter_url
+
+            # Hot-swap backends on pipeline AND conversation engine.
+            # Phase 1 (issue #91): conn_lock acquisition was previously here in
+            # the inline body; now handled by `_spawn_handler_task` on the
+            # outer task wrapper.  Same US-P01 serialization with stop/text
+            # handlers is preserved.
+            pipeline = conn_state.get("pipeline")
+            if pipeline:
+                try:
+                    # swap_backends() now handles cancel internally
+                    # and sets _swapping flag to drop audio during swap
+                    await pipeline.swap_backends(conn_config)
+                    # Inject session key for TinkerClaw conversation continuity
+                    if llm_be == "tinkerclaw" and hasattr(pipeline, '_llm'):
+                        if hasattr(pipeline._llm, 'set_session_key'):
+                            pipeline._llm.set_session_key(
+                                conn_state.get("session_id", ""))
+                except Exception as e:
+                    logger.exception(
+                        "Backend swap failed for %s",
+                        conn_state.get("ws_id", "?"),
+                    )
+                    # W15-C04: `_safe_send_json` owns the closed-check + send
+                    # atomically and doesn't raise if the socket closed after
+                    # our swap started.
+                    await self._safe_send_json(ws, {
+                        "type": "config_update",
+                        "error": f"Backend swap failed: {e}",
+                        "voice_mode": 0,
+                    })
+                    return
+
+            # Also swap ConversationEngine LLM (used by _handle_text).
+            # W15-C01: prefer the pooled instance so we don't re-load Ollama /
+            # re-open the aiohttp session on every config_update.  Only the
+            # pipeline owns the shutdown of a pooled backend.
+            if self._conversation:
+                try:
+                    from dragon_voice.llm import create_llm
+                    from dragon_voice.pipeline import _llm_sig
+                    new_key = _llm_sig(conn_config.llm)
+                    pooled = self._backend_pool.get(new_key)
+                    old_llm = self._conversation._llm
+                    if pooled is not None:
+                        new_llm = pooled
+                    else:
+                        new_llm = create_llm(conn_config.llm)
+                        await new_llm.initialize()
+                        self._backend_pool[new_key] = new_llm
+                    # Only shutdown the OLD one if nobody in the pool
+                    # references it (i.e. it wasn't pooled).
+                    if old_llm is not None and old_llm not in self._backend_pool.values():
+                        await old_llm.shutdown()
+                    self._conversation._llm = new_llm
+                    # 2026-04-23 (#58): also swap _llm_config so the
+                    # compact-vs-full tool prompt logic in
+                    # ConversationEngine._augment_context_with_tools picks the
+                    # right format for the active backend.  Without this,
+                    # cloud-mode agents stayed on the top-5 compact tool list
+                    # and never saw weather, stock_ticker, timesense_timer,
+                    # quick_poll, note, system_info, or unit_converter.
+                    self._conversation._llm_config = conn_config.llm
+                    logger.info("ConversationEngine LLM swapped to %s%s (backend=%s)",
+                                new_llm.name, " (pooled)" if pooled else "", conn_config.llm.backend)
+                except Exception as e:
+                    logger.exception("ConversationEngine LLM swap failed: %s", e)
+
+            # Update displayed names
+            self._stt_name = stt_be
+            self._tts_name = tts_be
+            self._llm_name = llm_be
+
+            # Confirm to Tab5
+            if not ws.closed:
+                # Report actual model for any mode
+                if voice_mode == 2:
+                    active_model = conn_config.llm.openrouter_model
+                elif llm_be == "tinkerclaw":
+                    active_model = conn_config.llm.tinkerclaw_model
+                elif llm_be == "ollama":
+                    active_model = conn_config.llm.ollama_model
+                else:
+                    active_model = ""
+                await ws.send_json({
+                    "type": "config_update",
+                    "config": {
+                        "stt": stt_be, "tts": tts_be,
+                        "llm": llm_be,
+                        "llm_model": active_model,
+                        "voice_mode": voice_mode,
+                        "cloud_mode": voice_mode >= 1,
+                    },
+                })
+
+                # v4·D Phase 4b vision capability advertisement.  Tab5's
+                # camera screen renders a "VISION · <model> READY" chip based
+                # on this.
+                try:
+                    vm = conn_config.llm.openrouter_model.lower() \
+                        if voice_mode == 2 else ""
+                    om = conn_config.llm.ollama_model.lower() \
+                        if voice_mode == 0 else ""
+                    vision_model = ""
+                    per_frame_mils = 0
+                    if voice_mode == 2:
+                        if "gpt-4o" in vm:
+                            vision_model = active_model
+                            per_frame_mils = 1200  # ~$0.012/frame
+                        elif "sonnet" in vm:
+                            vision_model = active_model
+                            per_frame_mils = 4500  # ~$0.045/frame
+                        elif "haiku" in vm:
+                            # Haiku 3.5 supports vision per OR
+                            vision_model = active_model
+                            per_frame_mils = 400
+                    elif voice_mode == 0:
+                        if "vision" in om or "llava" in om:
+                            vision_model = active_model
+                            per_frame_mils = 0  # local = free
+                    await ws.send_json({
+                        "type":           "vision_capability",
+                        "can_see":        bool(vision_model),
+                        "model":          vision_model,
+                        "per_frame_mils": per_frame_mils,
+                    })
+                except Exception:
+                    logger.exception("vision_capability emit failed")
+
+            # v4·D Gauntlet G7-F: speak a short alert when the Tab5
+            # auto-downgrades because the daily cap was hit.
+            try:
+                if cmd.get("reason") == "cap_downgrade":
+                    pipeline = conn_state.get("pipeline")
+                    if pipeline and hasattr(pipeline, "speak_system"):
+                        # Wave 14 W14-C06: track the task so
+                        # _handle_disconnect can cancel it if the user
+                        # closes mid-utterance.
+                        bg = conn_state["bg_tasks"]
+                        t = asyncio.create_task(pipeline.speak_system(
+                            "Daily budget cap reached. Switched back to local mode."
+                        ))
+                        bg.add(t)
+                        t.add_done_callback(bg.discard)
+            except Exception:
+                logger.exception("cap_downgrade alert failed")
+
     async def _handle_user_media(self, ws, conn_state, cmd):
         """Handle image/audio uploaded by Tab5 for multimodal LLM analysis."""
         import base64
@@ -1999,6 +2150,21 @@ class VoiceServer:
             for t in list(bg_tasks):
                 t.cancel()
             await asyncio.gather(*bg_tasks, return_exceptions=True)
+
+        # Phase 1 (issue #91): cancel any in-flight per-command handler
+        # tasks (text/media/config).  These are spawned by
+        # `_spawn_handler_task` and tracked in
+        # `conn_state["handler_tasks"]`.  Without this, a slow text
+        # turn that's still streaming to the LLM when Tab5 disconnects
+        # would keep generating tokens (and writing assistant
+        # messages to the DB on the now-dead session) until naturally
+        # complete.
+        handler_tasks = conn_state.get("handler_tasks") or {}
+        live = [t for t in handler_tasks.values() if t and not t.done()]
+        if live:
+            for t in live:
+                t.cancel()
+            await asyncio.gather(*live, return_exceptions=True)
 
         # v4·D Phase 4g: unregister the session's surface so skills that
         # kept a reference to it start seeing dropped sends explicitly.

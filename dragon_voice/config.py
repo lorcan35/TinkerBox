@@ -90,6 +90,12 @@ class LLMConfig:
     local_backend: str = ""  # Stores the original local backend for fallback (set at load time)
     ollama_url: str = "http://localhost:11434"
     ollama_model: str = "gemma3:4b"
+    # How long Ollama keeps the model resident after the last request.
+    # 30s avoids dual-model OOM on small Dragons (8 GB) by letting the
+    # un-used model evict quickly.  Dual-model setups (#80) override
+    # this to "5m" so both picker and responder stay warm across turns
+    # — otherwise each turn pays a ~30 s disk-reload tax twice.
+    ollama_keep_alive: str = "30s"
     openrouter_api_key: str = ""
     openrouter_model: str = "anthropic/claude-3-haiku"  # Default cloud model (user-selectable)
     openrouter_url: str = "https://openrouter.ai/api/v1"

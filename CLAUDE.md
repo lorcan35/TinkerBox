@@ -256,10 +256,16 @@ of model choice.
 - **Higher reply-rate, slightly slower** → `gemma3:4b`.  7/10 visible
   replies, 1 GB more RAM, 12 s slower per turn.  Worth A/B against ministral
   in real user sessions.
-- **Sub-second tool selection (future dual-model pipeline)** → `xLAM-2-1b-fc-r`
+- **Sub-second tool selection (dual-model pipeline, opt-in)** → `xLAM-2-1b-fc-r`
   picks tools fast (24 s median) but doesn't write conversational replies.
   Pair with a small responder model to combine strengths.  Not a default
-  candidate alone.
+  candidate alone.  PR #80 ships `backend: "dual"` for this — works
+  end-to-end on individual turns but **fails the sustained-gauntlet
+  validation gate on Dragon Q6A (11 GB RAM)** because xLAM + ministral
+  exceeds practical headroom and Ollama evicts the LRU model under
+  pressure.  See `docs/PLAN-dual-model-pipeline.md` "Validation results"
+  + LEARNINGS #80 for the matrix.  Default stays single-model on Dragon;
+  dual is recommended for ≥ 16 GB hardware only.
 - **Agentic chains where reliability matters** → mode 2 (Cloud, OpenRouter
   model picked per `llm_model`) or mode 3 (TinkerClaw Gateway).  Local mode
   with #74/#76/#77 is now usable, but cloud is still better for long chains.

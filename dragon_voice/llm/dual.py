@@ -87,6 +87,12 @@ def _build_subconfig(parent: LLMConfig, backend: str, model: str) -> LLMConfig:
     sub.backend = backend
     if backend == "ollama":
         sub.ollama_model = model
+        # Dual mode keeps both models hot — the default 30 s eviction
+        # would have either picker or responder reloading from disk on
+        # almost every turn, paying ~30 s twice per round-trip.  5 min
+        # comfortably spans a back-to-back gauntlet without giving up
+        # so much RAM that other Dragon services suffer.
+        sub.ollama_keep_alive = "5m"
     elif backend == "lmstudio":
         sub.lmstudio_model = model
     elif backend == "openrouter":

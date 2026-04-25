@@ -1,5 +1,11 @@
 # Wave 14 — Progress Tracker
 
+> **Historical (closed wave).**  Wave 14 wrapped on 2026-04-21 with all
+> critical/high items merged (PRs #67-#73).  This file is preserved as
+> the wave's per-item audit trail; it is **not** the live status doc.
+> For current sprint state see [`../CLAUDE.md`](../CLAUDE.md) "Current
+> Sprint" section + the GitHub issue list.
+
 Canonical status for every item in [docs/AUDIT.md](AUDIT.md). Update in the
 same commit that closes an item. Format: one line per ID with status, branch
 name, PR#, and one-sentence proof.

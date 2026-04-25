@@ -988,6 +988,31 @@ class VoiceServer:
                     "P13: Device %s already has connection %s — evicting stale connection",
                     device_id, old_ws_id,
                 )
+                # γ2-M5 (issue #108): tell the old client why it's being
+                # disconnected BEFORE we tear its pipeline down.  Pre-fix
+                # the client just saw TCP close and had no signal that
+                # another instance had claimed the slot — Tab5 would then
+                # auto-reconnect into the same eviction loop.  FATAL/DEVICE
+                # is the "operator action needed; do NOT auto-reconnect"
+                # signal Tab5 (γ2-H8) routes to the caption + retry banner.
+                old_on_event = old_conn.get("_on_event")
+                if old_on_event:
+                    try:
+                        await old_on_event(error_event(
+                            code="device_evicted",
+                            message="Another device claimed this session.",
+                            severity=Severity.FATAL,
+                            scope=Scope.DEVICE,
+                        ))
+                    except Exception as e:
+                        # Stale / closed WS — eviction must still proceed.
+                        # The user-visible signal is best-effort; the new
+                        # connection's success matters more.
+                        logger.debug(
+                            "P13: device_evicted notice not delivered to %s: %s",
+                            old_ws_id, e,
+                        )
+
                 # Shut down the old pipeline
                 old_pipeline = old_conn.get("pipeline")
                 if old_pipeline:

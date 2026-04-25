@@ -59,7 +59,9 @@ jobs:
             tests/test_mcp_bridge.py \
             tests/test_notes_db_async.py \
             tests/test_config_redact.py \
+            tests/test_device_evicted.py \
             tests/test_errors.py \
+            tests/test_tinkerclaw_health_check.py \
             tests/test_media_url_signer.py \
             tests/test_proxy_image_ssrf.py \
             tests/test_security_headers.py \

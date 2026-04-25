@@ -1,5 +1,15 @@
 # TinkerBox — Dragon Server Stack (THE BRAIN)
 
+## Active investigations — READ FIRST before related work
+
+- **UX-gap remediation (2026-04-25)** → see [`docs/UX-GAPS.md`](docs/UX-GAPS.md)
+  + master issue [#89](https://github.com/lorcan35/TinkerBox/issues/89).
+  21 verified gaps across 6 phases.  Phase 1 = WS dispatcher discipline
+  (text/multimodal cancel works, mode-swap stops freezing).  Read the doc
+  before touching anything in `_handle_text`, `_handle_user_media`,
+  `_handle_config_update`, `pipeline._process_utterance`, error emission
+  sites, dictation post-process, or the WS dispatcher.
+
 ## Repo Separation — READ THIS FIRST
 - **TinkerBox** (this repo) = Dragon Q6A server. Python. ALL intelligence lives here.
   - Owns: STT, LLM, TTS, embeddings, session management, conversation engine, REST API, dashboard, database

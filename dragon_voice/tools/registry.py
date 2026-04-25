@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 # XML-style markers for tool calls in LLM output.
 #
-# Two dialects are accepted:
+# Three dialects are accepted:
 #
 #   1. LEGACY (TinkerBox system-prompt format):
 #        <tool>NAME</tool><args>{"k": "v"}</args>
@@ -26,14 +26,23 @@ logger = logging.getLogger(__name__)
 #      were fine-tuned on.  Accepting it here means we don't have to fight
 #      the training prior of every FC model we want to run.
 #
-# Both shapes are extracted into the same `{"tool": name, "args": dict}`
+#   3. BRACKETED-NAME (xLAM quirk, surfaced during the dual-pipeline bench
+#      in #80 / #81 — issue #82):
+#        [NAME]{"k": "v"}</NAME>     — JSON args + matching close
+#        [NAME]UPPERCASE_IDENT()     — empty args, function-call-style noise
+#      The skill name IS the tag, with the open form using square brackets.
+#      To avoid false positives on user prose like `[note]` quoted in a
+#      chat reply, this dialect REQUIRES the name to be in the registered
+#      tool set.  Without that gate, parser would fire on innocent text.
+#
+# All three shapes are extracted into the same `{"tool": name, "args": dict}`
 # record, so downstream execute() + server eventing is format-agnostic.
 #
 # Tolerance knobs inherited from the prior implementation:
 #   - Stray `>` after JSON, missing `</args>`, extra whitespace all handled.
-#   - xLAM quirk: emits `[tool>` (left-bracket instead of left-angle) on
-#     the opening tag — the anchor regex now accepts either, since the
-#     closing `</tool>` still disambiguates unambiguously.
+#   - xLAM quirk on dialect 1: emits `[tool>` (left-bracket instead of
+#     left-angle) on the opening tag — the anchor regex accepts either,
+#     since the closing `</tool>` still disambiguates unambiguously.
 #
 # Tolerant regex: handles stray > after JSON, missing </args>, extra whitespace.
 # The `[<\[]tool[>\]]` open-tag class accepts `<tool>`, `[tool>`, `<tool]`, AND
@@ -42,6 +51,17 @@ logger = logging.getLogger(__name__)
 TOOL_PATTERN = re.compile(r'[<\[]tool[>\]](\w+)</tool>\s*<args>\s*({.*?})\s*>?\s*</args>', re.DOTALL)
 # Fallback: if </args> is missing entirely, grab JSON after <args>
 TOOL_PATTERN_LOOSE = re.compile(r'[<\[]tool[>\]](\w+)</tool>\s*<args>\s*({[^<]*})', re.DOTALL)
+
+# Dialect 3 cheap pre-check — used by has_tool_call.  Matches `[name]`
+# where `name` looks like a registered-tool identifier.  False positives
+# at this stage are fine; parse_tool_calls validates against the tool
+# registry before accepting.
+_BRACKET_NAME_PRECHECK = re.compile(r"\[([a-z_][a-z0-9_]*)\]")
+# Dialect 3 noise-args sanity check — the GETCURRENTDATEANDTIME() form
+# from xLAM should look like a function name (uppercase identifier),
+# not prose.  3-50 chars keeps real-world cases without exploding the
+# match window.
+_BRACKET_NOISE_IDENT = re.compile(r"^[A-Z][A-Z0-9_]{2,49}$")
 
 
 class ToolRegistry:
@@ -173,20 +193,102 @@ class ToolRegistry:
                 args = {}
             calls.append({"tool": name, "args": args})
 
+        # Dialect 3 — bracketed-name (xLAM quirk, issue #82).
+        # `[recall]{"query":"…"}</recall>` or `[datetime]GETCURRENTTIME()`.
+        # The skill name IS the tag, so without a registry validation step
+        # we'd false-positive on prose like `[note]` quoted in a chat
+        # reply.  Skip the pass entirely if no tools are registered (the
+        # validation gate would reject everything anyway).
+        if self._tools:
+            for m in _BRACKET_NAME_PRECHECK.finditer(text):
+                name = m.group(1)
+                if name not in self._tools:
+                    continue
+                i = m.end()
+                # Skip whitespace immediately after the opening bracket.
+                while i < len(text) and text[i] in " \t\n\r":
+                    i += 1
+                if i >= len(text):
+                    continue
+
+                args: Optional[dict] = None
+
+                if text[i] == "{":
+                    # Sub-form A: `[NAME]{json}</NAME>` — JSON args + close.
+                    end = _walk_json(text, i)
+                    if end < 0:
+                        continue
+                    try:
+                        parsed_args = json.loads(text[i:end])
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            "Failed to parse bracket-name args for %s: %s",
+                            name, text[i:end][:100],
+                        )
+                        continue
+                    if not isinstance(parsed_args, dict):
+                        continue
+                    args = parsed_args
+                    # The matching `</NAME>` close tag is *encouraged* but not
+                    # required — xLAM emits it cleanly on most prompts but
+                    # truncates on others.  We accept either way.
+                else:
+                    # Sub-form B: `[NAME]IDENT()` — empty args, function-name
+                    # noise.  Bail if the noise spans more than ~50 chars
+                    # (real-world cases like GETCURRENTDATEANDTIME stay
+                    # well under that) or doesn't look like an identifier.
+                    paren = text.find("()", i, i + 80)
+                    if paren < 0:
+                        continue
+                    noise = text[i:paren].strip()
+                    if not _BRACKET_NOISE_IDENT.match(noise):
+                        continue
+                    args = {}
+
+                if args is not None:
+                    calls.append({"tool": name, "args": args})
+
         return calls
 
     def has_tool_call(self, text: str) -> bool:
         """Quick check if text contains a tool call marker.
-        Accepts both dialects the parser understands: the legacy
-        `<tool>NAME</tool>` shape and the industry-standard
-        `<tool_call>{...}</tool_call>` shape.
+        Accepts the three dialects the parser understands: the legacy
+        `<tool>NAME</tool>` shape, the industry-standard
+        `<tool_call>{...}</tool_call>` shape, and the bracketed-name
+        xLAM quirk `[NAME]{json}</NAME>` / `[NAME]IDENT()` (gated on the
+        name actually matching a registered tool, so prose like
+        `[note]` in a chat reply doesn't fire).
         """
         has_legacy = (
             ("<tool>" in text or "[tool>" in text or "[tool]" in text or "<tool]" in text)
             and "</tool>" in text
         )
         has_std = "<tool_call>" in text and "</tool_call>" in text
-        return has_legacy or has_std
+        if has_legacy or has_std:
+            return True
+
+        if not self._tools:
+            return False
+        for m in _BRACKET_NAME_PRECHECK.finditer(text):
+            if m.group(1) not in self._tools:
+                continue
+            # Peek past whitespace for the `{` (sub-form A) or
+            # `<word>(` (sub-form B) that distinguishes a real call
+            # from prose that happens to mention `[recall]`.  Without
+            # this guard, `has_tool_call` over-fires on chat replies
+            # whenever a tool name appears in brackets.
+            j = m.end()
+            while j < len(text) and text[j] in " \t\n\r":
+                j += 1
+            if j >= len(text):
+                continue
+            if text[j] == "{":
+                return True
+            # Sub-form B: identifier+`()` should appear within the same
+            # window parse_tool_calls scans.
+            if "()" in text[j:j + 80]:
+                return True
+        return False
 
     def format_for_llm(self, compact: bool = False) -> str:
         """Format tool descriptions for injection into LLM system prompt.

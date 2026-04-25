@@ -26,7 +26,7 @@ fi
 
 # Make scripts executable
 echo "[3/3] Setting permissions..."
-chmod +x launch-chromium.sh start.sh install-services.sh 2>/dev/null || true
+chmod +x launch-chromium.sh start.sh 2>/dev/null || true
 
 echo ""
 echo "Setup complete! Run ./start.sh to launch TinkerBox."

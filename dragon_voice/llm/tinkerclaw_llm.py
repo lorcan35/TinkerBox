@@ -10,14 +10,30 @@ import asyncio
 import json
 import logging
 import re
+import time
 from typing import AsyncIterator, Optional
 
 import aiohttp
 
 from dragon_voice.config import LLMConfig
+from dragon_voice.errors import DragonError, Scope, Severity
 from dragon_voice.llm.base import LLMBackend
 
 logger = logging.getLogger(__name__)
+
+# γ2-M6 (issue #106) — fast-fail health check budget.
+#
+# HEALTH_CHECK_TIMEOUT_S = how long a single /health probe is allowed
+# to block.  5 s is well under Tab5's PONG-watch (~30 s) so a probe
+# during a slow-startup-recovery scenario can't itself trip the
+# eviction race.
+#
+# HEALTH_CACHE_TTL_S = how long a probe result is reused before re-
+# probing.  30 s is short enough that recovery after the gateway
+# comes back is felt within a turn or two, but long enough that the
+# happy path doesn't pay 5 s on every single user turn.
+HEALTH_CHECK_TIMEOUT_S = 5
+HEALTH_CACHE_TTL_S = 30
 
 # Wave 14 W14-M07: per-line + total-stream caps for the TinkerClaw SSE
 # parser.  The gateway is trusted in theory, but a bug on the other
@@ -111,6 +127,12 @@ class TinkerClawBackend(LLMBackend):
         self._model = config.tinkerclaw_model or "minimax/MiniMax-M2.5"
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_key: Optional[str] = None
+        # γ2-M6 (issue #106): cached health-check state.
+        # _health_cache_until=0.0 means "no cached result, must probe
+        # on next is_healthy() call".  Both fields are set together
+        # by is_healthy() and seeded by initialize().
+        self._health_cache_ok: bool = False
+        self._health_cache_until: float = 0.0
 
     async def initialize(self) -> None:
         headers = {"Content-Type": "application/json"}
@@ -129,15 +151,69 @@ class TinkerClawBackend(LLMBackend):
             headers=headers,
         )
 
-        # Health check — verify gateway is reachable (non-fatal if down)
+        # γ2-M6 (issue #106): seed the health cache so the first request
+        # after boot is fast — no extra 5 s probe just because we forgot
+        # we already checked at init.  Force=True bypasses the empty
+        # cache check and writes the result regardless.
+        await self.is_healthy(force=True)
+
+    async def is_healthy(self, force: bool = False) -> bool:
+        """Probe the TC gateway's /health endpoint with caching.
+
+        γ2-M6 (issue #106) — the audit identified that when the gateway
+        is reachable at TCP layer but hung / dead at app layer, the
+        first POST blocks for the full 600 s sock_read window.  This
+        method gives ``generate_stream_with_messages`` a 5 s yes/no
+        answer with 30 s caching so the user doesn't wait 10 minutes
+        before the connection-error fallback fires.
+
+        Parameters
+        ----------
+        force:
+            If True, bypass the cache and always re-probe.  Use for
+            ops debugging (manual recovery check after restarting the
+            gateway) — production callers leave it False.
+
+        Returns
+        -------
+        bool
+            True if /health returned 200 within HEALTH_CHECK_TIMEOUT_S,
+            False otherwise (any non-200, ClientError, TimeoutError).
+            Never raises.
+        """
+        now = time.monotonic()
+        if not force and now < self._health_cache_until:
+            return self._health_cache_ok
+
+        if self._session is None or self._session.closed:
+            # No live session means we haven't initialised yet.
+            self._health_cache_ok = False
+            self._health_cache_until = now + HEALTH_CACHE_TTL_S
+            return False
+
+        ok = False
         try:
-            async with self._session.get(f"{self._url}/health") as resp:
-                if resp.status == 200:
-                    logger.info("TinkerClaw gateway connected at %s", self._url)
+            async with self._session.get(
+                f"{self._url}/health",
+                timeout=aiohttp.ClientTimeout(total=HEALTH_CHECK_TIMEOUT_S),
+            ) as resp:
+                ok = resp.status == 200
+                if not ok:
+                    logger.warning(
+                        "TinkerClaw health check returned %d", resp.status
+                    )
                 else:
-                    logger.warning("TinkerClaw health check returned %d", resp.status)
-        except aiohttp.ClientError as e:
-            logger.warning("TinkerClaw gateway not reachable at %s: %s (will retry on first request)", self._url, e)
+                    logger.debug("TinkerClaw health check OK")
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+            logger.warning(
+                "TinkerClaw health check failed: %s (cached for %ds)",
+                e, HEALTH_CACHE_TTL_S,
+            )
+        # Cache regardless of outcome — both healthy and unhealthy
+        # results get the TTL so we don't spam-probe a down gateway.
+        self._health_cache_ok = ok
+        self._health_cache_until = now + HEALTH_CACHE_TTL_S
+        return ok
 
     def set_session_key(self, session_key: str) -> None:
         """Set the session key for conversation continuity.
@@ -183,6 +259,20 @@ class TinkerClawBackend(LLMBackend):
         """
         if not self._session or self._session.closed:
             await self.initialize()
+
+        # γ2-M6 (issue #106): fast-fail before the 600 s POST when the
+        # gateway is known to be down.  is_healthy() uses a 30 s cached
+        # result so the happy path doesn't pay for a probe per turn;
+        # only the first turn after the gateway goes down (or after the
+        # cache expires) waits the 5 s probe budget.
+        if not await self.is_healthy():
+            raise DragonError(
+                "TinkerClaw agent gateway isn't responding — "
+                "fall back to local mode and try again.",
+                code="gateway_unreachable",
+                severity=Severity.FATAL,
+                scope=Scope.GATEWAY,
+            )
 
         payload = {
             "model": self._model,

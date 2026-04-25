@@ -17,7 +17,7 @@ from typing import Callable, Awaitable, Optional
 import numpy as np
 
 from dragon_voice.config import VoiceConfig
-from dragon_voice.errors import Scope, Severity, error_event
+from dragon_voice.errors import DragonError, Scope, Severity, error_event
 from dragon_voice.stt import create_stt, STTBackend
 from dragon_voice.tts import create_tts, TTSBackend
 from dragon_voice.llm import create_llm, LLMBackend
@@ -993,6 +993,19 @@ class VoicePipeline:
 
         except asyncio.CancelledError:
             logger.info("Pipeline processing was cancelled")
+        except DragonError as e:
+            # γ2-M6 (issue #106): structured γ-arch errors (e.g. TC
+            # gateway fast-fail) carry severity + scope already.
+            # Forward as-is instead of collapsing to the generic
+            # `pipeline_failed` toast — Tab5 routes by scope (γ2-H8).
+            logger.warning(
+                "Pipeline received structured error: %s (code=%s, scope=%s)",
+                e.message, e.code, e.scope.value,
+            )
+            try:
+                await self._on_event(e.to_event())
+            except (ConnectionError, RuntimeError) as _e:
+                logger.debug("structured-error notice not delivered: %s", _e)
         except Exception:
             logger.exception("Pipeline processing error")
             try:

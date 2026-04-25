@@ -30,7 +30,7 @@ from dragon_voice.config import (
 )
 from dragon_voice.conversation import ConversationEngine
 from dragon_voice.db import Database
-from dragon_voice.errors import Scope, Severity, error_event
+from dragon_voice.errors import DragonError, Scope, Severity, error_event
 from dragon_voice.messages import MessageStore
 from dragon_voice.handlers import (
     config_api as _handlers_config_api,
@@ -1411,13 +1411,30 @@ class VoiceServer:
             # slow for a 90 s 4 B-class Ollama turn.  See docs/AUDIT.md
             # "Local-mode gauntlet" for the observed P13-eviction race.
             full_response = []
-            async with self._ws_keepalive_during_inference(ws, label="tc_text"):
-                async for token in llm.generate_stream_with_messages([
-                    {"role": "user", "content": text}
-                ]):
-                    full_response.append(token)
-                    if not ws.closed:
-                        await ws.send_json({"type": "llm", "text": token})
+            try:
+                async with self._ws_keepalive_during_inference(ws, label="tc_text"):
+                    async for token in llm.generate_stream_with_messages([
+                        {"role": "user", "content": text}
+                    ]):
+                        full_response.append(token)
+                        if not ws.closed:
+                            await ws.send_json({"type": "llm", "text": token})
+            except DragonError as e:
+                # γ2-M6 (issue #106): TC gateway pre-flight health check
+                # failed in ≤ 5 s.  Emit the structured γ1 error frame
+                # so Tab5 can surface a FATAL/GATEWAY banner — pre-fix
+                # the user waited the full 600 s sock_read timeout
+                # before the connection-error fallback fired.
+                logger.warning(
+                    "TC text path fast-failed: %s (code=%s)",
+                    e.message, e.code,
+                )
+                if not ws.closed:
+                    await self._safe_send_json(ws, e.to_event())
+                    await ws.send_json({
+                        "type": "llm_done", "llm_ms": 0, "text": "",
+                    })
+                return
 
             response_text = "".join(full_response)
 

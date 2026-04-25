@@ -69,4 +69,5 @@ jobs:
             tests/test_tool_parser.py \
             tests/test_dual_llm.py \
             tests/test_ws_dispatcher_cancellation.py \
-            tests/test_dictation_post_process_events.py
+            tests/test_dictation_post_process_events.py \
+            tests/test_incremental_tool_marker_detection.py

@@ -50,6 +50,12 @@ class OllamaBackend(LLMBackend):
         self._config = config
         self._base_url = config.ollama_url.rstrip("/")
         self._model = config.ollama_model
+        # Per-instance keep-alive — sourced from config so dual-model
+        # sub-backends can opt into a longer hold without the 30 s
+        # default reload-thrashing the picker/responder pair.  Falls
+        # back to the class constant for backward compat with anything
+        # still poking KEEP_ALIVE directly.
+        self._keep_alive = getattr(config, "ollama_keep_alive", "") or self.KEEP_ALIVE
         self._session: aiohttp.ClientSession | None = None
         self._last_usage: dict = {}
         self._conversation: list[dict] = []
@@ -126,7 +132,7 @@ class OllamaBackend(LLMBackend):
                 "model": self._model,
                 "messages": messages,
                 "stream": True,
-                "keep_alive": self.KEEP_ALIVE,
+                "keep_alive": self._keep_alive,
                 "options": {
                     "num_predict": self._config.max_tokens,
                     "temperature": self._config.temperature,
@@ -196,7 +202,7 @@ class OllamaBackend(LLMBackend):
             "model": self._model,
             "messages": messages,
             "stream": True,
-            "keep_alive": self.KEEP_ALIVE,
+            "keep_alive": self._keep_alive,
             "options": {
                 "num_predict": self._config.max_tokens,
                 "temperature": self._config.temperature,

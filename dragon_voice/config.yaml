@@ -32,7 +32,7 @@ tts:
 
 llm:
   local_backend: "ollama"  # Stores original local backend for cloud-to-local fallback
-  backend: "ollama"  # ollama, openrouter, lmstudio, npu_genie, tinkerclaw
+  backend: "ollama"  # ollama, openrouter, lmstudio, npu_genie, tinkerclaw, dual
   # ollama
   ollama_url: "http://localhost:11434"
   # Default local LLM for voice_mode=0 (Local) and the LLM side of mode 1 (Hybrid).
@@ -61,6 +61,16 @@ llm:
   # token resolves to blank, so a misconfigured gateway no-ops loudly.
   tinkerclaw_token: ""
   tinkerclaw_model: "minimax/MiniMax-M2.5"
+
+  # Dual-model pipeline (used only when backend=="dual").  Pairs a fast
+  # tool-picker (xLAM) with a warm responder (ministral) — see
+  # docs/PLAN-dual-model-pipeline.md.  Sub-backends default to "ollama"
+  # if blank.  To opt in: set `backend: "dual"` above; everything else
+  # stays the same.
+  dual_picker_backend: ""
+  dual_picker_model: "hf.co/Salesforce/xLAM-2-1b-fc-r-gguf:Q4_K_M"
+  dual_responder_backend: ""
+  dual_responder_model: "ministral-3:3b"
 
   system_prompt: "You are Tinker, a helpful AI assistant. Reply in 1-2 sentences maximum. Be concise. Never simulate user responses. Never generate text after your answer. Stop immediately after answering."
   max_tokens: 256

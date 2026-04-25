@@ -9,6 +9,7 @@ _BACKENDS = {
     "lmstudio": "dragon_voice.llm.lmstudio_llm.LMStudioBackend",
     "npu_genie": "dragon_voice.llm.npu_genie.NPUGenieBackend",
     "tinkerclaw": "dragon_voice.llm.tinkerclaw_llm.TinkerClawBackend",
+    "dual": "dragon_voice.llm.dual.DualModelBackend",
 }
 
 

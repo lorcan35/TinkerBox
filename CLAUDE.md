@@ -221,6 +221,7 @@ for the full per-prompt matrix and the prior 5-prompt baseline.
 | qwen3:4b | 2.5 GB | 92 s | 0/10 ⚠️ | 0/10 ⚠️ | n/a (no content) | **Phase-1a fixed the connection** — 92 s × 10 prompts no longer triggers P13 eviction.  But the model itself produces no usable content; can't be fixed server-side. |
 | qwen3.5:4b | 3.2 GB | 95 s | 0/10 ⚠️ | 0/10 ⚠️ | — | Same as qwen3:4b — keepalive holds, content empty. |
 | nemotron-3-nano:4b | 2.6 GB | 92 s | 1/10 ⚠️ | 0/10 ⚠️ | — | Same shape; one tool fired, no visible reply. |
+| distil-home-assistant-functiongemma | 2.4 GB | 81 s | **0/10** | **0/10** | ❌ never finished calc | **Worst tested model.**  Despite the "FunctionGemma" branding, emits zero tool markers and dumps raw chain-of-thought fragments truncated mid-thought (`"Let me calculate that. First, I need to multiply 456 by 789. Hmm, that's a big number. Maybe I can use the…"`).  No facts stored, no math answered, no tools fired across all 10 prompts.  `mem_facts_added_last_3min=0` confirms G3 fact-store didn't reach the DB either.  Failure class 3 (fluent hallucinator) at its worst.  Reject. |
 
 ⚠️ "0/10 user-visible" on the 4B-class block is post-#76 keepalive — pre-fix
 they were 0/5 with P13 eviction errors.  The connection now stays open the
@@ -255,10 +256,16 @@ of model choice.
 - **Higher reply-rate, slightly slower** → `gemma3:4b`.  7/10 visible
   replies, 1 GB more RAM, 12 s slower per turn.  Worth A/B against ministral
   in real user sessions.
-- **Sub-second tool selection (future dual-model pipeline)** → `xLAM-2-1b-fc-r`
+- **Sub-second tool selection (dual-model pipeline, opt-in)** → `xLAM-2-1b-fc-r`
   picks tools fast (24 s median) but doesn't write conversational replies.
   Pair with a small responder model to combine strengths.  Not a default
-  candidate alone.
+  candidate alone.  PR #80 ships `backend: "dual"` for this — works
+  end-to-end on individual turns but **fails the sustained-gauntlet
+  validation gate on Dragon Q6A (11 GB RAM)** because xLAM + ministral
+  exceeds practical headroom and Ollama evicts the LRU model under
+  pressure.  See `docs/PLAN-dual-model-pipeline.md` "Validation results"
+  + LEARNINGS #80 for the matrix.  Default stays single-model on Dragon;
+  dual is recommended for ≥ 16 GB hardware only.
 - **Agentic chains where reliability matters** → mode 2 (Cloud, OpenRouter
   model picked per `llm_model`) or mode 3 (TinkerClaw Gateway).  Local mode
   with #74/#76/#77 is now usable, but cloud is still better for long chains.

@@ -41,6 +41,89 @@ def _strip_tool_markup(text: str) -> str:
     return _TOOL_MARKUP_RE.sub("", text)
 
 
+# Phase 2 H1 (issue #94): tool-call marker openers we recognize.  When
+# any of these appears in the streaming buffer we hold back tokens from
+# that position onward so we don't yield half-formed tool markup to the
+# user.  See `_split_at_marker_boundary` for the rolling-detection
+# semantics.
+#
+# Dialect coverage (must stay in sync with `tools/registry.py`):
+#   1. Legacy + xLAM bracket quirks: `<tool>`, `[tool>`, `<tool]`, `[tool]`
+#   2. Standard FC: `<tool_call>`
+#   3. Bracketed-name (xLAM dialect 3): `[NAME]` — added at runtime
+#      from the tool registry by `_split_at_marker_boundary`
+_TOOL_MARKER_OPENERS_STATIC: tuple[str, ...] = (
+    "<tool>",
+    "[tool>",
+    "<tool]",
+    "[tool]",
+    "<tool_call>",
+)
+
+
+def _split_at_marker_boundary(
+    accumulated: str,
+    registered_tool_names: set[str] | None = None,
+) -> tuple[str, str]:
+    """Split `accumulated` into (flushable, held) at the earliest tool-marker
+    boundary so the caller can stream the flushable prefix while waiting
+    for the held suffix to either complete into a parseable tool call or
+    turn out to be benign prose.
+
+    The boundary is the leftmost position of:
+      * any complete known opener anywhere in the string, OR
+      * a strict-prefix match of any known opener at the END of the string
+        (i.e. an in-flight opener that hasn't completed yet)
+
+    If neither condition fires, returns `(accumulated, "")` — everything
+    is safe to flush right now.
+
+    Notes
+    -----
+    * Stateless: callers re-invoke after each token append, passing the
+      full accumulated buffer.  Cheap because the registered-tool set is
+      small (~15 entries) and the openers are short.
+    * Conservative on registered-tool dialect-3 partials: matches only on
+      `[NAME]` (complete close-bracket) — we don't try to match a `[NAM`
+      partial because false positives on prose like "[New York]" would
+      stutter the stream visibly.  The complete-marker check still catches
+      `[NAME]` once the close-bracket arrives.
+    """
+    # Two opener sets — they have different partial-matching semantics:
+    #   * static openers participate in BOTH complete + tail-partial matching
+    #   * dialect-3 `[NAME]` openers participate ONLY in complete matching
+    #     because partial-matching them (e.g. holding back `[recal` on the
+    #     way to `[recall]`) would also stutter on benign prose like
+    #     `[Star Trek` or `[Mr. Smith` and visibly break streaming.
+    static_openers: list[str] = list(_TOOL_MARKER_OPENERS_STATIC)
+    dialect3_openers: list[str] = (
+        [f"[{n}]" for n in registered_tool_names] if registered_tool_names else []
+    )
+
+    hold_at = len(accumulated)
+
+    # 1) Earliest complete opener anywhere (both sets).
+    for op in static_openers + dialect3_openers:
+        idx = accumulated.find(op)
+        if 0 <= idx < hold_at:
+            hold_at = idx
+
+    # 2) Tail partial — strict prefix of any STATIC opener at the end
+    #    of the string.  Dialect-3 openers deliberately excluded; see
+    #    note above.
+    max_op_len = max((len(o) for o in static_openers), default=0)
+    tail_window = accumulated[-max_op_len:] if max_op_len else ""
+    for op in static_openers:
+        for partial_len in range(1, len(op)):
+            if tail_window.endswith(op[:partial_len]):
+                tail_start = len(accumulated) - partial_len
+                if tail_start < hold_at:
+                    hold_at = tail_start
+                break  # found longest partial for this opener; move on
+
+    return accumulated[:hold_at], accumulated[hold_at:]
+
+
 class ConversationEngine:
     """Processes text input through the LLM with persistent context.
 
@@ -255,14 +338,45 @@ class ConversationEngine:
         t0 = time.monotonic()
         tool_calls_made = 0
 
+        # Phase 2 H1 (issue #94): registered-tool name set is needed at
+        # streaming time for dialect-3 ([NAME]{json}) marker detection.
+        # Captured once per turn; live registry mutations between turns
+        # are fine because we re-fetch each iteration's loop.
+        tool_names: set[str] = (
+            set(self._tool_registry._tools.keys())
+            if self._tool_registry else set()
+        )
+
         while True:
             # Stream LLM response
             full_response = []
+            # Phase 2 H1 (issue #94): rolling buffer for marker-aware
+            # streaming.  Pre-fix this loop suppressed every yield when
+            # `tool_registry` was set, accumulated the entire LLM output
+            # in `full_response`, and emitted a single yield at the
+            # bottom — Tab5 stared at a silent caption for 60-90 s on
+            # every tool-calling local turn.
+            #
+            # New behaviour: stream tokens immediately UNTIL a known
+            # tool-marker opener appears in the rolling buffer.  Hold
+            # back from the marker-start onward; once the LLM finishes
+            # we either parse + execute a tool call (existing path) or
+            # treat the held buffer as benign prose and flush it (with
+            # `_strip_tool_markup` for safety).
+            #
+            # `_split_at_marker_boundary` is the rolling-detection
+            # primitive — see its docstring for boundary rules.
+            held = ""
             async for token in self._llm.generate_stream_with_messages(context):
                 full_response.append(token)
-                # Don't yield tokens if this might be a tool call (buffer first)
                 if not self._tool_registry:
+                    # No registry → no tool detection needed; raw stream.
                     yield token
+                    continue
+                held += token
+                flushable, held = _split_at_marker_boundary(held, tool_names)
+                if flushable:
+                    yield flushable
 
             response_text = "".join(full_response)
 
@@ -319,13 +433,20 @@ class ConversationEngine:
                     continue  # Loop back for next LLM call
 
             # No tool call (or max reached) — this is the final response.
-            # Audit D5: strip any leftover `<tool>...</tool><args>...</args>`
-            # blocks before yielding; otherwise the user sees raw XML in the
-            # chat bubble (happens when the LLM emitted tool markup after
-            # MAX_TOOL_CALLS was hit, or when has_tool_call matched but
-            # parse_tool_calls rejected the payload).
-            if self._tool_registry:
-                cleaned = _strip_tool_markup(response_text)
+            # Phase 2 H1 (issue #94): the streaming loop above has already
+            # yielded everything up to the last marker-opener boundary.
+            # `held` is the residual tail from the marker onward — usually
+            # empty (no in-flight markers), or contains text that LOOKED
+            # like a tool start but never completed (benign prose with
+            # `<tool` literal, or malformed markup the parser rejected).
+            #
+            # Audit D5: still run `_strip_tool_markup` on the held tail so
+            # if it DID contain a complete-but-unparseable
+            # `<tool>X</tool><args>{}</args>` block (happens when the LLM
+            # emitted markup after MAX_TOOL_CALLS was hit) the user
+            # doesn't see raw XML.  Most turns this is a no-op.
+            if self._tool_registry and held:
+                cleaned = _strip_tool_markup(held)
                 if cleaned:
                     yield cleaned
 

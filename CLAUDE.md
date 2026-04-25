@@ -374,11 +374,17 @@ Dragon is an API-first server. Every capability is accessible via REST so any ha
 
 Dragon is an agent, not just a voice parrot. The LLM can call tools:
 - **Tool-calling:** LLM outputs `<tool>name</tool><args>{...}</args>` → parsed → executed → result injected → LLM continues
+- **Three accepted dialects** (see `dragon_voice/tools/registry.py` module docstring + LEARNINGS #79):
+  1. **Legacy** — `<tool>NAME</tool><args>{json}</args>` (TinkerBox system-prompt format; ministral, gemma3 emit this).  Tolerates xLAM bracket quirks (`[tool>`, `<tool]`, `[tool]`).
+  2. **Standard** — `<tool_call>{"name": "...", "arguments": {...}}</tool_call>` (industry-typical FC fine-tunes; Qwen-FC, Gemma-FC, distil-* all emit this regardless of system prompt).
+  3. **Bracketed-name** — `[NAME]{json}</NAME>` or `[NAME]UPPERCASE_IDENT()` (xLAM quirk surfaced in #82).  Gated on `NAME` being in the registered tool set so prose like `[note]` in chat doesn't false-fire.
 - **Built-in tools:** `web_search` (SearXNG, self-hosted on port 8888, returns up to 44 results), `remember` (store fact), `recall` (search memory), `datetime`, plus additional tools (10 total)
 - **Compact tool format:** For local models with limited context, tool definitions are sent in a compact XML format to minimize token usage
 - **Memory-augmented context:** Before every LLM call, relevant facts + document chunks injected into system prompt
 - **WebSocket events:** `tool_call` and `tool_result` events sent to connected clients during tool execution
 - **Max 3 tool calls per turn** to prevent infinite loops
+- **Empty-reply guard (`tools/response_wrap.py`, #77):** Some FC-trained models (xLAM, distil-functiongemma, LFM2.5-Nova) emit a tool call and stop — leaving the user-visible text empty after the parser strips the markup.  When that happens AND at least one tool fired, Dragon synthesizes a one-line natural-language ack from the tool result (per-tool template library, no extra LLM call).  See `dragon_voice/tools/response_wrap.py` for the per-tool wrap functions and the `synthesize_wrap` entrypoint.  PR #79 widened the trigger from "strict empty" to "no useful text" (residual XML / bracket noise also counts) so models like gemma3 that emit a stripped-empty `<` after the markup also get the wrap.
+- **WS keepalive during inference (`server.py: _ws_keepalive_during_inference`, #76):** Local-mode 4 B-class models routinely take 60-90 s per turn.  Tab5's WebSocket library times out after ~30 s without a PONG and triggers a reconnect, which hits server.py's P13 "Device already has connection" guard, which evicts the in-flight LLM stream — net result: empty reply on every slow turn.  The keepalive context manager fires `ws.ping()` every 5 s while ConversationEngine is generating, well under any client's PONG-watch window.  Wired into the three slow paths: TC text bypass, local text via ConvEngine, and the vision/multimodal path.  See LEARNINGS #78 for the original eviction analysis that motivated this.
 
 ### Memory Service
 Facts are stored with Ollama embeddings (`nomic-embed-text`, 768-dim vectors) for semantic search. Store facts via the `remember` tool (LLM-initiated) or `POST /api/v1/memory` (REST API). All stored facts are auto-recalled before every LLM call — relevant facts are injected into the system prompt via cosine similarity search against the user's query embedding.
@@ -483,7 +489,10 @@ dragon_voice/         — Voice pipeline package (port 3502)
     url_signer.py     — MediaUrlSigner: HMAC-signed + time-bounded /api/media/{id} URLs (W14-H04)
   surfaces/           — Tab5 widget-surface abstraction (widget_live/card/list/chart/media/prompt)
   mcp/                — Model Context Protocol client + bridge
-tests/                — Test suite (19 unit/smoke tests in CI + 29 E2E locally)
+tests/                — Test suite (112 functions across 14 files in CI named-set; 153 tests
+                        collected when running pytest tests/ directly excluding the audit/
+                        async suite; the test_api_e2e.py CLI runner contributes another 29
+                        live-Dragon scenarios that don't run in CI)
   test_api_e2e.py               — 29 live-device tests (local-only, not CI)
   test_e2e_dragon.py            — Dragon end-to-end (local-only, not CI)
   test_auth_middleware.py       — 6 tests for bearer-token gate (CI)
@@ -523,7 +532,7 @@ LEARNINGS.md          — Institutional knowledge (MANDATORY reading)
   - `tests/test_media_store.py` — 12 unit tests for MediaStore (disk storage, cleanup, capacity limits)
   - `tests/test_media_pipeline.py` — 29 unit tests for MediaPipeline (code block detection, table rendering, image URL handling, strip logic)
 
-Aggregate pytest run (excluding `tests/audit/` which needs pytest-asyncio): **121 tests collected, 121 passing** (April 2026, wave 14). Verify with `python3 -m pytest tests/ -q --ignore=tests/audit`.
+Aggregate pytest run (excluding `tests/audit/` which needs pytest-asyncio): **153 tests collected, 153 passing** (April 2026, post-wave-15 + #79/#85 follow-up).  Verify with `python3 -m pytest tests/ -q --ignore=tests/audit`.  The CI named-set is a tighter subset — 14 files, 112 functions — picked so each can run without a live server; everything else is local-only.
 
 ### Dashboard Debug Tab E2E Suite
 - **55 tests** — runnable from the Debug tab in the dashboard

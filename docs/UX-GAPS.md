@@ -39,11 +39,11 @@ Per user direction:
 
 | ID | Gap | Sev | Effort | Phase | Status |
 |---|---|---|---|---|---|
-| C1 | Text-mode interruption broken | CRITICAL | ~3 h | 1 | OPEN |
-| C2 | Multimodal interruption same blocking pattern | CRITICAL | +1 h | 1 | OPEN |
-| L2 | `config_update` blocks WS read loop (~13 s worst case) | HIGH (was LOW) | ~2.5 h | 1 | OPEN |
-| C3 | Config-swap race during inference | non-issue | 15 min docs | 1 | OPEN |
-| L4 | Cancel ack — late `llm` events arrive after Tab5 went READY | LOW | ~30 min | 1 | OPEN |
+| C1 | Text-mode interruption broken | CRITICAL | ~3 h | 1 | **MERGED #92** |
+| C2 | Multimodal interruption same blocking pattern | CRITICAL | +1 h | 1 | **MERGED #92** |
+| L2 | `config_update` blocks WS read loop (~13 s worst case) | HIGH (was LOW) | ~2.5 h | 1 | **MERGED #92** |
+| C3 | Config-swap race during inference | non-issue | 15 min docs | 1 | **MERGED #92** (doc note) |
+| L4 | Cancel ack — late `llm` events arrive after Tab5 went READY | LOW | ~30 min | 1 | **MERGED #92 + TinkerTab#194** |
 | H1 | Tokens buffered for full LLM phase during tool turns | HIGH | ~90 min | 2 | OPEN |
 | H2 | TTS sentence-boundary delay (incl. code-block false splits) | HIGH | ~110 min | 2 | OPEN |
 | H4 | Dictation post-process silent (no event during 10-20 s wait) | HIGH | ~95 min | 2 | OPEN |
@@ -65,7 +65,7 @@ Per user direction:
 
 | ID | Pattern | Replaces / improves | Phase | Status |
 |---|---|---|---|---|
-| α-arch | WS dispatcher async-task discipline | C1, C2, L2, parts of M5 | 1 | OPEN (bundled) |
+| α-arch | WS dispatcher async-task discipline | C1, C2, L2, parts of M5 | 1 | **MERGED #92** |
 | β-arch | Progress event bus (single channel for all phases) | H1, H2, H4, future tool/TTS feedback | 6 | OPEN |
 | γ-arch | `DragonError` taxonomy (severity + scope) | H8, M1, M2, M5, M6 | 3 | OPEN (bundled) |
 | δ-arch | Declarative retention policy framework | H6, H7, D-mem, D-docs | 6 | OPEN |

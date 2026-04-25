@@ -1402,9 +1402,15 @@ class VoiceServer:
         # Reset conn_config to local defaults before pipeline init.
         # Tab5 will immediately send config_update with its actual mode,
         # so this avoids initializing cloud backends only to swap them out.
+        # Only swap out when the configured backend is a cloud one — local
+        # backends (ollama, lmstudio, npu_genie, dual) are already what
+        # the user wants for mode 0/1, and re-pointing them at "ollama"
+        # silently breaks any local-but-non-ollama default (notably the
+        # dual-model pipeline added in #80).
         conn_config.stt.backend = "moonshine"
         conn_config.tts.backend = "piper"
-        conn_config.llm.backend = conn_config.llm.local_backend or "ollama"
+        if conn_config.llm.backend in ("openrouter", "tinkerclaw"):
+            conn_config.llm.backend = conn_config.llm.local_backend or "ollama"
         conn_config.llm.system_prompt = SYSTEM_PROMPT_LOCAL
         conn_config.llm.max_tokens = MAX_TOKENS_LOCAL
 

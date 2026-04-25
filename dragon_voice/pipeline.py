@@ -95,6 +95,13 @@ def _llm_sig(llm_config) -> tuple:
         model = getattr(llm_config, "tinkerclaw_model", "")
     elif be == "lmstudio":
         model = getattr(llm_config, "lmstudio_model", "")
+    elif be == "dual":
+        # Two-part identity for the dual-model pipeline (#80): both
+        # picker AND responder need to match for a pool hit, otherwise
+        # swapping either half would silently reuse the old combo.
+        picker = getattr(llm_config, "dual_picker_model", "")
+        responder = getattr(llm_config, "dual_responder_model", "")
+        model = f"{picker}|{responder}"
     else:
         model = ""
     return ("llm", be, model)

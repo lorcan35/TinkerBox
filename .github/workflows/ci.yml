@@ -65,4 +65,5 @@ jobs:
             tests/test_debug_handlers.py \
             tests/test_lifecycle_monitors.py \
             tests/test_status_handlers.py \
-            tests/test_config_api_handlers.py
+            tests/test_config_api_handlers.py \
+            tests/test_dual_llm.py

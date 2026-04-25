@@ -108,6 +108,15 @@ class LLMConfig:
     tinkerclaw_url: str = "http://localhost:18789"
     tinkerclaw_token: str = ""
     tinkerclaw_model: str = "minimax/MiniMax-M2.5"
+    # Dual-model pipeline (backend = "dual"): a fast tool-picker + warm
+    # responder. See dragon_voice/llm/dual.py and
+    # docs/PLAN-dual-model-pipeline.md.  Sub-backends default to
+    # "ollama" if blank — set explicitly to mix backends (e.g. picker
+    # = ollama, responder = openrouter for hybrid setups).
+    dual_picker_backend: str = ""
+    dual_picker_model: str = "hf.co/Salesforce/xLAM-2-1b-fc-r-gguf:Q4_K_M"
+    dual_responder_backend: str = ""
+    dual_responder_model: str = "ministral-3:3b"
 
 
 @dataclass
@@ -167,7 +176,7 @@ class VoiceConfig:
                 f"stt.backend must be one of {valid_stt}, got '{self.stt.backend}'"
             )
 
-        valid_llm = ("ollama", "openrouter", "lmstudio", "npu_genie", "tinkerclaw")
+        valid_llm = ("ollama", "openrouter", "lmstudio", "npu_genie", "tinkerclaw", "dual")
         if self.llm.backend not in valid_llm:
             errors.append(
                 f"llm.backend must be one of {valid_llm}, got '{self.llm.backend}'"

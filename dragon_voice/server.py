@@ -30,6 +30,7 @@ from dragon_voice.config import (
 )
 from dragon_voice.conversation import ConversationEngine
 from dragon_voice.db import Database
+from dragon_voice.errors import Scope, Severity, error_event
 from dragon_voice.messages import MessageStore
 from dragon_voice.handlers import (
     config_api as _handlers_config_api,
@@ -966,8 +967,11 @@ class VoiceServer:
         requested_session = cmd.get("session_id")
 
         if not device_id:
-            await ws.send_json({"type": "error", "code": "session_invalid",
-                                "message": "device_id is required"})
+            await ws.send_json(error_event(
+                code="session_invalid",
+                message="device_id is required",
+                severity=Severity.FATAL, scope=Scope.SESSION,
+            ))
             return
 
         ws_id = conn_state["ws_id"]
@@ -1234,8 +1238,14 @@ class VoiceServer:
         except Exception as e:
             logger.exception("Failed to initialize pipeline for %s", ws_id)
             if not ws.closed:
-                await ws.send_json({"type": "error", "code": "internal",
-                                    "message": f"Pipeline init failed: {e}"})
+                # Don't leak the raw exception to the user — Tab5
+                # surfaces this in the voice caption.  Operator can
+                # see the actual `e` in the journal.
+                await ws.send_json(error_event(
+                    code="pipeline_init_failed",
+                    message="Voice pipeline failed to start.  Try reconnecting.",
+                    severity=Severity.FATAL, scope=Scope.SESSION,
+                ))
             return
 
         conn_state["pipeline"] = pipeline
@@ -1328,8 +1338,11 @@ class VoiceServer:
         """Handle text input message — goes directly to conversation engine."""
         session_id = conn_state.get("session_id")
         if not session_id or not self._conversation:
-            await ws.send_json({"type": "error", "code": "session_invalid",
-                                "message": "Not registered — send register first"})
+            await ws.send_json(error_event(
+                code="session_invalid",
+                message="Not registered — send register first.",
+                severity=Severity.FATAL, scope=Scope.SESSION,
+            ))
             return
 
         content = cmd.get("content", "").strip()
@@ -1717,8 +1730,11 @@ class VoiceServer:
         except Exception:
             logger.exception("Text processing error on session %s", session_id)
             if not ws.closed:
-                await ws.send_json({"type": "error", "code": "llm_failed",
-                                    "message": "Text processing failed"})
+                await ws.send_json(error_event(
+                    code="llm_failed",
+                    message="Text processing failed — please try again.",
+                    severity=Severity.TRANSIENT, scope=Scope.LLM,
+                ))
 
     async def _handle_config_update(
         self,
@@ -2045,16 +2061,21 @@ class VoiceServer:
         image_path = await self._media_store.get_path(media_id)
         if not image_path:
             if not ws.closed:
-                await ws.send_json({"type": "error", "message": "Image not found"})
+                await ws.send_json(error_event(
+                    code="media_not_found",
+                    message="Image not found — please retake the photo.",
+                    severity=Severity.TRANSIENT, scope=Scope.MEDIA,
+                ))
             return
 
         backend = conn_config.llm.backend
         if backend == "ollama" and "vision" not in conn_config.llm.ollama_model:
             if not ws.closed:
-                await ws.send_json({
-                    "type": "error",
-                    "message": "Image analysis needs Cloud or TinkerClaw mode"
-                })
+                await ws.send_json(error_event(
+                    code="vision_unsupported",
+                    message="Image analysis needs Cloud or TinkerClaw mode.",
+                    severity=Severity.FATAL, scope=Scope.LLM,
+                ))
             return
 
         # Wave 13 H2: image may be up to ~8 MB (camera JPEG) -- reading on the
@@ -2085,7 +2106,11 @@ class VoiceServer:
 
         if not llm_backend:
             if not ws.closed:
-                await ws.send_json({"type": "error", "message": "No LLM available"})
+                await ws.send_json(error_event(
+                    code="no_llm_available",
+                    message="No language model is configured.  Check Settings.",
+                    severity=Severity.FATAL, scope=Scope.LLM,
+                ))
             return
 
         try:
@@ -2101,7 +2126,16 @@ class VoiceServer:
         except Exception as e:
             logger.error("user_media LLM failed: %s", e)
             if not ws.closed:
-                await ws.send_json({"type": "error", "message": str(e)})
+                # Phase 3 γ1: was raw `str(e)` — leaked Python exception
+                # text (e.g. "list index out of range") into Tab5's voice
+                # caption.  Now a stable, user-friendly message keyed by
+                # `vision_failed`; cause kept in the server log only.
+                await ws.send_json(error_event(
+                    code="vision_failed",
+                    message="Image analysis failed — please try again.",
+                    severity=Severity.TRANSIENT,
+                    scope=Scope.LLM,
+                ))
             return
 
         # #75 phase 1b: vision path gets the same empty-reply guard as

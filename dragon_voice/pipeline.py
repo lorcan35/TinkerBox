@@ -17,6 +17,7 @@ from typing import Callable, Awaitable, Optional
 import numpy as np
 
 from dragon_voice.config import VoiceConfig
+from dragon_voice.errors import Scope, Severity, error_event
 from dragon_voice.stt import create_stt, STTBackend
 from dragon_voice.tts import create_tts, TTSBackend
 from dragon_voice.llm import create_llm, LLMBackend
@@ -391,7 +392,11 @@ class VoicePipeline:
             logger.error("Pipeline processing timed out after %ds (backend=%s)", timeout, backend)
             self._processing = False
             try:
-                await self._on_event({"type": "error", "message": f"Processing timed out after {timeout}s"})
+                await self._on_event(error_event(
+                    code="llm_timeout",
+                    message="Thinking took too long — try a shorter question.",
+                    severity=Severity.TRANSIENT, scope=Scope.LLM,
+                ))
                 # Send tts_end so Tab5 doesn't hang
                 if self._tts_started:
                     await self._on_event({"type": "tts_end", "tts_ms": 0})
@@ -684,8 +689,11 @@ class VoicePipeline:
                             len(audio_data), self._config.stt.backend)
                 await self._on_event({"type": "stt", "text": "", "stt_ms": round(stt_ms)})
                 # User-friendly error — Tab5 shows this on voice overlay
-                await self._on_event({"type": "error",
-                                      "message": "Couldn't hear you — try again"})
+                await self._on_event(error_event(
+                    code="stt_empty",
+                    message="Couldn't hear you — try again.",
+                    severity=Severity.TRANSIENT, scope=Scope.STT,
+                ))
                 return
 
             logger.info("STT (%.0fms): %s", stt_ms, transcript)
@@ -988,9 +996,11 @@ class VoicePipeline:
         except Exception:
             logger.exception("Pipeline processing error")
             try:
-                await self._on_event(
-                    {"type": "error", "message": "Processing failed — see server logs"}
-                )
+                await self._on_event(error_event(
+                    code="pipeline_failed",
+                    message="Something went wrong — please try again.",
+                    severity=Severity.TRANSIENT, scope=Scope.LLM,
+                ))
             except (ConnectionError, RuntimeError) as _e:
                 # Wave 13 H5: the WS is already torn down — don't mask the
                 # original exception with a secondary send failure.

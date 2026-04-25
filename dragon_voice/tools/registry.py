@@ -10,11 +10,38 @@ from dragon_voice.tools.base import Tool
 
 logger = logging.getLogger(__name__)
 
-# XML-style markers for tool calls in LLM output
-# Tolerant regex: handles stray > after JSON, missing </args>, extra whitespace
-TOOL_PATTERN = re.compile(r'<tool>(\w+)</tool>\s*<args>\s*({.*?})\s*>?\s*</args>', re.DOTALL)
+# XML-style markers for tool calls in LLM output.
+#
+# Two dialects are accepted:
+#
+#   1. LEGACY (TinkerBox system-prompt format):
+#        <tool>NAME</tool><args>{"k": "v"}</args>
+#      This is what Dragon's own system prompt instructs the model to emit.
+#
+#   2. STANDARD (industry-typical, Qwen-FC / Gemma-FC / distil-* / many
+#      community function-calling fine-tunes):
+#        <tool_call>{"name": "NAME", "arguments": {"k": "v"}}</tool_call>
+#      Models trained for function-calling almost universally emit this
+#      shape regardless of what our system prompt asks — that's what they
+#      were fine-tuned on.  Accepting it here means we don't have to fight
+#      the training prior of every FC model we want to run.
+#
+# Both shapes are extracted into the same `{"tool": name, "args": dict}`
+# record, so downstream execute() + server eventing is format-agnostic.
+#
+# Tolerance knobs inherited from the prior implementation:
+#   - Stray `>` after JSON, missing `</args>`, extra whitespace all handled.
+#   - xLAM quirk: emits `[tool>` (left-bracket instead of left-angle) on
+#     the opening tag — the anchor regex now accepts either, since the
+#     closing `</tool>` still disambiguates unambiguously.
+#
+# Tolerant regex: handles stray > after JSON, missing </args>, extra whitespace.
+# The `[<\[]tool[>\]]` open-tag class accepts `<tool>`, `[tool>`, `<tool]`, AND
+# `[tool]` — quantized small models (notably xLAM) emit broken open brackets
+# semi-randomly; the closing `</tool>` is always intact so there's no ambiguity.
+TOOL_PATTERN = re.compile(r'[<\[]tool[>\]](\w+)</tool>\s*<args>\s*({.*?})\s*>?\s*</args>', re.DOTALL)
 # Fallback: if </args> is missing entirely, grab JSON after <args>
-TOOL_PATTERN_LOOSE = re.compile(r'<tool>(\w+)</tool>\s*<args>\s*({[^<]*})', re.DOTALL)
+TOOL_PATTERN_LOOSE = re.compile(r'[<\[]tool[>\]](\w+)</tool>\s*<args>\s*({[^<]*})', re.DOTALL)
 
 
 class ToolRegistry:
@@ -70,26 +97,25 @@ class ToolRegistry:
         """
         import re as _re
         calls = []
-        # Find each <tool>NAME</tool><args> anchor, then walk forward
-        # balancing {} so we capture the full JSON object.
-        anchor = _re.compile(r'<tool>(\w+)</tool>\s*<args>\s*', _re.DOTALL)
-        for m in anchor.finditer(text):
-            name = m.group(1)
-            i = m.end()
-            if i >= len(text) or text[i] != '{':
-                continue
+
+        def _walk_json(text: str, start: int) -> int:
+            """Return index one past the matching `}` for the JSON object
+            that starts at `text[start] == '{'`.  Honors string quoting +
+            backslash escapes.  Returns -1 on unbalanced input."""
+            if start >= len(text) or text[start] != '{':
+                return -1
             depth = 0
             in_str = False
             esc = False
-            end = -1
-            for j in range(i, len(text)):
+            for j in range(start, len(text)):
                 ch = text[j]
                 if in_str:
-                    if esc:      esc = False
+                    if esc:
+                        esc = False
                     elif ch == '\\':
-                                 esc = True
+                        esc = True
                     elif ch == '"':
-                                 in_str = False
+                        in_str = False
                     continue
                 if ch == '"':
                     in_str = True
@@ -98,8 +124,18 @@ class ToolRegistry:
                 elif ch == '}':
                     depth -= 1
                     if depth == 0:
-                        end = j + 1
-                        break
+                        return j + 1
+            return -1
+
+        # Dialect 1 — legacy `<tool>NAME</tool><args>{json}</args>` (and the
+        # xLAM `[tool>...` / `[tool]...` bracket quirks on the open tag).
+        # Anchor on the `<args>` prefix so the JSON walker picks up the full
+        # object even with nested braces.
+        anchor_legacy = _re.compile(r'[<\[]tool[>\]](\w+)</tool>\s*<args>\s*', _re.DOTALL)
+        for m in anchor_legacy.finditer(text):
+            name = m.group(1)
+            i = m.end()
+            end = _walk_json(text, i)
             if end < 0:
                 continue
             args_str = text[i:end].strip()
@@ -109,11 +145,48 @@ class ToolRegistry:
             except json.JSONDecodeError:
                 logger.warning("Failed to parse tool args for %s: %s",
                                name, args_str[:100])
+
+        # Dialect 2 — industry-standard `<tool_call>{"name": "X",
+        # "arguments": {...}}</tool_call>`.  Walk the JSON directly from
+        # right after the opening tag.  Whitespace / newlines between the
+        # tag and the `{` are tolerated.
+        anchor_std = _re.compile(r'<tool_call>\s*', _re.DOTALL)
+        for m in anchor_std.finditer(text):
+            i = m.end()
+            end = _walk_json(text, i)
+            if end < 0:
+                continue
+            body = text[i:end].strip()
+            try:
+                parsed = json.loads(body)
+            except json.JSONDecodeError:
+                logger.warning("Failed to parse <tool_call> body: %s",
+                               body[:120])
+                continue
+            if not isinstance(parsed, dict):
+                continue
+            name = parsed.get("name")
+            args = parsed.get("arguments", parsed.get("args", {}))
+            if not isinstance(name, str) or not name:
+                continue
+            if not isinstance(args, dict):
+                args = {}
+            calls.append({"tool": name, "args": args})
+
         return calls
 
     def has_tool_call(self, text: str) -> bool:
-        """Quick check if text contains a tool call marker."""
-        return "<tool>" in text and "</tool>" in text
+        """Quick check if text contains a tool call marker.
+        Accepts both dialects the parser understands: the legacy
+        `<tool>NAME</tool>` shape and the industry-standard
+        `<tool_call>{...}</tool_call>` shape.
+        """
+        has_legacy = (
+            ("<tool>" in text or "[tool>" in text or "[tool]" in text or "<tool]" in text)
+            and "</tool>" in text
+        )
+        has_std = "<tool_call>" in text and "</tool_call>" in text
+        return has_legacy or has_std
 
     def format_for_llm(self, compact: bool = False) -> str:
         """Format tool descriptions for injection into LLM system prompt.

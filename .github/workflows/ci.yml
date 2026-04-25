@@ -68,4 +68,5 @@ jobs:
             tests/test_config_api_handlers.py \
             tests/test_tool_parser.py \
             tests/test_dual_llm.py \
-            tests/test_ws_dispatcher_cancellation.py
+            tests/test_ws_dispatcher_cancellation.py \
+            tests/test_dictation_post_process_events.py

@@ -273,6 +273,90 @@ def test_with_marker_holds_back_until_tool_executed() -> None:
     assert "The answer is 42." in joined
 
 
+def test_malformed_tool_args_fires_on_tool_error_callback() -> None:
+    """γ2-M1 (issue #104): when the LLM emits a tool block with
+    malformed JSON args, the parse failure must surface to the WS
+    handler via the new ``on_tool_error`` callback so a
+    ``tool_args_invalid`` error frame can be sent to Tab5 instead of
+    the user seeing nothing.
+
+    Pre-fix this case was a silent ``logger.warning`` line — Tab5 got
+    no error frame, the LLM continued (or stopped, depending on the
+    model), and the user saw an empty / generic reply with zero hint
+    that anything was attempted."""
+    eng, _ = _make_engine(
+        [
+            "Sure, ",
+            '<tool>calculator</tool><args>{not valid json}</args>',
+        ],
+        with_registry=True,
+    )
+    seen_errors: list[dict] = []
+
+    async def _capture(err: dict) -> None:
+        seen_errors.append(err)
+
+    asyncio.run(_drain(
+        eng.process_text_stream("s1", "x", on_tool_error=_capture)
+    ))
+
+    assert len(seen_errors) == 1, (
+        f"Expected exactly one on_tool_error call; got {seen_errors}"
+    )
+    err = seen_errors[0]
+    assert err["dialect"] == 1
+    assert err["name"] == "calculator"
+    assert err["reason"] == "json_decode"
+
+
+def test_clean_tool_call_does_not_fire_on_tool_error() -> None:
+    """Pin the boundary: a successful tool-call must NOT spuriously
+    fire ``on_tool_error``.  Without this guard a future regression
+    that flips the error/success branches could go unnoticed because
+    Tab5 would just see an extra toast on every successful tool turn —
+    annoying but not test-breaking."""
+    eng, _ = _make_engine(
+        [
+            "Sure, ", "let me ", "look ",
+            '<tool>', 'web_search', '</tool>',
+            '<args>', '{"q":"x"}', '</args>',
+        ],
+        with_registry=True,
+    )
+    seen_errors: list[dict] = []
+
+    async def _capture(err: dict) -> None:
+        seen_errors.append(err)
+
+    asyncio.run(_drain(
+        eng.process_text_stream("s1", "find x", on_tool_error=_capture)
+    ))
+    assert seen_errors == []
+
+
+def test_on_tool_error_callback_exception_is_swallowed() -> None:
+    """Defensive: a buggy callback must not break the streaming turn.
+    Pre-fix the existing on_tool_call/on_tool_result wrappers swallow
+    callback errors at debug level; preserve that contract for the
+    new on_tool_error path so a flaky WS send doesn't tear down the
+    LLM turn."""
+    eng, _ = _make_engine(
+        [
+            '<tool>calculator</tool><args>{not valid}</args>',
+        ],
+        with_registry=True,
+    )
+
+    async def _boom(err: dict) -> None:
+        raise RuntimeError("simulated callback failure")
+
+    # Should NOT raise out of process_text_stream — the loop terminates
+    # cleanly even when the user-supplied callback explodes.
+    asyncio.run(_drain(
+        eng.process_text_stream("s1", "x", on_tool_error=_boom)
+    ))
+
+
 def test_tail_partial_marker_does_not_flush_prematurely() -> None:
     """If the LLM emits `<too` and then keeps going, the tail must wait
     for the next token before flushing."""

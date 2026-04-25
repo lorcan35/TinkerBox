@@ -1138,8 +1138,36 @@ class VoiceServer:
                 except Exception:
                     logger.debug("widget_list auto-emit failed", exc_info=True)
 
+            async def _on_tool_error(err: dict):
+                """γ2-M1 (issue #104): emit a `tool_args_invalid` error
+                frame when the parser swallows malformed JSON args.
+
+                Pre-fix the failure was a silent `logger.warning` —
+                the LLM continued without firing the tool and the
+                user saw an empty/generic reply with zero signal that
+                anything was attempted.  Now we surface a TRANSIENT
+                error in the TOOL scope so Tab5 (γ2-H8) can render a
+                non-blocking toast.
+
+                The raw args are deliberately NOT included in the
+                user-facing message — they may contain prompt-injection
+                content from the LLM and Tab5's caption isn't a safe
+                place to render arbitrary text.  Server log already
+                carries the full failure for ops debugging.
+                """
+                if ws.closed:
+                    return
+                tool_name = err.get("name") or "(unknown)"
+                await self._safe_send_json(ws, error_event(
+                    code="tool_args_invalid",
+                    message=f"Tool '{tool_name}' had invalid arguments — skipped.",
+                    severity=Severity.TRANSIENT,
+                    scope=Scope.TOOL,
+                ))
+
             conn_state["on_tool_call"] = _on_tool_call
             conn_state["on_tool_result"] = _on_tool_result
+            conn_state["on_tool_error"] = _on_tool_error
 
         # Send session_start IMMEDIATELY — before slow pipeline init.
         # Use _safe_send_json so a transient transport close (the Tab5
@@ -1536,6 +1564,7 @@ class VoiceServer:
                     input_mode="text",
                     on_tool_call=conn_state.get("on_tool_call"),
                     on_tool_result=conn_state.get("on_tool_result"),
+                    on_tool_error=conn_state.get("on_tool_error"),
                 ):
                     full_response.append(token)
                     pending += token

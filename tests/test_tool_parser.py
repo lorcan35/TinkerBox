@@ -226,3 +226,118 @@ def test_registered_tool_executes() -> None:
     out = asyncio.run(r.execute("calculator", {"expression": "2+2"}))
     assert out["tool"] == "calculator"
     assert out["result"] == {"ok": True}
+
+
+# ───────────────────────── γ2-M1 (issue #104): expose parse errors
+#
+# Pre-fix `parse_tool_calls` swallowed JSON-decode errors silently
+# (`logger.warning(...)`) — the LLM continued without firing the tool
+# and the user saw an empty / generic response with zero signal that
+# anything was attempted.  γ2-M1 adds `parse_tool_calls_with_errors`
+# which surfaces failed parses so the WS handler can emit a
+# `tool_args_invalid` error frame (γ1 taxonomy).
+
+
+def test_with_errors_returns_empty_lists_for_clean_input() -> None:
+    r = _registry_with("calculator")
+    calls, errors = r.parse_tool_calls_with_errors("just some prose")
+    assert calls == []
+    assert errors == []
+
+
+def test_with_errors_returns_calls_for_clean_dialect1() -> None:
+    r = _registry_with("calculator")
+    calls, errors = r.parse_tool_calls_with_errors(
+        '<tool>calculator</tool><args>{"expression": "2+2"}</args>'
+    )
+    assert calls == [{"tool": "calculator", "args": {"expression": "2+2"}}]
+    assert errors == []
+
+
+def test_with_errors_dialect1_malformed_json_surfaces_error() -> None:
+    """`<tool>X</tool><args>{not json}</args>` — pre-fix this was a
+    silent warning; now must produce a structured error record so
+    the WS handler can emit a tool_args_invalid frame."""
+    r = _registry_with("calculator")
+    calls, errors = r.parse_tool_calls_with_errors(
+        '<tool>calculator</tool><args>{not valid json}</args>'
+    )
+    assert calls == []
+    assert len(errors) == 1
+    err = errors[0]
+    assert err["dialect"] == 1
+    assert err["name"] == "calculator"
+    assert err["reason"] == "json_decode"
+
+
+def test_with_errors_dialect2_malformed_json_surfaces_error() -> None:
+    """`<tool_call>{...</tool_call>` — JSON parse fails before we can
+    read the `name` field, so name is None."""
+    r = _registry_with("anything")
+    calls, errors = r.parse_tool_calls_with_errors(
+        '<tool_call>{not valid json}</tool_call>'
+    )
+    assert calls == []
+    assert len(errors) == 1
+    err = errors[0]
+    assert err["dialect"] == 2
+    assert err["name"] is None
+    assert err["reason"] == "json_decode"
+
+
+def test_with_errors_dialect3_malformed_json_surfaces_error() -> None:
+    """`[NAME]{bad json}` — name is known (gated on registry) so the
+    error carries it."""
+    r = _registry_with("recall")
+    calls, errors = r.parse_tool_calls_with_errors(
+        '[recall]{not valid json}</recall>'
+    )
+    assert calls == []
+    assert len(errors) == 1
+    err = errors[0]
+    assert err["dialect"] == 3
+    assert err["name"] == "recall"
+    assert err["reason"] == "json_decode"
+
+
+def test_with_errors_mixed_good_and_bad_returns_both() -> None:
+    """One well-formed + one malformed in the same response.  User
+    should get the good tool result AND know one was skipped."""
+    r = _registry_with("calculator", "recall")
+    text = (
+        '<tool>calculator</tool><args>{"expression": "2+2"}</args>'
+        ' then '
+        '<tool>recall</tool><args>{not valid}</args>'
+    )
+    calls, errors = r.parse_tool_calls_with_errors(text)
+    assert calls == [{"tool": "calculator", "args": {"expression": "2+2"}}]
+    assert len(errors) == 1
+    assert errors[0]["name"] == "recall"
+
+
+def test_parse_tool_calls_backcompat_unchanged() -> None:
+    """Pre-existing callers (and the 16 tests above) call the bare
+    `parse_tool_calls` and expect just the success list.  That signature
+    is preserved — the new error info only flows through the *_with_errors
+    sibling.  This guards against an accidental break of the public API."""
+    r = _registry_with("calculator")
+    out = r.parse_tool_calls(
+        '<tool>calculator</tool><args>{not valid}</args>'
+    )
+    assert out == []  # malformed → still 0 calls; no exception, no errors leaked
+    assert isinstance(out, list)
+
+
+def test_with_errors_does_not_emit_when_dialect2_lacks_name_field() -> None:
+    """Dialect-2 input that decodes cleanly but has no `name` is a
+    silently-skipped call (existing test_dialect2_skips_call_with_missing_name).
+    That's not a parse failure — it's a malformed FC envelope.  Don't
+    emit a tool_args_invalid error for it; the parser just declines to
+    fire the tool.  This test pins that boundary so we don't regress
+    into noisy error frames for prose-shaped JSON."""
+    r = _registry_with("anything")
+    calls, errors = r.parse_tool_calls_with_errors(
+        '<tool_call>{"arguments": {"x": 1}}</tool_call>'
+    )
+    assert calls == []
+    assert errors == []

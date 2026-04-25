@@ -114,9 +114,48 @@ class ToolRegistry:
         truncate at the first `}` it encounters -- a nested JSON value
         like {"filter": {"k": "v"}} lost its outer closer.  We now
         balance braces manually after the regex anchors the position.
+
+        γ2-M1 (issue #104): pre-fix this method swallowed JSON-decode
+        errors silently — `parse_tool_calls_with_errors` is the
+        error-surfacing sibling.  This method preserves the original
+        list-only signature for backward compatibility (16 existing
+        unit tests + 2 conversation.py call sites).
+        """
+        calls, _errors = self.parse_tool_calls_with_errors(text)
+        return calls
+
+    def parse_tool_calls_with_errors(
+        self, text: str
+    ) -> tuple[list[dict], list[dict]]:
+        """Like :meth:`parse_tool_calls`, but also returns parse errors.
+
+        γ2-M1 (issue #104, refs #89, refs #101).  The Phase-2 audit
+        identified the silent JSON-decode swallow as user-invisible
+        agentic failure: the LLM emits a tool call, the parser fails
+        to load the args, the tool never fires, and the user sees a
+        generic / empty reply with no signal that anything was tried.
+
+        Returns
+        -------
+        (calls, errors)
+            ``calls`` is identical to what :meth:`parse_tool_calls`
+            returns (list of ``{"tool": name, "args": dict}``).
+            ``errors`` is a list of error records:
+
+                {"dialect": 1|2|3,
+                 "name": str | None,
+                 "reason": "json_decode"}
+
+            ``name`` is ``None`` for dialect-2 errors, where the JSON
+            parse fails before the FC envelope's ``name`` field can be
+            read.  ``reason`` is currently always ``"json_decode"`` —
+            the only failure mode worth surfacing today; structurally-
+            wrong FC envelopes (e.g. missing ``name``) stay silent
+            because they look indistinguishable from prose-shaped JSON.
         """
         import re as _re
-        calls = []
+        calls: list[dict] = []
+        errors: list[dict] = []
 
         def _walk_json(text: str, start: int) -> int:
             """Return index one past the matching `}` for the JSON object
@@ -165,6 +204,9 @@ class ToolRegistry:
             except json.JSONDecodeError:
                 logger.warning("Failed to parse tool args for %s: %s",
                                name, args_str[:100])
+                errors.append({
+                    "dialect": 1, "name": name, "reason": "json_decode",
+                })
 
         # Dialect 2 — industry-standard `<tool_call>{"name": "X",
         # "arguments": {...}}</tool_call>`.  Walk the JSON directly from
@@ -182,6 +224,9 @@ class ToolRegistry:
             except json.JSONDecodeError:
                 logger.warning("Failed to parse <tool_call> body: %s",
                                body[:120])
+                errors.append({
+                    "dialect": 2, "name": None, "reason": "json_decode",
+                })
                 continue
             if not isinstance(parsed, dict):
                 continue
@@ -225,6 +270,9 @@ class ToolRegistry:
                             "Failed to parse bracket-name args for %s: %s",
                             name, text[i:end][:100],
                         )
+                        errors.append({
+                            "dialect": 3, "name": name, "reason": "json_decode",
+                        })
                         continue
                     if not isinstance(parsed_args, dict):
                         continue
@@ -248,7 +296,7 @@ class ToolRegistry:
                 if args is not None:
                     calls.append({"tool": name, "args": args})
 
-        return calls
+        return calls, errors
 
     def has_tool_call(self, text: str) -> bool:
         """Quick check if text contains a tool call marker.

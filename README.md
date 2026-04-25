@@ -246,7 +246,7 @@ python3 -m dragon_voice &     # Voice server (separate terminal)
 python3 dashboard.py &        # Dashboard (separate terminal)
 
 # Or install as systemd services for auto-start on boot:
-sudo ./install-services.sh
+# (see "Deployment → systemd Services" below for the install commands)
 ```
 
 ### Deploy from a workstation
@@ -918,7 +918,7 @@ TinkerBox/
 |-- telegram.env.example           Example Telegram bot environment
 |-- setup.sh                       Dependency installer
 |-- start.sh                       One-command launcher (Chromium + Dragon)
-|-- install-services.sh            systemd service installer
+|-- systemd/                       systemd unit files (canonical install path)
 |-- launch-chromium.sh             Chromium CDP launcher
 |-- start-chat.sh                  Chat launcher script
 |-- CLAUDE.md                      Developer guide, sprint status, architecture

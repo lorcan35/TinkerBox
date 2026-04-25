@@ -13,8 +13,10 @@
 # Retention: last KEEP copies of each artifact type (default 14 = ~14 hrs).
 # Deleting older backups keeps the backup dir bounded.
 #
-# Location: /home/radxa/bin/tinkerclaw-backup.sh (symlinked from TinkerBox
-# repo's scripts/ by install-services.sh on deploy).
+# Location: /home/radxa/bin/tinkerclaw-backup.sh (symlinked from
+# TinkerBox repo's scripts/ on deploy — copy/symlink it manually now
+# that the legacy install-services.sh helper is gone, or invoke it via
+# systemd/tinkerclaw-backup.service + .timer).
 
 set -euo pipefail
 

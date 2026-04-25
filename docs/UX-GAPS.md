@@ -48,11 +48,11 @@ Per user direction:
 | H2 | TTS sentence-boundary delay (incl. code-block false splits) | HIGH | ~110 min | 2 | **MERGED #99** |
 | H4 | Dictation post-process silent (no event during 10-20 s wait) | HIGH | ~95 min | 2 | **MERGED #95 + TinkerTab#195** |
 | L3 | Piper TTS not killed on timeout | LOW | ~35 min | 2 | **MERGED #99** |
-| H8 | Raw error strings on wrong UI surface (voice caption vs toast) | HIGH | ~4 h | 3 | OPEN |
-| M1 | Tool parser silent on malformed JSON args | MED | ~3 h | 3 | OPEN |
+| H8 | Raw error strings on wrong UI surface (voice caption vs toast) | HIGH | ~4 h | 3 | **MERGED #105 + #107 + #109 + TinkerTab#197** |
+| M1 | Tool parser silent on malformed JSON args | MED | ~3 h | 3 | **MERGED #105** |
 | M2 | WS upgrade rejection plain text (401/503) | MED | ~3.5 h | 3 | OPEN |
-| M5 | Device-id collision silent eviction | MED | ~3 h | 3 | OPEN |
-| M6 | TC gateway down → 600 s timeout, no fast-fail | MED | ~4 h | 3 | OPEN |
+| M5 | Device-id collision silent eviction | MED | ~3 h | 3 | **MERGED #109 + TinkerTab#197** |
+| M6 | TC gateway down → 600 s timeout, no fast-fail | MED | ~4 h | 3 | **MERGED #107** |
 | H6 | Idle paused sessions never purge | HIGH | ~2-3 h | 4 | OPEN |
 | H7 | Media cleanup 1 h delay before first run | HIGH | ~1 h | 4 | OPEN |
 | D-mem | Memory facts unbounded (downgraded — sqlite-vec confirmed loaded) | LOW (was MED) | ~1 h | 4 | OPEN |
@@ -67,7 +67,7 @@ Per user direction:
 |---|---|---|---|---|
 | α-arch | WS dispatcher async-task discipline | C1, C2, L2, parts of M5 | 1 | **MERGED #92** |
 | β-arch | Progress event bus (single channel for all phases) | H1, H2, H4, future tool/TTS feedback | 6 | OPEN |
-| γ-arch | `DragonError` taxonomy (severity + scope) | H8, M1, M2, M5, M6 | 3 | **γ1 MERGED #102** (γ2 + γ3 OPEN) |
+| γ-arch | `DragonError` taxonomy (severity + scope) | H8, M1, M2, M5, M6 | 3 | **γ1 + γ2 MERGED (#102, #105, #107, #109, TinkerTab#197)** (γ3 OPEN) |
 | δ-arch | Declarative retention policy framework | H6, H7, D-mem, D-docs | 6 | OPEN |
 
 ---
@@ -126,7 +126,7 @@ affects the whole protocol.  Cleaner if dispatcher cleanup landed first.
 | PR | Scope | Effort |
 |---|---|---|
 | γ1 | `DragonError` class with `severity: TRANSIENT|FATAL` + `scope`; audit ~12 emission sites | **MERGED #102** |
-| γ2 | H8 route to correct surface (toast vs caption); H1 `tool_failed`; M5 `device_evicted` frame; M6 fast-fail TC health check | ~10 h combined |
+| γ2 | H8 route to correct surface (toast vs caption); M1 `tool_args_invalid` frame; M5 `device_evicted` frame; M6 fast-fail TC health check | **MERGED #105 + #107 + #109 + TinkerTab#197** |
 | γ3 | M2 WS upgrade JSON responses + Tab5 401-stops-retrying | ~3 h |
 
 **E2E acceptance:**

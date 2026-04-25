@@ -303,6 +303,7 @@ class ConversationEngine:
         audio_duration_s: Optional[float] = None,
         on_tool_call=None,
         on_tool_result=None,
+        on_tool_error=None,
     ) -> AsyncIterator[str]:
         """Process text input with streaming response and tool-calling support.
 
@@ -313,6 +314,12 @@ class ConversationEngine:
             audio_duration_s: Duration of voice input (None for text).
             on_tool_call: Optional async callback(call_dict) for tool call events.
             on_tool_result: Optional async callback(result_dict) for tool result events.
+            on_tool_error: Optional async callback(error_dict) — fires once
+                per failed tool-call parse (γ2-M1, issue #104).  Pre-fix
+                these failures were silent `logger.warning` lines; the
+                WS handler wires this to a `tool_args_invalid` error
+                frame so the user sees a transient toast instead of an
+                empty/generic LLM reply.
 
         Yields:
             Text tokens as they arrive from the LLM.
@@ -385,7 +392,22 @@ class ConversationEngine:
                     and self._tool_registry.has_tool_call(response_text)
                     and tool_calls_made < MAX_TOOL_CALLS):
 
-                tool_calls = self._tool_registry.parse_tool_calls(response_text)
+                # γ2-M1 (issue #104): use the error-surfacing variant so
+                # malformed tool-call attempts emit a `tool_args_invalid`
+                # WS frame instead of silently disappearing into a
+                # logger.warning.  Errors are reported even when there's
+                # at least one successful call in the same response —
+                # the user wants to know "tool A worked, tool B was
+                # skipped" rather than just seeing the partial result.
+                tool_calls, tool_errors = (
+                    self._tool_registry.parse_tool_calls_with_errors(response_text)
+                )
+                if tool_errors and on_tool_error:
+                    for err in tool_errors:
+                        try:
+                            await on_tool_error(err)
+                        except Exception as e:
+                            logger.debug("on_tool_error callback error: %s", e)
                 if tool_calls:
                     tool_call = tool_calls[0]  # Execute one at a time
                     tool_calls_made += 1

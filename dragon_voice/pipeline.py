@@ -49,6 +49,31 @@ _SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
 # Triggers on comma/semicolon/colon/dash with 20+ chars buffered
 _CLAUSE_END = re.compile(r"[,;:\u2014—]\s*$")
 
+# Phase 2 H2 (issue #94): word-boundary timeout-flush regex — finds the
+# last whitespace position so the timeout flush splits at a word break,
+# not mid-word.  Used only when the LLM has been silent on punctuation
+# for >300 ms AND the buffer has enough content to make a meaningful
+# TTS chunk.
+_LAST_WORD_BOUNDARY = re.compile(r"\s\S*$")
+
+# Phase 2 H2 (issue #94): triple-backtick toggle for code-block
+# detection.  While inside a code block the clause-flush is suppressed
+# (a colon in `def foo():` is structural, not a natural pause).  The
+# sentence-flush (.!?) still applies because periods are rare in code
+# blocks and a `.` is usually meaningful (e.g. `obj.method()`).
+# Timeout-flush also suppressed in code so the whole block emits as
+# one TTS unit.
+_TRIPLE_BACKTICK = "```"
+
+# Phase 2 H2 (issue #94): timeout-flush parameters.  300 ms is long
+# enough that a normal punctuation-rich response never trips it
+# (sentences land their `.` well within 300 ms of each other on any
+# model > 5 tok/s) but short enough that an LLM rambling without
+# punctuation still feels responsive.  Minimum buffer of 20 chars
+# prevents micro-stuttered chunks.
+_LOCAL_TIMEOUT_FLUSH_S = 0.30
+_LOCAL_TIMEOUT_FLUSH_MIN_CHARS = 20
+
 # Hallucination stop patterns — LLMs sometimes simulate user turns or continue
 # generating after answering. Truncate response at these markers.
 _HALLUCINATION_STOPS = re.compile(
@@ -725,6 +750,16 @@ class VoicePipeline:
             # length so a marker straddling a token boundary still hits.
             scan_watermark = 0
             OVERLAP = 32
+            # Phase 2 H2 (issue #94): track last successful TTS flush so
+            # we can word-boundary-flush after _LOCAL_TIMEOUT_FLUSH_S of
+            # punctuation silence.  Pre-fix, an LLM rambling without
+            # punctuation could buffer 60+ chars before any TTS chunk
+            # left Dragon, producing a noticeable mid-reply silence.
+            # Also track triple-backtick code-block state so the clause
+            # flush doesn't false-fire on `def foo():` style colons.
+            last_flush_ts = time.monotonic()
+            in_code_block = False
+            is_local = self._config.llm.backend in ("ollama", "npu_genie", "lmstudio")
             async for token in llm_stream:
                 if self._cancelled:
                     return
@@ -755,7 +790,21 @@ class VoicePipeline:
                 await self._on_event({"type": "llm", "text": token})
                 sentence_buffer += token
 
+                # Phase 2 H2 (issue #94): toggle code-block state on
+                # every triple-backtick boundary in the new token.  We
+                # only check the freshly-arrived token to avoid
+                # double-counting a backtick that was already in
+                # sentence_buffer.
+                if _TRIPLE_BACKTICK in token:
+                    n_marks = token.count(_TRIPLE_BACKTICK)
+                    if n_marks % 2 == 1:
+                        in_code_block = not in_code_block
+
                 # Check for sentence boundary — flush to TTS
+                # (Sentence-flush still fires inside code blocks because
+                # `.` is rare in code AND meaningful when present —
+                # `obj.method()` etc.  Suppressing it would cause a
+                # whole code response to wait for end-of-stream.)
                 if _SENTENCE_END.search(sentence_buffer):
                     sentences = _SENTENCE_SPLIT.split(sentence_buffer)
                     # Send all complete sentences, keep incomplete tail
@@ -768,19 +817,46 @@ class VoicePipeline:
                             # Last fragment is incomplete — keep buffering
                             remainder = sentence
                     sentence_buffer = remainder
+                    last_flush_ts = time.monotonic()
                 # Clause-level flushing: flush on comma/semicolon/colon/dash
                 # when buffer reaches a minimum length. Threshold is mode-aware:
                 #  - Local backends (low latency): 20 chars — start TTS early
                 #  - Cloud/hybrid backends (bursty tokens): 60 chars — buffer
                 #    a full sentence-length clause to smooth over latency spikes
                 #    and avoid choppy playback (P08)
-                elif _CLAUSE_END.search(sentence_buffer):
-                    is_local = self._config.llm.backend in ("ollama", "npu_genie", "lmstudio")
+                # Phase 2 H2: SKIP clause flush inside a code block — `:`
+                # in `def foo():` is structural, not a natural pause.
+                elif _CLAUSE_END.search(sentence_buffer) and not in_code_block:
                     clause_min_chars = 20 if is_local else 60
                     if len(sentence_buffer) >= clause_min_chars:
                         if sentence_buffer.strip():
                             await self._synthesize_and_send(sentence_buffer.strip())
                         sentence_buffer = ""
+                        last_flush_ts = time.monotonic()
+                # Phase 2 H2 (issue #94): timeout word-boundary flush.
+                # If neither sentence nor clause flush fired AND the LLM
+                # has been silent on punctuation for >300 ms, flush at
+                # the last word boundary so the user hears progress
+                # instead of staring at a frozen orb.  Local mode only —
+                # cloud TTS is fast and bursty, the existing 60-char
+                # clause threshold smooths it well enough.  Skip inside
+                # code blocks (would chop code mid-line).
+                elif (
+                    is_local
+                    and not in_code_block
+                    and len(sentence_buffer) >= _LOCAL_TIMEOUT_FLUSH_MIN_CHARS
+                    and (time.monotonic() - last_flush_ts) > _LOCAL_TIMEOUT_FLUSH_S
+                ):
+                    m = _LAST_WORD_BOUNDARY.search(sentence_buffer)
+                    if m and m.start() >= 10:
+                        # Flush up to (but not including) the whitespace,
+                        # keep the partial trailing word for the next
+                        # iteration.
+                        flush_text = sentence_buffer[: m.start()].strip()
+                        sentence_buffer = sentence_buffer[m.start():].lstrip()
+                        if flush_text:
+                            await self._synthesize_and_send(flush_text)
+                            last_flush_ts = time.monotonic()
 
             # Flush remaining text
             if sentence_buffer.strip() and not self._cancelled:
@@ -995,6 +1071,16 @@ class VoicePipeline:
                     self._tts.synthesize(text), timeout=30
                 )
             except (Exception, asyncio.TimeoutError) as tts_err:
+                # Phase 2 L3 (issue #94): kill any in-flight Piper
+                # subprocess BEFORE falling back / raising.  Piper has
+                # its own internal timeout which usually catches stalls,
+                # but the OpenRouter→Piper fallback path below could
+                # trigger a SECOND Piper synthesis on top of an already-
+                # stalled one.  Without explicit kill_active_procs the
+                # zombie holds the audio device + an FD until the Python
+                # process exits.
+                if hasattr(self._tts, "kill_active_procs"):
+                    self._tts.kill_active_procs()
                 if self._config.tts.backend == "openrouter":
                     logger.error("Cloud TTS failed: %s — falling back to local", tts_err)
                     # v4·D audit P1 fix: cache fallback Piper instance so
@@ -1006,7 +1092,20 @@ class VoicePipeline:
                         self._fallback_tts = create_tts(TTSConfig(backend="piper"))
                         await self._fallback_tts.initialize()
                         logger.info("Pre-warmed fallback TTS (piper) cached")
-                    audio_bytes = await self._fallback_tts.synthesize(text)
+                    # Phase 2 L3 (issue #94): the fallback Piper itself
+                    # can stall — wrap with the same 30s wait_for and
+                    # kill its procs on a second timeout.  Without the
+                    # second guard a TTS-down scenario with no second
+                    # fallback could leak indefinitely.
+                    try:
+                        audio_bytes = await asyncio.wait_for(
+                            self._fallback_tts.synthesize(text), timeout=30
+                        )
+                    except (Exception, asyncio.TimeoutError) as fb_err:
+                        if hasattr(self._fallback_tts, "kill_active_procs"):
+                            self._fallback_tts.kill_active_procs()
+                        logger.error("Fallback Piper TTS also failed: %s", fb_err)
+                        raise
                     await self._on_event({
                         "type": "config_update",
                         "error": "Cloud TTS unavailable, reverted to local",

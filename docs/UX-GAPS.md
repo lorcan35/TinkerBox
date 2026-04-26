@@ -66,7 +66,7 @@ Per user direction:
 | ID | Pattern | Replaces / improves | Phase | Status |
 |---|---|---|---|---|
 | α-arch | WS dispatcher async-task discipline | C1, C2, L2, parts of M5 | 1 | **MERGED #92** |
-| β-arch | Progress event bus (single channel for all phases) | H1, H2, H4, future tool/TTS feedback | 6 | OPEN |
+| β-arch | Progress event bus (single channel for all phases) | H1, H2, H4, future tool/TTS feedback | 6 | **IN PROGRESS** (dictation + tool migrated; STT/LLM/TTS/media deferred) |
 | γ-arch | `DragonError` taxonomy (severity + scope) | H8, M1, M2, M5, M6 | 3 | **MERGED — Phase 3 COMPLETE (#102, #105, #107, #109, #112, TinkerTab#197, TinkerTab#199)** |
 | δ-arch | Declarative retention policy framework | H6, H7, D-mem, D-docs | 6 | OPEN |
 

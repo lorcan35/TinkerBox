@@ -31,6 +31,8 @@ from dragon_voice.config import (
 from dragon_voice.conversation import ConversationEngine
 from dragon_voice.db import Database
 from dragon_voice.errors import DragonError, Scope, Severity, error_event
+from dragon_voice.progress import Phase, Stage
+from dragon_voice.progress_emit import emit_progress_pair
 from dragon_voice.messages import MessageStore
 from dragon_voice.handlers import (
     config_api as _handlers_config_api,
@@ -1113,6 +1115,22 @@ class VoiceServer:
 
         # Store tool event callbacks per-connection (NOT on shared conversation engine)
         if self._tool_registry:
+            # β-arch (issue #123): adapter so emit_progress_pair (which
+            # takes an OnEvent: Callable[[dict], Awaitable[None]]) can
+            # use the existing _safe_send_json swallow.  Returning
+            # True/False from the helper is harmless — the pair helper
+            # awaits but discards the return.
+            async def _emit_via_ws(ev: dict) -> None:
+                await self._safe_send_json(ws, ev)
+
+            # Read the bus transition flag once at registration time —
+            # not hot-reloaded.
+            _emit_legacy = bool(getattr(
+                conn_state.get("config"),
+                "progress_bus_emit_legacy",
+                True,
+            ))
+
             async def _on_tool_call(call):
                 # #75 phase 1b: pre-register the call + args in the
                 # per-turn tracker so `_on_tool_result` can merge the
@@ -1127,16 +1145,41 @@ class VoiceServer:
                 except Exception:
                     logger.debug("tool_calls_this_turn pre-register suppressed", exc_info=True)
                 if not ws.closed:
-                    await self._safe_send_json(ws, {
-                        "type": "tool_call",
-                        "tool": call["tool"],
-                        "args": call["args"],
-                    })
+                    # β-arch (issue #123): pair-emit — legacy
+                    # `tool_call` for unmodified Tab5 + new
+                    # progress.tool.start with the same payload nested.
+                    await emit_progress_pair(
+                        _emit_via_ws,
+                        legacy={
+                            "type": "tool_call",
+                            "tool": call["tool"],
+                            "args": call["args"],
+                        },
+                        phase=Phase.TOOL,
+                        stage=Stage.START,
+                        payload={"tool": call["tool"], "args": call["args"]},
+                        emit_legacy=_emit_legacy,
+                    )
 
             async def _on_tool_result(result):
                 if ws.closed:
                     return
-                await ws.send_json({"type": "tool_result", **result})
+                # β-arch (issue #123): pair-emit — legacy
+                # `tool_result` (with all result fields spread at top
+                # level) + new progress.tool.done with the same fields
+                # nested in payload for the unified bus.
+                await emit_progress_pair(
+                    _emit_via_ws,
+                    legacy={"type": "tool_result", **result},
+                    phase=Phase.TOOL,
+                    stage=Stage.DONE,
+                    payload={
+                        "tool": result.get("tool"),
+                        "result": result.get("result"),
+                        "execution_ms": result.get("execution_ms"),
+                    },
+                    emit_legacy=_emit_legacy,
+                )
                 # #75 phase 1b: merge result into the most-recent
                 # pre-registered call for this tool name (fills the
                 # FIRST pending slot so same-tool-twice-in-one-turn
@@ -1203,12 +1246,28 @@ class VoiceServer:
                 if ws.closed:
                     return
                 tool_name = err.get("name") or "(unknown)"
-                await self._safe_send_json(ws, error_event(
+                # β-arch (issue #123): pair-emit — legacy γ1 error
+                # frame (already structured per #102) + new
+                # progress.tool.error frame for the unified bus.
+                # Both carry the same code/message/severity/scope
+                # so γ2-H8 routing applies regardless of which
+                # frame Tab5 reads.
+                await emit_progress_pair(
+                    _emit_via_ws,
+                    legacy=error_event(
+                        code="tool_args_invalid",
+                        message=f"Tool '{tool_name}' had invalid arguments — skipped.",
+                        severity=Severity.TRANSIENT,
+                        scope=Scope.TOOL,
+                    ),
+                    phase=Phase.TOOL,
+                    stage=Stage.ERROR,
                     code="tool_args_invalid",
                     message=f"Tool '{tool_name}' had invalid arguments — skipped.",
                     severity=Severity.TRANSIENT,
                     scope=Scope.TOOL,
-                ))
+                    emit_legacy=_emit_legacy,
+                )
 
             conn_state["on_tool_call"] = _on_tool_call
             conn_state["on_tool_result"] = _on_tool_result

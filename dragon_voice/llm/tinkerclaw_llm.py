@@ -43,6 +43,16 @@ _SSE_MAX_LINE_BYTES = 256 * 1024          # 256 KiB — one SSE "data: ..." fram
 _SSE_MAX_STREAM_BYTES = 16 * 1024 * 1024  # 16 MiB — whole response total
 _SSE_MAX_TOKENS = 50_000                  # ~200 KB of text, generous
 
+# Audit C7 (#137): pre-stream max_tokens cap.  The TC gateway used to
+# receive payloads with no max_tokens, letting MiniMax (or whichever
+# upstream model TC routed to) generate unbounded — Dragon's
+# server-side _SSE_MAX_TOKENS abort would only fire after we'd
+# already paid for the over-generated tokens.  Sending a sane cap in
+# the payload tells the upstream to stop early.  4096 is a generous
+# voice-reply budget (~16 KB of text) while still well under the
+# server-side abort threshold.
+_TC_REPLY_MAX_TOKENS = 4096
+
 # #B1 (TinkerTab audit 2026-04-24): chain-of-thought / tool-loop preamble
 # that TinkerClaw agents routinely leak into the user-facing reply when a
 # tool fails ("That didn't work well. Let me try another approach:…Let me
@@ -278,6 +288,9 @@ class TinkerClawBackend(LLMBackend):
             "model": self._model,
             "messages": messages,
             "stream": True,
+            # Audit C7 (#137): pre-stream cap so the upstream model
+            # doesn't generate beyond what we'll accept (and bill).
+            "max_tokens": _TC_REPLY_MAX_TOKENS,
         }
         if self._session_key:
             payload["user"] = self._session_key

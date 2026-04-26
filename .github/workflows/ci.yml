@@ -74,4 +74,5 @@ jobs:
             tests/test_ws_dispatcher_cancellation.py \
             tests/test_dictation_post_process_events.py \
             tests/test_incremental_tool_marker_detection.py \
-            tests/test_tts_flush_and_kill.py
+            tests/test_tts_flush_and_kill.py \
+            tests/test_ws_upgrade_errors.py

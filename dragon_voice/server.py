@@ -542,7 +542,19 @@ class VoiceServer:
                 logger.warning(
                     "WS /ws/voice: rejecting unauthenticated upgrade from %s (header_present=%s)",
                     request.remote, bool(auth_header))
-                return web.Response(text="Unauthorized", status=401)
+                # γ3-Dragon (issue #111): JSON body with `code` so future
+                # ops tooling / dashboard introspection can distinguish
+                # auth failure from other 401 sources without parsing
+                # prose.  Tab5 (γ3-Tab5 follow-up) still uses the raw
+                # status code for its stop-retry decision since
+                # esp_websocket_client doesn't expose the body cleanly.
+                return web.json_response(
+                    {
+                        "code": "auth_failed",
+                        "message": "Invalid Dragon token — check Settings.",
+                    },
+                    status=401,
+                )
         else:
             logger.warning(
                 "WS /ws/voice: server.api_token not configured — allowing "
@@ -551,7 +563,15 @@ class VoiceServer:
         # Reject if at connection limit
         if len(self._active_connections) >= self._max_connections:
             logger.warning("Connection limit reached (%d), rejecting", self._max_connections)
-            return web.Response(text="Too many connections", status=503)
+            # γ3-Dragon (issue #111): same JSON-body treatment as the
+            # 401 path above — see comment there for rationale.
+            return web.json_response(
+                {
+                    "code": "server_full",
+                    "message": "Dragon is at capacity — try again in a moment.",
+                },
+                status=503,
+            )
 
         # v4·D connectivity audit -- ROOT CAUSE FIX #3.
         #

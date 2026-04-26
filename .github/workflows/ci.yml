@@ -94,4 +94,5 @@ jobs:
             tests/test_openrouter_tts_errors.py \
             tests/test_max_tool_calls_signal.py \
             tests/test_audio_resample.py \
-            tests/test_dictation_post_process_race.py
+            tests/test_dictation_post_process_race.py \
+            tests/test_b6_hybrid_first_utterance.py

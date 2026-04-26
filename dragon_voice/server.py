@@ -1904,10 +1904,24 @@ class VoiceServer:
         # v4·D audit P1: rate-limit config_update to 2/sec/conn.  A buggy
         # skill or trigger-happy test harness could storm mode swaps that
         # each do heavy backend init.
+        #
+        # Audit C1 (#137): pre-fix this was a silent `logger.debug` +
+        # `return` — Tab5's mode-toggle UI sat on its previous local
+        # state and the user assumed the swap landed.  Now we emit a
+        # γ-arch TRANSIENT/SESSION error so Tab5 (γ2-H8) can render a
+        # toast like "Slow down — give the swap a moment."  Defensive:
+        # only emit if the WS is still open.
         _now_cfg = time.monotonic()
         _last_cfg = conn_state.get("_last_config_update_ts", 0.0)
         if _now_cfg - _last_cfg < 0.5:
             logger.debug("config_update rate-limited on %s", ws_id)
+            if not ws.closed:
+                await self._safe_send_json(ws, error_event(
+                    code="config_update_rate_limited",
+                    message="Mode swap rate-limited — try again in a moment.",
+                    severity=Severity.TRANSIENT,
+                    scope=Scope.SESSION,
+                ))
             return
         conn_state["_last_config_update_ts"] = _now_cfg
 

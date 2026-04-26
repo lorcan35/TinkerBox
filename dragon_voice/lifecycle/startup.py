@@ -133,6 +133,32 @@ async def run_startup(server: Any, app: web.Application) -> None:
     server._surface_mgr = SurfaceManager()
     logger.info("SurfaceManager initialized")
 
+    # Phase 5 ε1a (issue #128): in-process scheduler.  In-memory
+    # store for Tier 1 — ε2 swaps in SqliteNotificationStore via a
+    # one-line change here.  Wired AFTER SurfaceManager + SessionManager
+    # exist (manager depends on both at fire time per RFC A3) and
+    # BEFORE widget-emitting tool registration so ScheduleReminderTool
+    # can be registered alongside its peers.
+    server._scheduler_mgr = None
+    try:
+        from dragon_voice.scheduler import (
+            InMemoryNotificationStore,
+            SchedulerManager,
+        )
+        server._scheduler_store = InMemoryNotificationStore()
+        server._scheduler_mgr = SchedulerManager(
+            store=server._scheduler_store,
+            surface_mgr=server._surface_mgr,
+            session_mgr=server._session_mgr,
+        )
+        await server._scheduler_mgr.start()
+        logger.info(
+            "SchedulerManager initialized (store=%s)",
+            type(server._scheduler_store).__name__,
+        )
+    except Exception as e:
+        logger.warning("SchedulerManager init failed: %s", e)
+
     # Register widget-emitting tools AFTER surface_mgr exists.
     if server._tool_registry is not None:
         try:
@@ -146,6 +172,21 @@ async def run_startup(server: Any, app: web.Application) -> None:
             logger.info("QuickPollTool registered (declarative widget skill)")
         except Exception as e:
             logger.warning("TimesenseTool registration failed: %s", e)
+
+        # Phase 5 ε1a: scheduler tool registration.  Separate try
+        # block so a tool-init error doesn't take down the rest of
+        # the registry.
+        if server._scheduler_mgr is not None:
+            try:
+                from dragon_voice.tools.schedule_reminder_tool import (
+                    ScheduleReminderTool,
+                )
+                server._tool_registry.register(
+                    ScheduleReminderTool(server._scheduler_mgr, server._db)
+                )
+                logger.info("ScheduleReminderTool registered (scheduler skill)")
+            except Exception as e:
+                logger.warning("ScheduleReminderTool registration failed: %s", e)
 
     # Conversation engine (shared LLM backend for text/API input)
     server._conversation = ConversationEngine(

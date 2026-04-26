@@ -66,6 +66,16 @@ async def run_shutdown(server: Any, app: web.Application) -> None:
         except (asyncio.CancelledError, Exception):
             pass
 
+    # Phase 5 ε1a (issue #128): cancel scheduler tasks BEFORE pipeline
+    # drain so an in-flight notification fire doesn't race with a
+    # closed WS.  Pattern matches the cancel-then-await discipline
+    # above (W14-M09 fix).
+    if getattr(server, "_scheduler_mgr", None):
+        try:
+            await server._scheduler_mgr.shutdown()
+        except Exception:
+            logger.debug("SchedulerManager shutdown raised", exc_info=True)
+
     # Drain per-connection pipelines
     tasks = []
     for _ws_id, conn in list(server._active_connections.items()):

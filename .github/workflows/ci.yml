@@ -100,4 +100,5 @@ jobs:
             tests/test_voice_tts_timeout.py \
             tests/test_tc_pre_stream_cap.py \
             tests/test_dictation_buffer_cap_signal.py \
-            tests/test_hybrid_tts_fast_path.py
+            tests/test_hybrid_tts_fast_path.py \
+            tests/test_missing_key_gamma_arch.py

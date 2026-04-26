@@ -1999,22 +1999,40 @@ class VoiceServer:
                     # Audit G5 (2026-04-20): revert to Local so Tab5 doesn't
                     # sit wedged on mode 3 showing an error. Matches the
                     # OpenRouter-key-missing path below.
+                    # Audit D5 (#137): same γ-arch shape as B7 / OR-key
+                    # for consistency — error_event + plain config_update
+                    # revert.
                     if not ws.closed:
-                        await ws.send_json({
+                        await self._safe_send_json(ws, error_event(
+                            code="tc_gateway_unreachable",
+                            message="TinkerClaw gateway is not reachable — reverted to local.",
+                            severity=Severity.FATAL,
+                            scope=Scope.GATEWAY,
+                        ))
+                        await self._safe_send_json(ws, {
                             "type": "config_update",
-                            "error": "TinkerClaw gateway is not reachable",
                             "voice_mode": 0,
                         })
                     return
 
             # Validate API key for cloud modes (1=Hybrid, 2=Cloud need OpenRouter)
-            # Mode 3 (TinkerClaw) doesn't need Dragon's OpenRouter key — uses own gateway
+            # Mode 3 (TinkerClaw) doesn't need Dragon's OpenRouter key — uses own gateway.
+            #
+            # Audit D5 (#137): pre-fix the toast was a bare
+            # `config_update.error` raw-string that didn't tell the user
+            # what happened next.  Migrated to the same γ-arch error_event
+            # + revert pattern as B7 (TC token check) for consistency.
             if voice_mode in (1, 2) and not conn_config.llm.openrouter_api_key:
                 logger.error("Cloud mode requested but no API key configured")
                 if not ws.closed:
-                    await ws.send_json({
+                    await self._safe_send_json(ws, error_event(
+                        code="openrouter_key_missing",
+                        message="OpenRouter key not configured — reverted to local.",
+                        severity=Severity.FATAL,
+                        scope=Scope.LLM,
+                    ))
+                    await self._safe_send_json(ws, {
                         "type": "config_update",
-                        "error": "No OpenRouter API key configured",
                         "voice_mode": 0,
                     })
                 return

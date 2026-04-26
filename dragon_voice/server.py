@@ -1113,6 +1113,31 @@ class VoiceServer:
                     await self._safe_send_json(ws, msg)
             await self._surface_mgr.register_session(session_id, _surface_send, caps=conn_state.get("widget_capabilities"))
 
+        # Phase 5 ε2 (issue #131): replay any queued offline
+        # notifications for this device.  Hook fires AFTER
+        # SurfaceManager.register_session so the scheduler manager
+        # can find a live Tab5Surface for this session.  Best-effort:
+        # a queue-drain failure logs a warning but doesn't block
+        # registration (the user's reminders just stay queued for
+        # the next register).
+        scheduler_mgr = getattr(self, "_scheduler_mgr", None)
+        if scheduler_mgr is not None:
+            try:
+                replayed = await scheduler_mgr.replay_queued_for_device(
+                    device_id,
+                )
+                if replayed > 0:
+                    logger.info(
+                        "Scheduler offline-queue replay: delivered %d "
+                        "frame(s) to %s on session %s",
+                        replayed, device_id, session_id,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Scheduler offline-queue replay failed for %s: %s",
+                    device_id, e,
+                )
+
         # Store tool event callbacks per-connection (NOT on shared conversation engine)
         if self._tool_registry:
             # β-arch (issue #123): adapter so emit_progress_pair (which

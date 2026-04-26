@@ -64,6 +64,8 @@ jobs:
             tests/test_progress_event.py \
             tests/test_scheduler_api.py \
             tests/test_scheduler_manager.py \
+            tests/test_scheduler_replay.py \
+            tests/test_scheduler_store_sqlite.py \
             tests/test_scheduler_tool.py \
             tests/test_scheduler_when_parser.py \
             tests/test_config_redact.py \

@@ -197,3 +197,56 @@ CREATE TABLE IF NOT EXISTS memory_chunks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_chunks_doc ON memory_chunks(document_id, chunk_index);
+
+
+-- ── Scheduled Notifications (F-T2 / Phase 5 ε2) ───────────────────
+-- Pending and historical reminders.  Job-firing logic lives in
+-- dragon_voice/scheduler/manager.py; this is just durable backing
+-- store so notifications survive Dragon restart.
+
+CREATE TABLE IF NOT EXISTS scheduled_notifications (
+    id            TEXT PRIMARY KEY,                       -- short uuid (sched_<12hex>)
+    device_id     TEXT,                                   -- delivery target; NULL = broadcast (unused Tier 1/2)
+    originating_session_id TEXT,                          -- session that scheduled it (UX context only)
+    fire_at       REAL NOT NULL,                          -- UTC epoch float, matches sessions.last_active_at
+    title         TEXT NOT NULL DEFAULT 'Reminder',       -- ≤63 chars (widget_card.title cap)
+    body          TEXT NOT NULL DEFAULT '',               -- ≤255 chars (widget_card.body cap)
+    tone          TEXT NOT NULL DEFAULT 'info'
+                  CHECK(tone IN ('info', 'warn', 'success', 'danger')),
+    status        TEXT NOT NULL DEFAULT 'pending'
+                  CHECK(status IN ('pending', 'fired', 'cancelled', 'failed')),
+    recurrence    TEXT,                                   -- NULL in Tier 2.0; reserved for cron-like spec
+    created_at    REAL NOT NULL,
+    fired_at      REAL,                                   -- NULL until fired
+    cancelled_at  REAL,                                   -- NULL until cancelled
+    FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+);
+
+-- Hot path: list_due(now) reads pending sorted by fire_at.
+CREATE INDEX IF NOT EXISTS idx_sched_pending_fire
+    ON scheduled_notifications(status, fire_at);
+
+-- Per-device list/cancel: O(log N) lookup.
+CREATE INDEX IF NOT EXISTS idx_sched_device
+    ON scheduled_notifications(device_id, fire_at DESC);
+
+
+-- ── Notification Queue (per-device offline replay) ────────────────
+-- When a notification fires while the device is offline, we queue
+-- the *rendered* widget_card payload here for replay on next register.
+-- Separate from scheduled_notifications because:
+--   * queued items are post-fire (state has already advanced)
+--   * replay-spam cap (50 items per device) lives at this layer
+--   * device-FK semantics matter: device removed → queue purged
+
+CREATE TABLE IF NOT EXISTS notification_queue (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    device_id       TEXT NOT NULL,
+    notification_id TEXT,                                 -- FK to scheduled_notifications.id
+    payload         TEXT NOT NULL,                        -- JSON: full widget_card frame
+    queued_at       REAL NOT NULL,
+    FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_notif_queue_device
+    ON notification_queue(device_id, queued_at ASC);

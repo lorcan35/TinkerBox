@@ -822,6 +822,21 @@ class VoiceServer:
                             logger.info("Connection %s: cancel → pipeline.cancel", ws_id)
                             await pipeline.cancel()
                             cancelled_what.append("pipeline")
+                        # Audit B1 (#165): also drop any scheduler-fired
+                        # widgets that deferred during this turn — user
+                        # cancelled the turn, so any reminder that fired
+                        # during it should also disappear (a fresh fire
+                        # cycle will pop on the next turn-idle window if
+                        # the scheduler still wants to deliver it).
+                        sid = conn_state.get("session_id")
+                        if self._surface_mgr is not None and sid:
+                            dropped = self._surface_mgr.discard_deferred(sid)
+                            if dropped:
+                                logger.info(
+                                    "Connection %s: cancel → discarded %d deferred widget(s)",
+                                    ws_id, dropped,
+                                )
+                                cancelled_what.append(f"deferred:{dropped}")
                         # Send ack so Tab5 has a positive signal that cancel
                         # landed — matters because Tab5 transitions to READY
                         # locally on cancel-send and may otherwise see late
@@ -1382,6 +1397,10 @@ class VoiceServer:
             on_tool_call=conn_state.get("on_tool_call"),
             on_tool_result=conn_state.get("on_tool_result"),
             on_tool_error=conn_state.get("on_tool_error"),
+            # Audit B1 (#165): surface_mgr lets the pipeline gate
+            # scheduler-fired widgets so they don't interleave with
+            # LLM token frames.
+            surface_mgr=self._surface_mgr,
         )
         try:
             await pipeline.initialize()
@@ -1507,6 +1526,26 @@ class VoiceServer:
         # callback accumulates here so the end-of-turn empty-reply guard
         # can synthesise a template wrap from what actually fired.
         conn_state["tool_calls_this_turn"] = []
+
+        # Audit B1 (#165): mark turn busy so scheduler-fired widgets
+        # defer until this text turn completes — prevents the
+        # `llm token / widget_card / llm token` interleave.
+        if self._surface_mgr is not None:
+            self._surface_mgr.mark_turn_start(session_id)
+        try:
+            await self._handle_text_body(ws, conn_state, cmd, text, session_id, content)
+        finally:
+            if self._surface_mgr is not None:
+                try:
+                    await self._surface_mgr.mark_turn_end(session_id)
+                except Exception:
+                    logger.exception("B1: turn-end drain failed for text turn")
+
+    async def _handle_text_body(
+        self, ws: web.WebSocketResponse, conn_state: dict, cmd: dict,
+        text: str, session_id: str, content: str,
+    ) -> None:
+        """Body of _handle_text, wrapped by the B1 turn-gate bracket above."""
 
         # TinkerClaw mode: bypass ConversationEngine, use ConversationEngine's
         # swapped LLM (not pipeline._llm which may be stale after swap race)

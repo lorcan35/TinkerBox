@@ -26,6 +26,16 @@ class _SessionState:
     surface: Tab5Surface
     action_handlers: Dict[str, ActionHandler] = field(default_factory=dict)
     # card_id -> handler. Skills register their own card_ids.
+    # Audit B1 (#165): per-session turn-gate.  `turn_busy` is True
+    # while a voice or text turn is mid-LLM/TTS — out-of-band emits
+    # (scheduler reminder fires) defer until the turn completes so
+    # they don't interleave between `llm` token frames.
+    turn_busy: bool = False
+    # Each entry is a zero-arg async callable that performs the
+    # deferred send.  Stored as callables (not raw msg + send) so the
+    # eventual send-time guard (e.g. `if ws.closed: skip`) lives at
+    # the call site, not here.
+    deferred_emits: list = field(default_factory=list)
 
 
 class SurfaceManager:
@@ -51,6 +61,10 @@ class SurfaceManager:
 
     async def unregister_session(self, session_id: str) -> None:
         async with self._lock:
+            # Audit B1 (#165): pop drops the deferred-emits queue too —
+            # no point trying to deliver them after the session is
+            # gone.  Their callers' send_fn would no-op on closed WS
+            # anyway, but we save the wasted attempts.
             self._sessions.pop(session_id, None)
             log.info("surface unregistered: session=%s", session_id)
 
@@ -74,6 +88,94 @@ class SurfaceManager:
         if not state:
             return
         state.action_handlers.pop(card_id, None)
+
+    # ── Audit B1 (#165): TurnGate — defer out-of-band emits while a
+    #    voice/text turn is mid-LLM, drain on turn end, discard on
+    #    cancel.  Used by SchedulerManager so reminder fires don't
+    #    interleave between LLM token frames.
+
+    def mark_turn_start(self, session_id: str) -> None:
+        """Mark this session as mid-turn — out-of-band emits will be
+        deferred until `mark_turn_end` (or dropped via `discard_deferred`).
+
+        Idempotent — safe to call when already busy.  No-op for
+        unknown sessions (the session may have unregistered between
+        the caller's check and now).
+        """
+        state = self._sessions.get(session_id)
+        if state is None:
+            return
+        state.turn_busy = True
+
+    async def mark_turn_end(self, session_id: str) -> None:
+        """Clear the turn-busy flag and drain any deferred emits in
+        FIFO order.  Each deferred callable is awaited; an exception
+        in one does not block the rest (logged + skipped).
+
+        Safe to call when no turn was in flight (no-op).
+        """
+        state = self._sessions.get(session_id)
+        if state is None:
+            return
+        state.turn_busy = False
+        if not state.deferred_emits:
+            return
+        pending = state.deferred_emits
+        state.deferred_emits = []
+        for fn in pending:
+            try:
+                await fn()
+            except Exception:
+                log.exception(
+                    "deferred emit raised on turn-end drain for session=%s",
+                    session_id,
+                )
+
+    def discard_deferred(self, session_id: str) -> int:
+        """Drop all deferred emits without sending.  Returns the count
+        dropped.  Used by the WS cancel handler so a user-initiated
+        stop also suppresses any reminder that fired during the turn.
+        Does NOT clear the turn_busy flag — caller still needs to
+        eventually call `mark_turn_end` (or the surface
+        unregister hook).
+        """
+        state = self._sessions.get(session_id)
+        if state is None or not state.deferred_emits:
+            return 0
+        n = len(state.deferred_emits)
+        state.deferred_emits.clear()
+        return n
+
+    def is_turn_busy(self, session_id: str) -> bool:
+        """True if a voice/text turn is currently in flight for this
+        session.  Out-of-band emitters use this to decide whether to
+        send immediately or defer."""
+        state = self._sessions.get(session_id)
+        return bool(state and state.turn_busy)
+
+    async def defer_or_send(
+        self,
+        session_id: str,
+        send_fn: Callable[[], Awaitable[Any]],
+    ) -> bool:
+        """Either run `send_fn()` now (turn idle / unknown session) or
+        queue it for the next `mark_turn_end` drain.
+
+        Returns True if the emit ran immediately, False if it was
+        deferred.  Unknown-session always returns True (and runs the
+        send_fn) — caller's send_fn is expected to be defensive
+        (e.g. check ws.closed) so a vanished session won't raise.
+        """
+        state = self._sessions.get(session_id)
+        if state is None or not state.turn_busy:
+            await send_fn()
+            return True
+        state.deferred_emits.append(send_fn)
+        log.debug(
+            "deferred out-of-band emit for session=%s (queue=%d)",
+            session_id, len(state.deferred_emits),
+        )
+        return False
 
     async def handle_action(
         self,

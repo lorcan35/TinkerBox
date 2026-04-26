@@ -65,6 +65,16 @@ def _make_manager(
     else:
         fake_surface_mgr.surface_for = MagicMock(return_value=surface_for_returns)
 
+    # Audit B1 (#165): defer_or_send routes the scheduler's emit
+    # through the turn-gate.  In tests we always run the callable
+    # immediately (mimicking "turn idle") so the captured-emits list
+    # gets populated synchronously like before.
+    async def _defer_or_send(session_id, send_fn):
+        await send_fn()
+        return True
+
+    fake_surface_mgr.defer_or_send = _defer_or_send
+
     # Stub SessionManager — list_sessions(device_id, status="active")
     # returns either [active_session] or [] (offline / no session).
     fake_session_mgr = MagicMock()

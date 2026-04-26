@@ -364,23 +364,46 @@ class SchedulerManager:
             await self._store.mark_fired(notif_id)
             return
 
+        # Audit B1 (#165): out-of-band reminder fires must not
+        # interleave between LLM token frames during an in-flight
+        # turn.  Route through SurfaceManager.defer_or_send: when the
+        # session is mid-turn the emit queues until turn-end-drain;
+        # when idle it fires immediately.  Tool-call widgets (TimeSense,
+        # QuickPoll, etc.) are NOT routed through the gate — they're
+        # synchronous to the turn and should land immediately.
+        async def _send_card() -> None:
+            try:
+                await surface.card(
+                    title=notif.title,
+                    body=notif.body,
+                    tone=notif.tone,
+                    icon="bell",
+                    action=("Dismiss", "scheduler.dismiss"),
+                    card_id=card_id,
+                    skill_id="scheduler",
+                )
+                logger.info(
+                    "Notification %s delivered → device=%s session=%s",
+                    notif_id, notif.device_id, session["id"],
+                )
+            except Exception as e:
+                logger.warning(
+                    "Notification %s fire delivery failed (still marking fired): %s",
+                    notif_id, e,
+                )
+
         try:
-            await surface.card(
-                title=notif.title,
-                body=notif.body,
-                tone=notif.tone,
-                icon="bell",
-                action=("Dismiss", "scheduler.dismiss"),
-                card_id=card_id,
-                skill_id="scheduler",
+            sent_now = await self._surface_mgr.defer_or_send(
+                session["id"], _send_card,
             )
-            logger.info(
-                "Notification %s fired → device=%s session=%s",
-                notif_id, notif.device_id, session["id"],
-            )
+            if not sent_now:
+                logger.info(
+                    "Notification %s deferred (turn busy) → device=%s session=%s",
+                    notif_id, notif.device_id, session["id"],
+                )
         except Exception as e:
             logger.warning(
-                "Notification %s fire delivery failed (still marking fired): %s",
+                "Notification %s defer-or-send routing failed (still marking fired): %s",
                 notif_id, e,
             )
         await self._store.mark_fired(notif_id)

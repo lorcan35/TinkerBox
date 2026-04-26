@@ -341,3 +341,47 @@ def test_with_errors_does_not_emit_when_dialect2_lacks_name_field() -> None:
     )
     assert calls == []
     assert errors == []
+
+
+# ───────────────────────── #134 — schedule_reminder visibility
+
+
+def test_schedule_reminder_in_compact_priority_list() -> None:
+    """Issue #134: local LLM (compact format) was missing
+    schedule_reminder from its priority list, causing it to
+    hallucinate "no such tool" when users asked for reminders.
+
+    Pin so future priority-list refactors don't drop it again.
+    """
+    from dragon_voice.tools.base import Tool
+
+    class _StubReminder(Tool):
+        @property
+        def name(self) -> str:
+            return "schedule_reminder"
+        @property
+        def description(self) -> str:
+            return "Schedule a reminder"
+        @property
+        def parameters_schema(self) -> dict:
+            return {"type": "object", "properties": {"when": {"type": "string"}}, "required": ["when"]}
+        async def execute(self, args):
+            return {"ok": True}
+
+    r = ToolRegistry()
+    r.register(_StubReminder())
+    # also register some non-priority tools to verify filtering
+    r.register(_FakeTool("calculator"))
+    r.register(_FakeTool("note"))
+    r.register(_FakeTool("weather"))
+
+    compact = r.format_for_llm(compact=True)
+    assert "schedule_reminder" in compact, (
+        "Issue #134 regression: schedule_reminder missing from compact "
+        "format — local LLM will hallucinate 'no such tool'"
+    )
+    # And the existing priority tools are still there
+    assert "calculator" in compact
+    # Non-priority tools NOT in compact (note + weather should be excluded)
+    assert "note: " not in compact  # avoid matching schedule_reminder description
+    assert "weather: " not in compact

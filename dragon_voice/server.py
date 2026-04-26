@@ -14,7 +14,6 @@ import copy
 import json
 import logging
 import os
-import re
 import time
 from typing import AsyncIterator, Optional
 
@@ -53,56 +52,8 @@ from dragon_voice.middleware import (
 )
 from dragon_voice.pipeline import VoicePipeline
 from dragon_voice.sessions import SessionManager
-from dragon_voice.tools.response_wrap import synthesize_wrap
+from dragon_voice.tools.response_wrap import looks_like_useful_text, synthesize_wrap
 
-
-# #75 phase 1b refinement: the "is the model's reply empty enough that we
-# should prefer the template wrap?" check.  Strict `not text.strip()` is
-# too narrow — gemma3:4b's 10-prompt G2 (math) emitted a single stray
-# bracket `<` that survived ConversationEngine's tool-XML stripping,
-# which made the original guard see "non-empty" and skip the wrap.
-# Net result: tool fires, wrap synthesised "456 * 789 = 359784", but the
-# user got a chat bubble containing just `<`.
-#
-# Heuristic: a reply is "useful" only if, after stripping whitespace and
-# stripping stray-bracket/punctuation noise, at least 3 word characters
-# remain.  Below that we treat it as junk and prefer the wrap.
-_BRACKET_NOISE = set("<>[]{}()\"'` \t\n\r")
-
-
-_RESIDUAL_XML_TAG = re.compile(r"<[^>]*>|\[[^]]*\]|\{[^}]*\}")
-
-
-def _looks_like_useful_text(text: str) -> bool:
-    """True if `text` carries enough signal to be worth showing the user
-    over a templated tool-result ack.  Designed to fail "open" — when in
-    doubt, treat the model's text as useful (avoid clobbering real content).
-
-    Heuristic:
-      1. If the input contains a closing-tag pattern like `</word>` it is
-         almost certainly a residual tool-XML leak (ConversationEngine
-         already strips well-formed tool blocks; what reaches here would
-         be a malformed remainder like `[tool]remember</tool><args>...`).
-         Treat as junk.
-      2. Otherwise strip well-formed `<…>` / `[…]` / `{…}` blocks,
-         strip whitespace + bracket-noise chars, and require ≥ 3
-         meaningful chars.
-    """
-    if not text:
-        return False
-    # Closing-tag fingerprint — proven residual leak from FC models like
-    # xLAM that emit `[tool]name</tool><args>{json}</args>` with broken
-    # opening brackets.  Stripping `[tool]` + `</tool>` + `<args>` +
-    # `</args>` + `{json}` would leave the literal tool name like
-    # "remember" which superficially looks like 8 meaningful chars but
-    # is just registry noise we don't want to show the user.
-    if re.search(r"</\w+>", text):
-        return False
-    stripped = _RESIDUAL_XML_TAG.sub("", text).strip()
-    if len(stripped) < 3:
-        return False
-    meaningful = [c for c in stripped if c not in _BRACKET_NOISE]
-    return len(meaningful) >= 3
 
 logger = logging.getLogger(__name__)
 
@@ -1383,13 +1334,18 @@ class VoiceServer:
         conn_config.llm.max_tokens = MAX_TOKENS_LOCAL
 
         # NOW initialize the voice pipeline (slow: Moonshine load ~2s)
-        # This happens AFTER session_start is sent so Tab5 doesn't timeout
+        # This happens AFTER session_start is sent so Tab5 doesn't timeout.
+        # Audit A2 (#142): pass the per-conn tool callbacks built above so
+        # voice turns surface tool indicators just like text turns do.
         pipeline = VoicePipeline(
             conn_config, on_audio, on_event,
             conversation_engine=self._conversation,
             session_id=session_id,
             media_pipeline=self._media_pipeline,
             backend_pool=self._backend_pool,
+            on_tool_call=conn_state.get("on_tool_call"),
+            on_tool_result=conn_state.get("on_tool_result"),
+            on_tool_error=conn_state.get("on_tool_error"),
         )
         try:
             await pipeline.initialize()
@@ -1587,8 +1543,8 @@ class VoiceServer:
             #      when there were zero tool fires (e.g. real LLM error).
             # #75 phase 1b refinement: trigger wrap when reply is
             # bracket-noise-only too, not just strict-empty.  See
-            # _looks_like_useful_text above for the heuristic.
-            if not _looks_like_useful_text(response_text):
+            # looks_like_useful_text above for the heuristic.
+            if not looks_like_useful_text(response_text):
                 tool_calls = conn_state.get("tool_calls_this_turn") or []
                 if tool_calls:
                     fallback = synthesize_wrap(tool_calls)
@@ -1749,7 +1705,7 @@ class VoiceServer:
             # Tab5 doesn't render an empty bubble.  Same intent as the
             # TC-path guard above, just applied to the local/conversation
             # engine flow.
-            if not _looks_like_useful_text(response_text):
+            if not looks_like_useful_text(response_text):
                 tool_calls = conn_state.get("tool_calls_this_turn") or []
                 if tool_calls:
                     wrap = synthesize_wrap(tool_calls)
@@ -2355,7 +2311,7 @@ class VoiceServer:
         # #75 phase 1b: vision path gets the same empty-reply guard as
         # the text paths.  Multimodal models can fire a tool (e.g.
         # `note` to save a snapshot caption) and stop without text.
-        if not _looks_like_useful_text("".join(full_response)):
+        if not looks_like_useful_text("".join(full_response)):
             tool_calls = conn_state.get("tool_calls_this_turn") or []
             if tool_calls:
                 wrap = synthesize_wrap(tool_calls)

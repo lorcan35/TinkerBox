@@ -1252,9 +1252,15 @@ class VoicePipeline:
                 self._tts_started = True
 
             t0 = time.monotonic()
+            # Audit C3 (#137): mode-aware TTS budget.  Pre-fix the voice
+            # path used a flat 30 s, which was OK for cloud but tight
+            # for local Piper on a long sentence (Piper takes 15-25 s
+            # for a 200-word reply on Q6A ARM64).  Match the text-path's
+            # 90 s for non-OpenRouter / 30 s for OpenRouter.
+            tts_timeout = 30 if self._config.tts.backend == "openrouter" else 90
             try:
                 audio_bytes = await asyncio.wait_for(
-                    self._tts.synthesize(text), timeout=30
+                    self._tts.synthesize(text), timeout=tts_timeout
                 )
             except (Exception, asyncio.TimeoutError) as tts_err:
                 # Phase 2 L3 (issue #94): kill any in-flight Piper
@@ -1279,13 +1285,15 @@ class VoicePipeline:
                         await self._fallback_tts.initialize()
                         logger.info("Pre-warmed fallback TTS (piper) cached")
                     # Phase 2 L3 (issue #94): the fallback Piper itself
-                    # can stall — wrap with the same 30s wait_for and
-                    # kill its procs on a second timeout.  Without the
-                    # second guard a TTS-down scenario with no second
-                    # fallback could leak indefinitely.
+                    # can stall — wrap with a wait_for and kill its
+                    # procs on a second timeout.  Without the second
+                    # guard a TTS-down scenario with no second fallback
+                    # could leak indefinitely.
+                    # Audit C3 (#137): use the same 90 s budget as the
+                    # primary path now that we know Piper can need it.
                     try:
                         audio_bytes = await asyncio.wait_for(
-                            self._fallback_tts.synthesize(text), timeout=30
+                            self._fallback_tts.synthesize(text), timeout=90
                         )
                     except (Exception, asyncio.TimeoutError) as fb_err:
                         if hasattr(self._fallback_tts, "kill_active_procs"):

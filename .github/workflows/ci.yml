@@ -96,4 +96,5 @@ jobs:
             tests/test_audio_resample.py \
             tests/test_dictation_post_process_race.py \
             tests/test_b6_hybrid_first_utterance.py \
-            tests/test_config_update_rate_limit_signal.py
+            tests/test_config_update_rate_limit_signal.py \
+            tests/test_voice_tts_timeout.py

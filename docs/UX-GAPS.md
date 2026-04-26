@@ -160,6 +160,10 @@ PRs.
 **Why fifth:** new capability surface.  Tier-1 is scaffolding for every future
 "skill that fires later" (timer, reminder, deploy notifier, calendar, weather alert).
 
+**Implementation locked in [`docs/RFC-scheduler.md`](RFC-scheduler.md)** —
+ε-design PR carries the full architecture, decomposition into ε1a/ε1b/ε2,
+and risk register.  Read the RFC before starting any implementation PR.
+
 | PR | Scope | Effort |
 |---|---|---|
 | ε-design | RFC: scheduler architecture + Tab5 notification UI surface decision | ~2 h |

@@ -35,7 +35,26 @@ async def periodic_purge_loop(server: Any, days: int) -> None:
 
 
 async def media_cleanup_loop(server: Any) -> None:
-    """Remove expired media uploads every hour."""
+    """Remove expired media uploads every hour.
+
+    δ1 (issue #114): runs ONE cleanup pass immediately on entry
+    BEFORE the first hour-long sleep.  Pre-fix the loop slept first,
+    so backlogged orphans from a prior crash or a freshly-deployed
+    media directory had to wait a full hour for the first sweep.
+    The MediaStore has a 500 MB cap but it's only enforced lazily
+    by this loop, so a busy first hour could blow through it.
+
+    The startup pass uses the same exception swallow as the in-loop
+    pass so a transient failure (e.g. SD-card mount race) still
+    lets the periodic loop start.
+    """
+    # δ1: run cleanup once on entry before sleeping.
+    try:
+        await server._media_store.cleanup()
+        logger.info("Startup media cleanup pass complete")
+    except Exception as e:
+        logger.warning("Startup media cleanup error: %s", e)
+
     while True:
         await asyncio.sleep(3600)
         try:

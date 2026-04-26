@@ -69,15 +69,16 @@ def test_system_endpoint_includes_inference_executor_block() -> None:
 def test_text_path_emits_media_rendering_progress_before_render() -> None:
     """Pin via source inspection so a refactor that drops the progress
     emit re-opens the perceived-stall window between llm_done and
-    media frames."""
+    media frames.  Audit B1 (#165) extracted the body to
+    `_handle_text_body`; the emit lives there now."""
     import inspect
     from dragon_voice.server import VoiceServer
-    src = inspect.getsource(VoiceServer._handle_text)
+    src = inspect.getsource(VoiceServer._handle_text_body)
     assert "has_renderable_content(response_text)" in src, (
-        "_handle_text must guard the progress emit on has_renderable_content"
+        "_handle_text_body must guard the progress emit on has_renderable_content"
     )
     assert '"media_rendering"' in src and '"start"' in src, (
-        "_handle_text must emit type=media_rendering, stage=start"
+        "_handle_text_body must emit type=media_rendering, stage=start"
     )
 
 

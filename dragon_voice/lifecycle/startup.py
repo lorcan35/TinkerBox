@@ -57,7 +57,13 @@ async def run_startup(server: Any, app: web.Application) -> None:
     await server._db.initialize()
 
     # Session manager (with background cleanup)
-    server._session_mgr = SessionManager(server._db)
+    # δ2 / H6 (issue #116): pass long-window paused retention so the
+    # cleanup loop can end sessions that motion-sensor wakeups keep
+    # touching but no real conversation has used in N days.
+    server._session_mgr = SessionManager(
+        server._db,
+        paused_retention_days=server._config.database.paused_session_retention_days,
+    )
     await server._session_mgr.start()
 
     # Message store

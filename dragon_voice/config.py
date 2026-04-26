@@ -145,6 +145,16 @@ class ToolsConfig:
 @dataclass
 class DatabaseConfig:
     message_retention_days: int = 30  # Purge messages older than this (0 = never purge)
+    # δ2 / H6 (issue #116): auto-end sessions in `paused` state whose
+    # `last_active_at` is older than this many days.  Catches the
+    # device-sat-idle-for-a-month-without-motion case that the
+    # existing 30-min stale-session cleanup misses (because Tab5
+    # motion-sensor wakeups every ~20 min refresh `last_active_at`
+    # via the register→resume→touch_session path, even when no real
+    # conversation happened).  Once the session is ended, its
+    # messages purge normally via `purge_old_messages`.  Set to 0 to
+    # disable.
+    paused_session_retention_days: int = 30
 
 
 @dataclass

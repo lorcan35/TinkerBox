@@ -401,7 +401,8 @@ class VoiceServer:
             The live WS to ping.  If already closed, the helper is a no-op.
         interval_s : float, default 5.0
             Seconds between PING frames.  5 s is safely under every
-            Tab5 firmware revision's PONG-watch window (30–45 s).
+            Tab5 firmware revision's PONG-watch window (current
+            firmware: 180 s pong budget; older firmware: 30–45 s).
         ping_timeout_s : float, default 5.0
             How long to wait for the individual `ws.ping()` call to
             return before treating it as a failed ping.  Short so GIL
@@ -624,8 +625,16 @@ class VoiceServer:
                 # internally and they never surface to the message loop), so the
                 # silence check produced a 30-45s false-positive close every cycle.
                 # Liveness is now detected by: (1) WS-level ping/pong timeout on
-                # Tab5 side (45s), (2) this task's send-failure counter above
-                # (3 consecutive send failures), and (3) TCP RST propagation.
+                # Tab5 side (Tab5's voice.c sets ping_interval_sec=15 +
+                # pingpong_timeout_sec=180, so worst-case idle dead-detect ≈ 195 s
+                # — deliberately wide to tolerate slow Ollama LLM turns without
+                # tearing the WS during a legit thinking window), (2) this task's
+                # send-failure counter above (3 consecutive send failures), and
+                # (3) TCP RST propagation.  Audit D1 (#137) flagged "45 s
+                # detection latency" but the actual budget is 195 s — the 45 s
+                # number was from a pre-#75 iteration and the comment is stale.
+                # Lowering the PONG budget below ~120 s reintroduces the LLM-flap
+                # class #75 was built to fix.
                 # _last_client_msg_time is left as-is for potential future use.
 
         _keepalive_task = asyncio.create_task(_ws_keepalive())

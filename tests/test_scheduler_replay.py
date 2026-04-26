@@ -53,6 +53,12 @@ def _make_manager_with_active_session() -> tuple[
     fake_surface.card = _capture_card
     surface_mgr = MagicMock()
     surface_mgr.surface_for = MagicMock(return_value=fake_surface)
+    # Audit B1 (#165): defer_or_send routes the live-fire path
+    # through the turn-gate; in tests we run it immediately.
+    async def _defer_or_send(session_id, send_fn):
+        await send_fn()
+        return True
+    surface_mgr.defer_or_send = _defer_or_send
 
     session_mgr = MagicMock()
     session_mgr.list_sessions = AsyncMock(

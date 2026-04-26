@@ -156,6 +156,7 @@ class VoicePipeline:
         on_tool_call: Optional[Callable[[dict], Awaitable[None]]] = None,
         on_tool_result: Optional[Callable[[dict], Awaitable[None]]] = None,
         on_tool_error: Optional[Callable[[dict], Awaitable[None]]] = None,
+        surface_mgr=None,
     ) -> None:
         """Initialize the pipeline.
 
@@ -185,6 +186,11 @@ class VoicePipeline:
         self._conversation_engine = conversation_engine
         self._session_id = session_id
         self._media_pipeline = media_pipeline
+        # Audit B1 (#165): surface_mgr lets the pipeline tell the
+        # SurfaceManager when a turn is in flight so out-of-band emits
+        # (scheduler reminder fires) defer until the turn ends instead
+        # of interleaving between LLM token frames.
+        self._surface_mgr = surface_mgr
         self._on_tool_call = on_tool_call
         self._on_tool_result = on_tool_result
         self._on_tool_error = on_tool_error
@@ -786,6 +792,11 @@ class VoicePipeline:
         # Audit A3 (#142): clear the per-utterance tool tracker so the
         # empty-reply guard at end-of-stream sees only this turn's fires.
         self._tool_calls_this_turn = []
+        # Audit B1 (#165): mark the SurfaceManager turn as busy so
+        # scheduler-fired widgets defer until we drain on the finally
+        # below.  Idempotent + no-op if surface_mgr/session_id absent.
+        if self._surface_mgr is not None and self._session_id:
+            self._surface_mgr.mark_turn_start(self._session_id)
         pipeline_start = time.monotonic()
 
         try:
@@ -1238,6 +1249,14 @@ class VoicePipeline:
             total_ms = (time.monotonic() - pipeline_start) * 1000
             logger.info("Pipeline total: %.0fms", total_ms)
             self._processing = False
+            # Audit B1 (#165): turn ended — drain any deferred
+            # scheduler-fired widgets now that there's no LLM token
+            # stream to interleave with.
+            if self._surface_mgr is not None and self._session_id:
+                try:
+                    await self._surface_mgr.mark_turn_end(self._session_id)
+                except Exception:
+                    logger.exception("B1: turn-end drain failed")
 
             # Log OpenRouter API usage for cost tracking
             try:

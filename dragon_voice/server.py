@@ -1204,7 +1204,7 @@ class VoiceServer:
                     logger.debug("widget_list auto-emit failed", exc_info=True)
 
             async def _on_tool_error(err: dict):
-                """γ2-M1 (issue #104): emit a `tool_args_invalid` error
+                """γ2-M1 (issue #104): emit a structured tool error
                 frame when the parser swallows malformed JSON args.
 
                 Pre-fix the failure was a silent `logger.warning` —
@@ -1213,6 +1213,12 @@ class VoiceServer:
                 anything was attempted.  Now we surface a TRANSIENT
                 error in the TOOL scope so Tab5 (γ2-H8) can render a
                 non-blocking toast.
+
+                Audit B4 (#137): the err dict's `code` and `message`
+                fields are honoured so ConvEngine can signal e.g.
+                `tool_call_limit_reached` distinct from the original
+                `tool_args_invalid` parse failure.  Default codes
+                preserve back-compat with callers that pre-date B4.
 
                 The raw args are deliberately NOT included in the
                 user-facing message — they may contain prompt-injection
@@ -1223,6 +1229,10 @@ class VoiceServer:
                 if ws.closed:
                     return
                 tool_name = err.get("name") or "(unknown)"
+                code = err.get("code") or "tool_args_invalid"
+                message = err.get("message") or (
+                    f"Tool '{tool_name}' had invalid arguments — skipped."
+                )
                 # β-arch (issue #123): pair-emit — legacy γ1 error
                 # frame (already structured per #102) + new
                 # progress.tool.error frame for the unified bus.
@@ -1232,15 +1242,15 @@ class VoiceServer:
                 await emit_progress_pair(
                     _emit_via_ws,
                     legacy=error_event(
-                        code="tool_args_invalid",
-                        message=f"Tool '{tool_name}' had invalid arguments — skipped.",
+                        code=code,
+                        message=message,
                         severity=Severity.TRANSIENT,
                         scope=Scope.TOOL,
                     ),
                     phase=Phase.TOOL,
                     stage=Stage.ERROR,
-                    code="tool_args_invalid",
-                    message=f"Tool '{tool_name}' had invalid arguments — skipped.",
+                    code=code,
+                    message=message,
                     severity=Severity.TRANSIENT,
                     scope=Scope.TOOL,
                     emit_legacy=_emit_legacy,

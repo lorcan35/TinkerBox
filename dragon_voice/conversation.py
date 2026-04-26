@@ -387,6 +387,36 @@ class ConversationEngine:
 
             response_text = "".join(full_response)
 
+            # Audit B4 (#137): if the LLM emitted ANOTHER tool-call after
+            # MAX_TOOL_CALLS was already hit, surface that to the user
+            # instead of silently stripping the markup.  Pre-fix the
+            # loop just fell through to the strip path and the user saw
+            # a reply that read as if it had been cut off mid-thought
+            # ("Let me check the calendar… <silence>").  Now we emit a
+            # γ-arch TRANSIENT/TOOL error so Tab5 can render a toast
+            # like "Reached the 3-tool limit for this turn — try again."
+            if (self._tool_registry
+                    and self._tool_registry.has_tool_call(response_text)
+                    and tool_calls_made >= MAX_TOOL_CALLS):
+                logger.warning(
+                    "MAX_TOOL_CALLS=%d reached on session %s — emitting "
+                    "tool_call_limit error and stopping the chain",
+                    MAX_TOOL_CALLS, session_id,
+                )
+                if on_tool_error is not None:
+                    try:
+                        await on_tool_error({
+                            "name": "(chain)",
+                            "code": "tool_call_limit_reached",
+                            "message": (
+                                f"Reached the {MAX_TOOL_CALLS}-tool limit for "
+                                "this turn — please ask again to continue."
+                            ),
+                            "limit": MAX_TOOL_CALLS,
+                        })
+                    except Exception as e:
+                        logger.debug("on_tool_error (limit) callback error: %s", e)
+
             # Check for tool calls
             if (self._tool_registry
                     and self._tool_registry.has_tool_call(response_text)

@@ -211,6 +211,11 @@ async def run_startup(server: Any, app: web.Application) -> None:
         memory_service=server._memory_service,
         media_store=server._media_store,
         media_url_signer=server._media_url_signer,
+        # Phase 5 ε1b: scheduler REST surface lights up when the
+        # manager initialised cleanly.  ε1a's startup wiring sets
+        # `_scheduler_mgr = None` if init failed so the guard in
+        # setup_all_routes does the right thing.
+        scheduler_mgr=getattr(server, "_scheduler_mgr", None),
     )
 
     # Notes API routes

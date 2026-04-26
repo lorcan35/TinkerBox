@@ -98,4 +98,5 @@ jobs:
             tests/test_b6_hybrid_first_utterance.py \
             tests/test_config_update_rate_limit_signal.py \
             tests/test_voice_tts_timeout.py \
-            tests/test_tc_pre_stream_cap.py
+            tests/test_tc_pre_stream_cap.py \
+            tests/test_dictation_buffer_cap_signal.py

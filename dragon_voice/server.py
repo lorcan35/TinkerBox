@@ -1010,15 +1010,40 @@ class VoiceServer:
 
                 logger.info("P13: Evicted stale connection %s for device %s", old_ws_id, device_id)
 
-        # Upsert device in DB
-        await self._db.upsert_device(
-            device_id=device_id,
-            hardware_id=hardware_id,
-            name=cmd.get("name", ""),
-            firmware_ver=cmd.get("firmware_ver", ""),
-            platform=cmd.get("platform", ""),
-            capabilities=cmd.get("capabilities"),
-        )
+        # Upsert device in DB.
+        #
+        # Audit D2 (#137): the `devices` table has a UNIQUE constraint on
+        # `hardware_id`, so a second `device_id` registering with a
+        # `hardware_id` that's already claimed raises sqlite3.IntegrityError
+        # which used to bubble up to the WS handler and drop the connection
+        # with no Tab5 signal.  Catch it specifically and emit a γ-arch
+        # FATAL/DEVICE error so the user sees what happened.
+        import sqlite3 as _sqlite3
+        try:
+            await self._db.upsert_device(
+                device_id=device_id,
+                hardware_id=hardware_id,
+                name=cmd.get("name", ""),
+                firmware_ver=cmd.get("firmware_ver", ""),
+                platform=cmd.get("platform", ""),
+                capabilities=cmd.get("capabilities"),
+            )
+        except _sqlite3.IntegrityError as e:
+            if "hardware_id" in str(e).lower():
+                logger.warning(
+                    "D2 hardware_id collision: device_id=%s wanted hw=%s but "
+                    "hw is already claimed by another device — rejecting register",
+                    device_id, hardware_id,
+                )
+                if not ws.closed:
+                    await self._safe_send_json(ws, error_event(
+                        code="hardware_id_collision",
+                        message="This hardware ID is already registered to another device.",
+                        severity=Severity.FATAL,
+                        scope=Scope.DEVICE,
+                    ))
+                return
+            raise
 
         # v4·D audit P0 fix: expose the widget subset of client capabilities
         # on conn_state so skills can pull it via SurfaceManager and

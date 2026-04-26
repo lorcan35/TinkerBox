@@ -33,6 +33,7 @@ def setup_all_routes(
     memory_service=None,
     media_store=None,
     media_url_signer=None,
+    scheduler_mgr=None,
 ) -> None:
     """Register all API route modules on the aiohttp app.
 
@@ -78,5 +79,16 @@ def setup_all_routes(
             DocumentRoutes(memory_service).register(app)
         except ImportError:
             logger.debug("Memory/document routes not available yet")
+
+    # Phase 5 ε1b (issue #126): scheduler REST endpoints.  Guarded so
+    # a SchedulerManager init failure (logged in startup.py) doesn't
+    # take the API package down with it.
+    if scheduler_mgr is not None:
+        try:
+            from dragon_voice.api.scheduler import SchedulerRoutes
+            SchedulerRoutes(scheduler_mgr).register(app)
+            logger.info("Scheduler REST routes registered (5 endpoints)")
+        except ImportError:
+            logger.debug("Scheduler routes not available yet")
 
     logger.info("API routes registered (modular package)")

@@ -329,9 +329,9 @@ See `schema.sql` — 6 tables: devices, sessions, messages, notes, events, confi
 - Paginate through old sessions via REST API
 - Dashboard shows live conversation via WebSocket events
 
-## API-First Architecture (47 REST endpoints + 1 WebSocket)
+## API-First Architecture (52 REST endpoints + 1 WebSocket)
 
-_Counted from code: `for f in dragon_voice/api/*.py dragon_voice/notes/api.py; do grep -c 'app.router.add_' "$f"; done | paste -sd+ | bc` → 47. Drifted from "46" to "52" and back — see wave-14 H23._
+_Counted from code: `for f in dragon_voice/api/*.py dragon_voice/notes/api.py; do grep -c 'app.router.add_' "$f"; done | paste -sd+ | bc` → 52 (was 47 before Phase 5 ε1b added the 5 scheduler endpoints).  Drifted from "46" to "52" and back — see wave-14 H23._
 
 Dragon is an API-first server. Every capability is accessible via REST so any hardware client can use it.
 
@@ -386,6 +386,11 @@ Dragon is an API-first server. Every capability is accessible via REST so any ha
 | | GET | `/api/ota/firmware.bin` | Download firmware |
 | **Rich Media** | GET | `/api/media/{id}` | Serve rendered media file (JPEG/PNG/WAV), Cache-Control 1h |
 | | POST | `/api/media/upload` | Accept BMP/JPEG from Tab5 camera, convert+resize via Pillow, return media_id |
+| **Scheduler** | POST | `/api/v1/scheduler/notifications` | Schedule a notification (when, message, device_id) |
+| | GET | `/api/v1/scheduler/notifications` | List notifications (filter by device_id, status) |
+| | GET | `/api/v1/scheduler/notifications/{id}` | Get one notification |
+| | DELETE | `/api/v1/scheduler/notifications/{id}` | Cancel a pending notification |
+| | PATCH | `/api/v1/scheduler/notifications/{id}` | Reschedule (change `when`) |
 
 ### Agentic Pipeline
 

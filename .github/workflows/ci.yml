@@ -62,6 +62,7 @@ jobs:
             tests/test_progress_bus_integration.py \
             tests/test_progress_emit.py \
             tests/test_progress_event.py \
+            tests/test_scheduler_api.py \
             tests/test_scheduler_manager.py \
             tests/test_scheduler_tool.py \
             tests/test_scheduler_when_parser.py \

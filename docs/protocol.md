@@ -1447,6 +1447,15 @@ action).
 - `image_url` — optional hero image
 - `action` — optional single action
 
+**Phase 5 ε1b note (April 2026):** the scheduler service (RFC at
+[`docs/RFC-scheduler.md`](RFC-scheduler.md)) is a `widget_card`
+producer.  Scheduled reminders fire as `widget_card` frames with
+`skill_id="scheduler"` and `card_id="sched_<8hex>"`.  The card
+includes `action={"label":"Dismiss","event":"scheduler.dismiss"}`
+which the existing SurfaceManager default-dismiss path closes for
+free.  No new wire format — Tab5's existing `voice.c:1269`
+handler renders these the same as any other card.
+
 ### 17.6 List — `widget_list`
 
 ```json

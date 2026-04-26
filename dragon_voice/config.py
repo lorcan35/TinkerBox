@@ -185,6 +185,16 @@ class VoiceConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
 
+    # β-arch (issue #123): protocol-level transition flag for the
+    # progress event bus.  When True (default), migrated emitters
+    # double-write — they send the legacy ad-hoc event AND the new
+    # `progress` event so unmodified Tab5 firmware in production
+    # keeps working unchanged.  Once Tab5 ships a `progress`-aware
+    # build, set to False to drop the legacy frames in a follow-up
+    # cleanup PR.  Not hot-reloaded; a flip requires a server
+    # restart, which is fine for a transition flag.
+    progress_bus_emit_legacy: bool = True
+
     def validate(self) -> list[str]:
         """Validate configuration values.
 

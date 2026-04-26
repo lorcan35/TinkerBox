@@ -78,6 +78,16 @@ def _types(events: list[dict]) -> list[str]:
     return [e.get("type", "?") for e in events]
 
 
+def _progress_for_phase(events: list[dict], phase: str) -> list[dict]:
+    """β-arch (issue #123): filter the captured events to just the
+    ``progress`` frames matching the given phase.  Used by the
+    augmented assertions to verify the double-write contract."""
+    return [
+        e for e in events
+        if e.get("type") == "progress" and e.get("phase") == phase
+    ]
+
+
 # ───────────────────────── happy path: postprocessing → summary
 
 
@@ -105,6 +115,18 @@ def test_finish_dictation_emits_postprocessing_then_summary() -> None:
     assert summary_ev["title"] == "Test Note"
     assert summary_ev["summary"] == "A test summary."
 
+    # β-arch (issue #123): the legacy frames above MUST also be
+    # accompanied by progress.dictation_post frames — pin the
+    # double-write contract so a future cleanup PR that removes
+    # the legacy emit can still rely on the progress channel.
+    progress = _progress_for_phase(events, "dictation_post")
+    stages = [e["stage"] for e in progress]
+    assert "start" in stages, f"missing dictation_post.start; got {stages}"
+    assert "done" in stages, f"missing dictation_post.done; got {stages}"
+    done_ev = next(e for e in progress if e["stage"] == "done")
+    assert done_ev["payload"]["title"] == "Test Note"
+    assert done_ev["payload"]["summary"] == "A test summary."
+
 
 # ───────────────────────── error path: LLM raises
 
@@ -127,6 +149,16 @@ def test_finish_dictation_emits_postprocessing_error_on_llm_failure() -> None:
     assert err_ev["error"] == "RuntimeError"
     assert "Note saved" in err_ev["message"]
 
+    # β-arch (issue #123): pair-emit must include a progress.error
+    # frame carrying the γ1 taxonomy so γ2-H8 routing applies on
+    # an updated Tab5 firmware.
+    progress = _progress_for_phase(events, "dictation_post")
+    err_progress = [e for e in progress if e["stage"] == "error"]
+    assert len(err_progress) == 1
+    assert err_progress[0]["code"] == "RuntimeError"
+    assert err_progress[0]["severity"] == "transient"
+    assert err_progress[0]["scope"] == "llm"
+
 
 # ───────────────────────── error path: no LLM available
 
@@ -146,6 +178,14 @@ def test_finish_dictation_emits_error_when_no_llm_available() -> None:
     err_ev = next(e for e in events if e["type"] == "dictation_postprocessing_error")
     assert err_ev["error"] == "no_llm_available"
     assert "LLM offline" in err_ev["message"]
+
+    # β-arch (issue #123): pair-emit progress.error mirrors the
+    # legacy err_ev with code='no_llm_available'.
+    progress = _progress_for_phase(events, "dictation_post")
+    err_progress = [e for e in progress if e["stage"] == "error"]
+    assert len(err_progress) == 1
+    assert err_progress[0]["code"] == "no_llm_available"
+    assert err_progress[0]["scope"] == "llm"
 
 
 # ───────────────────────── cancellation path
@@ -202,6 +242,17 @@ def test_rapid_finish_dictation_emits_cancelled_for_prior() -> None:
         "can correlate it to the prior turn"
     )
 
+    # β-arch (issue #123): pair-emit must include a single
+    # progress.cancelled frame for the prior post-process and TWO
+    # progress.start frames (one per dictation that was long enough
+    # to trigger post-process).
+    progress = _progress_for_phase(events, "dictation_post")
+    stages = [e["stage"] for e in progress]
+    assert stages.count("start") == 2
+    assert stages.count("cancelled") == 1
+    cancelled = next(e for e in progress if e["stage"] == "cancelled")
+    assert cancelled["code"] == "dictation_post_cancelled"
+
 
 # ───────────────────────── short-dictation guard (existing behavior)
 
@@ -222,3 +273,8 @@ def test_short_dictation_does_not_post_process() -> None:
     assert "dictation_postprocessing" not in types
     assert "dictation_postprocessing_error" not in types
     assert "dictation_postprocessing_cancelled" not in types
+
+    # β-arch (issue #123): same regression guard for the new bus —
+    # short dictations must NOT emit any progress.dictation_post
+    # frames either (otherwise we'd be silently inflating the bus).
+    assert _progress_for_phase(events, "dictation_post") == []

@@ -18,6 +18,8 @@ import numpy as np
 
 from dragon_voice.config import VoiceConfig
 from dragon_voice.errors import DragonError, Scope, Severity, error_event
+from dragon_voice.progress import Phase, Stage
+from dragon_voice.progress_emit import emit_progress_pair
 from dragon_voice.stt import create_stt, STTBackend
 from dragon_voice.tts import create_tts, TTSBackend
 from dragon_voice.llm import create_llm, LLMBackend
@@ -545,14 +547,31 @@ class VoicePipeline:
                 # rapidly stops + restarts dictation could see a stale
                 # summary land on top of their new transcript a few seconds
                 # later.
-                await self._on_event({"type": "dictation_postprocessing_cancelled"})
+                # β-arch (issue #123): double-write — legacy frame for
+                # unmodified Tab5 firmware + new progress frame for the
+                # unified bus.
+                await emit_progress_pair(
+                    self._on_event,
+                    legacy={"type": "dictation_postprocessing_cancelled"},
+                    phase=Phase.DICTATION_POST,
+                    stage=Stage.CANCELLED,
+                    code="dictation_post_cancelled",
+                    message="Prior summary abandoned for new dictation.",
+                    emit_legacy=self._config.progress_bus_emit_legacy,
+                )
             # Phase 2 H4 (issue #94): emit a "still working" event so Tab5
             # can show "Generating summary..." instead of leaving the user
             # staring at the bare transcript for 10-20 s while the LLM
             # writes the title + summary.  Pre-fix, the only events between
             # `stt` (line 490) and `dictation_summary` were silence —
             # users assumed the device had hung.
-            await self._on_event({"type": "dictation_postprocessing"})
+            await emit_progress_pair(
+                self._on_event,
+                legacy={"type": "dictation_postprocessing"},
+                phase=Phase.DICTATION_POST,
+                stage=Stage.START,
+                emit_legacy=self._config.progress_bus_emit_legacy,
+            )
             self._post_process_task = asyncio.ensure_future(
                 self._post_process_dictation(full_text)
             )
@@ -584,11 +603,24 @@ class VoicePipeline:
             # Pre-fix this would silently log and leave Tab5 waiting for a
             # `dictation_summary` event that never arrives — UI gets stuck
             # on the "Generating summary..." caption forever.
-            await self._on_event({
-                "type": "dictation_postprocessing_error",
-                "error": "no_llm_available",
-                "message": "Note saved — summary unavailable (LLM offline)",
-            })
+            # β-arch (issue #123): pair-emit — legacy frame for unmodified
+            # Tab5 + new progress.error frame carrying the γ1 error
+            # taxonomy so γ2-H8 routing applies.
+            await emit_progress_pair(
+                self._on_event,
+                legacy={
+                    "type": "dictation_postprocessing_error",
+                    "error": "no_llm_available",
+                    "message": "Note saved — summary unavailable (LLM offline)",
+                },
+                phase=Phase.DICTATION_POST,
+                stage=Stage.ERROR,
+                code="no_llm_available",
+                message="Note saved — summary unavailable (LLM offline)",
+                severity=Severity.TRANSIENT,
+                scope=Scope.LLM,
+                emit_legacy=self._config.progress_bus_emit_legacy,
+            )
             return
 
         prompt = (
@@ -615,11 +647,21 @@ class VoicePipeline:
                     summary = line[8:].strip().strip('"')
 
             logger.info("Dictation summary: title='%s'", title)
-            await self._on_event({
-                "type": "dictation_summary",
-                "title": title,
-                "summary": summary,
-            })
+            # β-arch (issue #123): pair-emit — legacy `dictation_summary`
+            # carries title/summary at the top level; the new progress
+            # frame nests them in `payload` so the bus is uniform.
+            await emit_progress_pair(
+                self._on_event,
+                legacy={
+                    "type": "dictation_summary",
+                    "title": title,
+                    "summary": summary,
+                },
+                phase=Phase.DICTATION_POST,
+                stage=Stage.DONE,
+                payload={"title": title, "summary": summary},
+                emit_legacy=self._config.progress_bus_emit_legacy,
+            )
         except asyncio.CancelledError:
             # Phase 2 H4 (issue #94): the cancelled-side event is emitted
             # by `finish_dictation` BEFORE it spawns a new task — we don't
@@ -633,11 +675,24 @@ class VoicePipeline:
             # transcript is already in the chat from the prior `stt` event,
             # so the user hasn't lost data — they just don't get the
             # auto-generated title/summary.
-            await self._on_event({
-                "type": "dictation_postprocessing_error",
-                "error": type(e).__name__,
-                "message": "Note saved — summary generation failed",
-            })
+            # β-arch (issue #123): pair-emit so the new progress.error
+            # frame carries the γ1 taxonomy.  `code` uses the exception
+            # class name (matches the legacy `error` field convention).
+            await emit_progress_pair(
+                self._on_event,
+                legacy={
+                    "type": "dictation_postprocessing_error",
+                    "error": type(e).__name__,
+                    "message": "Note saved — summary generation failed",
+                },
+                phase=Phase.DICTATION_POST,
+                stage=Stage.ERROR,
+                code=type(e).__name__,
+                message="Note saved — summary generation failed",
+                severity=Severity.TRANSIENT,
+                scope=Scope.LLM,
+                emit_legacy=self._config.progress_bus_emit_legacy,
+            )
 
     # ── Ask mode (existing) ────────────────────────────────────────
 

@@ -50,7 +50,7 @@ Per user direction:
 | L3 | Piper TTS not killed on timeout | LOW | ~35 min | 2 | **MERGED #99** |
 | H8 | Raw error strings on wrong UI surface (voice caption vs toast) | HIGH | ~4 h | 3 | **MERGED #105 + #107 + #109 + TinkerTab#197** |
 | M1 | Tool parser silent on malformed JSON args | MED | ~3 h | 3 | **MERGED #105** |
-| M2 | WS upgrade rejection plain text (401/503) | MED | ~3.5 h | 3 | OPEN |
+| M2 | WS upgrade rejection plain text (401/503) | MED | ~3.5 h | 3 | **MERGED #112 + TinkerTab#199** |
 | M5 | Device-id collision silent eviction | MED | ~3 h | 3 | **MERGED #109 + TinkerTab#197** |
 | M6 | TC gateway down → 600 s timeout, no fast-fail | MED | ~4 h | 3 | **MERGED #107** |
 | H6 | Idle paused sessions never purge | HIGH | ~2-3 h | 4 | OPEN |
@@ -67,7 +67,7 @@ Per user direction:
 |---|---|---|---|---|
 | α-arch | WS dispatcher async-task discipline | C1, C2, L2, parts of M5 | 1 | **MERGED #92** |
 | β-arch | Progress event bus (single channel for all phases) | H1, H2, H4, future tool/TTS feedback | 6 | OPEN |
-| γ-arch | `DragonError` taxonomy (severity + scope) | H8, M1, M2, M5, M6 | 3 | **γ1 + γ2 MERGED (#102, #105, #107, #109, TinkerTab#197)** (γ3 OPEN) |
+| γ-arch | `DragonError` taxonomy (severity + scope) | H8, M1, M2, M5, M6 | 3 | **MERGED — Phase 3 COMPLETE (#102, #105, #107, #109, #112, TinkerTab#197, TinkerTab#199)** |
 | δ-arch | Declarative retention policy framework | H6, H7, D-mem, D-docs | 6 | OPEN |
 
 ---
@@ -127,7 +127,7 @@ affects the whole protocol.  Cleaner if dispatcher cleanup landed first.
 |---|---|---|
 | γ1 | `DragonError` class with `severity: TRANSIENT|FATAL` + `scope`; audit ~12 emission sites | **MERGED #102** |
 | γ2 | H8 route to correct surface (toast vs caption); M1 `tool_args_invalid` frame; M5 `device_evicted` frame; M6 fast-fail TC health check | **MERGED #105 + #107 + #109 + TinkerTab#197** |
-| γ3 | M2 WS upgrade JSON responses + Tab5 401-stops-retrying | ~3 h |
+| γ3 | M2 WS upgrade JSON responses + Tab5 401-stops-retrying | **MERGED #112 + TinkerTab#199** |
 
 **E2E acceptance:**
 - `[Ollama timeout after 300s]` no longer appears in voice overlay caption;

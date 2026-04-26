@@ -1644,8 +1644,16 @@ class VoiceServer:
                 except Exception:
                     logger.debug("TC receipt emit failed", exc_info=True)
 
-            # Rich media detection for TinkerClaw responses too
+            # Rich media detection for TinkerClaw responses too.
+            # Audit D4 (#137): emit a progress signal BEFORE rendering
+            # if there's renderable content, so Tab5 doesn't perceive
+            # the 1-3 s code-block render as a stalled reply.
             if full_response and self._media_pipeline:
+                if not ws.closed and self._media_pipeline.has_renderable_content(response_text):
+                    await self._safe_send_json(ws, {
+                        "type": "media_rendering",
+                        "stage": "start",
+                    })
                 try:
                     media_events = await self._media_pipeline.process_response(
                         response_text, session_id
@@ -1765,6 +1773,14 @@ class VoiceServer:
             # clears the streamed markdown bubble; media events then append
             # the rendered JPEG below.
             if full_response:
+                # Audit D4 (#137): emit progress before render so Tab5
+                # doesn't perceive the 1-3 s code-block render as a
+                # stalled reply.
+                if not ws.closed and self._media_pipeline.has_renderable_content(response_text):
+                    await self._safe_send_json(ws, {
+                        "type": "media_rendering",
+                        "stage": "start",
+                    })
                 try:
                     media_events = await self._media_pipeline.process_response(
                         response_text, session_id

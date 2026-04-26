@@ -87,6 +87,26 @@ class SystemRoutes:
             "active_connections": active,
         }
 
+        # Audit D3 (#137): expose inference_executor depth so the
+        # dashboard can spot Moonshine / Piper backpressure (queued
+        # work growing while busy is at max_workers means STT/TTS is
+        # the bottleneck).  Pre-fix this was invisible — operators
+        # had to guess from CPU + log timestamps.
+        try:
+            from dragon_voice.pipeline import inference_executor as _exec
+            queue = getattr(_exec, "_work_queue", None)
+            threads = getattr(_exec, "_threads", None)
+            queued = queue.qsize() if queue is not None else 0
+            busy = len(threads) if threads is not None else 0
+            result["inference_executor"] = {
+                "max_workers": getattr(_exec, "_max_workers", 0),
+                "busy": busy,         # threads currently spawned
+                "queued": queued,     # work items waiting for a worker
+            }
+        except Exception:
+            # Don't let metrics-collection break the endpoint.
+            pass
+
         # DB stats if available
         if self._db:
             try:

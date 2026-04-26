@@ -23,6 +23,7 @@ from dragon_voice.progress_emit import emit_progress_pair
 from dragon_voice.stt import create_stt, STTBackend
 from dragon_voice.tts import create_tts, TTSBackend
 from dragon_voice.llm import create_llm, LLMBackend
+from dragon_voice.audio import resample_pcm16
 from dragon_voice.tools.response_wrap import looks_like_useful_text, synthesize_wrap
 
 logger = logging.getLogger(__name__)
@@ -1268,24 +1269,12 @@ class VoicePipeline:
             tts_ms = (time.monotonic() - t0) * 1000
 
             if audio_bytes:
-                # Resample from TTS sample rate to 16kHz for Tab5 playback
+                # Resample from TTS sample rate to 16kHz for Tab5 playback.
+                # Audit B8 (#137): shared with the text-path TTS branch
+                # in server._handle_text via dragon_voice.audio.resample_pcm16.
                 tts_rate = self._tts.sample_rate if self._tts else 22050
                 target_rate = self._config.audio.input_sample_rate  # 16000
-
-                if tts_rate != target_rate:
-                    audio_i16 = np.frombuffer(audio_bytes, dtype=np.int16)
-                    # Simple linear interpolation resample
-                    ratio = target_rate / tts_rate
-                    new_len = int(len(audio_i16) * ratio)
-                    indices = np.arange(new_len) / ratio
-                    indices_floor = indices.astype(np.int32)
-                    indices_floor = np.clip(indices_floor, 0, len(audio_i16) - 2)
-                    frac = indices - indices_floor
-                    resampled = (
-                        audio_i16[indices_floor] * (1 - frac)
-                        + audio_i16[indices_floor + 1] * frac
-                    ).astype(np.int16)
-                    audio_bytes = resampled.tobytes()
+                audio_bytes = resample_pcm16(audio_bytes, tts_rate, target_rate)
 
                 logger.debug(
                     "TTS (%.0fms): %d bytes @ %dHz for '%.40s...'",

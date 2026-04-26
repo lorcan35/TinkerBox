@@ -52,6 +52,7 @@ from dragon_voice.middleware import (
 )
 from dragon_voice.pipeline import VoicePipeline
 from dragon_voice.sessions import SessionManager
+from dragon_voice.audio import resample_pcm16
 from dragon_voice.tools.response_wrap import looks_like_useful_text, synthesize_wrap
 
 
@@ -1784,18 +1785,12 @@ class VoiceServer:
                     tts_ms = (time.monotonic() - t0) * 1000
 
                     if audio_bytes:
+                        # Audit B8 (#137): shared resample with the
+                        # voice-path TTS branch in
+                        # pipeline._synthesize_and_send.
                         tts_rate = pipeline._tts.sample_rate
                         target_rate = conn_cfg.audio.input_sample_rate if conn_cfg else 16000
-                        if tts_rate != target_rate:
-                            import numpy as np
-                            audio_i16 = np.frombuffer(audio_bytes, dtype=np.int16)
-                            ratio = target_rate / tts_rate
-                            new_len = int(len(audio_i16) * ratio)
-                            indices = np.arange(new_len) / ratio
-                            idx_floor = np.clip(indices.astype(np.int32), 0, len(audio_i16) - 2)
-                            frac = indices - idx_floor
-                            audio_bytes = (audio_i16[idx_floor] * (1 - frac)
-                                         + audio_i16[idx_floor + 1] * frac).astype(np.int16).tobytes()
+                        audio_bytes = resample_pcm16(audio_bytes, tts_rate, target_rate)
 
                         chunk_size = 4096
                         pace_sleep = (chunk_size / 2) / target_rate * 0.8

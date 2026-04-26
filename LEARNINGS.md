@@ -682,3 +682,10 @@ sequentially across the whole file (don't restart per section).
 - **Prevention:**
   1. **Every "if X and Y" gate where Y can flip false at runtime is a candidate for a "Y was the false clause" signal.**  Audit pattern: search for `< MAX_`, `< _MAX_`, `< limit`, etc., and check whether the false case is observable to the user.
   2. **A callback that handles "thing went wrong, here's a code+message" should not hardcode the code on the receiving side.**  The receiver should respect the sender's `code`/`message` fields and only fall back to its own defaults when the sender omitted them.
+
+### 87. PCM resample duplicated voice-vs-text TTS — extracted to dragon_voice.audio (audit B8)
+- **Date:** 2026-04-26 (PR for #150)
+- **Symptom:** Quality work on the resample (e.g. swapping linear interp for a polyphase filter) would silently miss the parallel callsite.  Same divergence shape as #83 (voice-vs-text post-process).
+- **Root Cause:** Two near-identical 10-line linear-interp resample blocks lived inline in `pipeline._synthesize_and_send` and `server._handle_text`.  No shared helper.
+- **Fix:** Extracted to `dragon_voice/audio.py:resample_pcm16(audio_bytes, src_rate, dst_rate)`.  Same-rate fast path short-circuits with no allocation.  Empty input + 1-sample edge cases handled.  8-case unit test pins behaviour, including a byte-identical match to the pre-extraction formula so any future polyphase swap requires an explicit test update.
+- **Prevention:** Use the file-split smell test from CLAUDE.md ("what stakeholder cares about the code I'm moving?") in reverse — when the *same* code lives in two files maintained by the *same* concern (audio plumbing), that's the smell that the helper's natural home doesn't exist yet.  Build it before the third copy arrives.

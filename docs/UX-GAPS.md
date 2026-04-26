@@ -57,7 +57,7 @@ Per user direction:
 | H7 | Media cleanup 1 h delay before first run | HIGH | ~1 h | 4 | **MERGED #115** |
 | D-mem | Memory facts unbounded (downgraded — sqlite-vec confirmed loaded) | LOW (was MED) | ~1 h | 4 | OPEN (deferred — perf fine at 100k facts; ship if/when ops sees a real issue) |
 | D-docs | Document ingest no size cap | MED | ~1 h | 4 | **MERGED #119** |
-| L1 | POST 413 returns `Connection: close` | LOW | 10 min | 6 | OPEN |
+| L1 | POST 413 returns `Connection: close` | LOW | 10 min | 6 | **MERGED #122** |
 | F-T1 | Scheduler tier 1 (in-process) | DESIGN | ~7 h | 5 | OPEN |
 | F-T2 | Scheduler tier 2 (durable + offline queue) | DESIGN | +6 h | 5 | OPEN |
 
@@ -66,9 +66,9 @@ Per user direction:
 | ID | Pattern | Replaces / improves | Phase | Status |
 |---|---|---|---|---|
 | α-arch | WS dispatcher async-task discipline | C1, C2, L2, parts of M5 | 1 | **MERGED #92** |
-| β-arch | Progress event bus (single channel for all phases) | H1, H2, H4, future tool/TTS feedback | 6 | **IN PROGRESS** (dictation + tool migrated; STT/LLM/TTS/media deferred) |
+| β-arch | Progress event bus (single channel for all phases) | H1, H2, H4, future tool/TTS feedback | 6 | **MERGED #124** (dictation + tool migrated; STT/LLM/TTS/media deferred to follow-ups) |
 | γ-arch | `DragonError` taxonomy (severity + scope) | H8, M1, M2, M5, M6 | 3 | **MERGED — Phase 3 COMPLETE (#102, #105, #107, #109, #112, TinkerTab#197, TinkerTab#199)** |
-| δ-arch | Declarative retention policy framework | H6, H7, D-mem, D-docs | 6 | OPEN |
+| δ-arch | Declarative retention policy framework | H6, H7, D-mem, D-docs | 6 | **DEFERRED** — low value: 3 callers (purge/media/sessions) don't justify abstraction tax; Phase 4 already shipped point-fixes |
 
 ---
 
@@ -183,9 +183,9 @@ After individual fixes ship, collapse ad-hoc patterns into single abstractions.
 
 | PR | Scope | Effort |
 |---|---|---|
-| β-arch | Progress event bus — single `progress` channel replaces ad-hoc events | ~3-4 h |
-| δ-arch | Declarative retention policy framework — single loop, config-driven | ~2-3 h |
-| L1 | POST 413 `Connection: close` cleanup | 10 min (bundle anywhere) |
+| β-arch | Progress event bus — single `progress` channel replaces ad-hoc events | **MERGED #124** |
+| δ-arch | Declarative retention policy framework — single loop, config-driven | **DEFERRED** (low value vs cost) |
+| L1 | POST 413 `Connection: close` cleanup | **MERGED #122** |
 
 ---
 

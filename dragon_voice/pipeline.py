@@ -23,7 +23,7 @@ from dragon_voice.progress_emit import emit_progress_pair
 from dragon_voice.stt import create_stt, STTBackend
 from dragon_voice.tts import create_tts, TTSBackend
 from dragon_voice.llm import create_llm, LLMBackend
-from dragon_voice.audio import resample_pcm16
+from dragon_voice.audio import resample_pcm16_async
 from dragon_voice.tools.response_wrap import looks_like_useful_text, synthesize_wrap
 
 logger = logging.getLogger(__name__)
@@ -1304,11 +1304,14 @@ class VoicePipeline:
 
             if audio_bytes:
                 # Resample from TTS sample rate to 16kHz for Tab5 playback.
-                # Audit B8 (#137): shared with the text-path TTS branch
-                # in server._handle_text via dragon_voice.audio.resample_pcm16.
+                # Audit B8 (#137) + C8 (#137): shared async helper hops
+                # large buffers off the event loop so cancels / voice
+                # frames from other connections aren't delayed.
                 tts_rate = self._tts.sample_rate if self._tts else 22050
                 target_rate = self._config.audio.input_sample_rate  # 16000
-                audio_bytes = resample_pcm16(audio_bytes, tts_rate, target_rate)
+                audio_bytes = await resample_pcm16_async(
+                    audio_bytes, tts_rate, target_rate
+                )
 
                 logger.debug(
                     "TTS (%.0fms): %d bytes @ %dHz for '%.40s...'",

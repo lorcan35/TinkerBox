@@ -81,6 +81,8 @@ async def run_startup(server: Any, app: web.Application) -> None:
         server._memory_service = MemoryService(
             server._db,
             ollama_url=server._config.llm.ollama_url,
+            # δ3 / D-docs (issue #118): wire the configured ingest cap.
+            max_document_bytes=server._config.memory.max_document_bytes,
         )
         await server._memory_service.initialize()
 

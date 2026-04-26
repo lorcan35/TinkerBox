@@ -28,14 +28,29 @@ CHUNK_SIZE = 512  # tokens (approx chars/4)
 CHUNK_OVERLAP = 50
 
 
+class DocumentTooLargeError(ValueError):
+    """Raised by ``MemoryService.ingest_document`` when content
+    exceeds ``MemoryConfig.max_document_bytes``.
+
+    δ3 / D-docs (issue #118): the API layer catches this and turns
+    it into HTTP 413 with a structured ``code: "document_too_large"``
+    error body.  Subclassing ValueError so existing generic
+    ValueError handling around ingestion (e.g. validation errors
+    on title) still works without a special case.
+    """
+
+
 class MemoryService:
     """Manages facts, documents, and semantic search."""
 
     def __init__(self, db: Database, ollama_url: str = "http://localhost:11434",
-                 embed_model: str = "nomic-embed-text") -> None:
+                 embed_model: str = "nomic-embed-text",
+                 max_document_bytes: int = 10 * 1024 * 1024) -> None:
         self._db = db
         self._ollama_url = ollama_url
         self._embed_model = embed_model
+        # δ3 / D-docs (issue #118): cap document ingest size.  0 disables.
+        self._max_document_bytes = max_document_bytes
         self._embed_dim: int = 0  # set after first embedding call
         # Audit K2 (2026-04-20): sqlite-vec backend. _use_vec flips true
         # once the vec0 extension loads + the vec virtual table exists.
@@ -362,7 +377,24 @@ class MemoryService:
 
     async def ingest_document(self, title: str, content: str,
                               metadata: Optional[dict] = None) -> dict:
-        """Ingest a document: chunk, embed, store."""
+        """Ingest a document: chunk, embed, store.
+
+        Raises ``DocumentTooLargeError`` if the content exceeds
+        ``self._max_document_bytes`` (δ3 / D-docs, issue #118).
+        Defence-in-depth: API entry also checks before calling, but
+        a future caller (skill, tool, scheduled importer) bypassing
+        the HTTP path still gets the safety net here.
+        """
+        # δ3 / D-docs: cap before chunking + embedding.  Without this
+        # a 500 MB document would lock the HTTP handler for ~40 min
+        # and could OOM Dragon's 8 GB RAM during batch embedding.
+        if self._max_document_bytes > 0:
+            content_bytes = len(content.encode("utf-8"))
+            if content_bytes > self._max_document_bytes:
+                raise DocumentTooLargeError(
+                    f"Document content is {content_bytes} bytes; "
+                    f"max is {self._max_document_bytes} bytes."
+                )
         doc_id = secrets.token_hex(6)
         now = time.time()
         chunks = self._chunk_text(content)

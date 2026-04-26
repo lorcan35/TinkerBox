@@ -164,6 +164,12 @@ class MemoryConfig:
     auto_extract_facts: bool = True
     max_context_facts: int = 3
     max_context_chunks: int = 3
+    # δ3 / D-docs (issue #118): cap document ingest size.  Above this
+    # the embedding loop locks the HTTP handler for many minutes and
+    # can OOM Dragon's 8 GB RAM during batch embedding.  10 MB is
+    # the audit's recommended baseline — a typical Markdown / PDF-
+    # extracted document is well under this.  Set to 0 to disable.
+    max_document_bytes: int = 10 * 1024 * 1024  # 10 MB
 
 
 @dataclass

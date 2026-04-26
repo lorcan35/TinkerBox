@@ -5,7 +5,7 @@ import logging
 from aiohttp import web
 
 from dragon_voice.api.utils import json_error, parse_json_body, parse_pagination, paginated_response
-from dragon_voice.memory import MemoryService
+from dragon_voice.memory import DocumentTooLargeError, MemoryService
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +24,10 @@ class DocumentRoutes:
         """POST /api/v1/documents — ingest text document
 
         Request: {"title": "Project Notes", "content": "...", "metadata": {}}
+
+        δ3 / D-docs (issue #118): rejects oversized content with
+        HTTP 413 + structured JSON body.  Pre-fix a 500 MB document
+        would lock the handler for ~40 minutes embedding chunks.
         """
         body, err = await parse_json_body(request)
         if err:
@@ -33,7 +37,19 @@ class DocumentRoutes:
         if not content:
             return json_error("'content' field is required")
         metadata = body.get("metadata")
-        result = await self._memory.ingest_document(title, content, metadata)
+        try:
+            result = await self._memory.ingest_document(title, content, metadata)
+        except DocumentTooLargeError as e:
+            # Structured 413: matches the γ-arch error pattern (code +
+            # message), but lives in HTTP-response shape rather than
+            # the WS-frame shape since this is a REST endpoint.
+            return web.json_response(
+                {
+                    "code": "document_too_large",
+                    "message": str(e),
+                },
+                status=413,
+            )
         return web.json_response(result, status=201)
 
     async def list_documents(self, request: web.Request) -> web.Response:

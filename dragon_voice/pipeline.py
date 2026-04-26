@@ -955,7 +955,15 @@ class VoicePipeline:
             # flush doesn't false-fire on `def foo():` style colons.
             last_flush_ts = time.monotonic()
             in_code_block = False
-            is_local = self._config.llm.backend in ("ollama", "npu_genie", "lmstudio")
+            # Audit C9 (#137): the fast-path flush decisions below
+            # (clause-flush min chars + word-boundary timeout flush)
+            # are TTS-bound, not LLM-bound — tiny cloud TTS chunks
+            # cost a per-chunk network round-trip and cause choppy
+            # playback (P08).  Pre-fix this gated on LLM backend, so
+            # Hybrid mode (local LLM + cloud TTS) inherited the
+            # local-mode flushing thresholds and hammered the
+            # OpenRouter TTS endpoint with 20-char chunks.
+            is_local_tts = self._config.tts.backend != "openrouter"
             async for token in llm_stream:
                 if self._cancelled:
                     return
@@ -1023,7 +1031,7 @@ class VoicePipeline:
                 # Phase 2 H2: SKIP clause flush inside a code block — `:`
                 # in `def foo():` is structural, not a natural pause.
                 elif _CLAUSE_END.search(sentence_buffer) and not in_code_block:
-                    clause_min_chars = 20 if is_local else 60
+                    clause_min_chars = 20 if is_local_tts else 60
                     if len(sentence_buffer) >= clause_min_chars:
                         if sentence_buffer.strip():
                             await self._synthesize_and_send(sentence_buffer.strip())
@@ -1038,7 +1046,7 @@ class VoicePipeline:
                 # clause threshold smooths it well enough.  Skip inside
                 # code blocks (would chop code mid-line).
                 elif (
-                    is_local
+                    is_local_tts
                     and not in_code_block
                     and len(sentence_buffer) >= _LOCAL_TIMEOUT_FLUSH_MIN_CHARS
                     and (time.monotonic() - last_flush_ts) > _LOCAL_TIMEOUT_FLUSH_S

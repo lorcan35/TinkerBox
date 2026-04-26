@@ -58,6 +58,7 @@ jobs:
             tests/test_media_pipeline.py \
             tests/test_mcp_bridge.py \
             tests/test_notes_db_async.py \
+            tests/test_paused_session_retention.py \
             tests/test_config_redact.py \
             tests/test_device_evicted.py \
             tests/test_errors.py \

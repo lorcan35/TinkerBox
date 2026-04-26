@@ -466,6 +466,33 @@ class Database:
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
+    async def get_old_paused_sessions(self, retention_days: int) -> list[dict]:
+        """Find paused-only sessions older than retention_days.
+
+        δ2 / H6 (issue #116): companion to get_stale_sessions.  The
+        existing 30-min stale check misses the device-idle-for-a-month
+        scenario because motion-sensor wakeups refresh last_active_at
+        via Tab5 register→resume→touch_session.  This long-window
+        query targets the actually-abandoned case (no motion-sensor
+        pings for >= retention_days), so paused sessions stop
+        accumulating forever.
+
+        Returns [] when retention_days <= 0 (disabled).
+        """
+        if retention_days <= 0:
+            return []
+        cutoff = time.time() - (retention_days * 86400)
+        cursor = await self.conn.execute(
+            f"""
+            SELECT {self._SESSION_COLUMNS} FROM sessions
+            WHERE status = 'paused' AND last_active_at < ?
+            ORDER BY last_active_at ASC
+            """,
+            (cutoff,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
     # ── Messages ───────────────────────────────────────────────────────
 
     async def add_message(

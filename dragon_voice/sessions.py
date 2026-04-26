@@ -33,9 +33,18 @@ class SessionManager:
     to auto-end stale sessions.
     """
 
-    def __init__(self, db: Database, timeout_s: float = SESSION_TIMEOUT_S) -> None:
+    def __init__(
+        self,
+        db: Database,
+        timeout_s: float = SESSION_TIMEOUT_S,
+        paused_retention_days: int = 30,
+    ) -> None:
         self._db = db
         self._timeout_s = timeout_s
+        # δ2 / H6 (issue #116): long-window retention for paused
+        # sessions whose last_active_at is refreshed by motion-sensor
+        # wakeups but never see actual conversation.  0 disables.
+        self._paused_retention_days = paused_retention_days
         self._cleanup_task: Optional[asyncio.Task] = None
 
     async def start(self) -> None:
@@ -267,7 +276,18 @@ class SessionManager:
         return session, False
 
     async def _cleanup_loop(self) -> None:
-        """Background task: auto-end sessions that have been inactive too long."""
+        """Background task: auto-end sessions that have been inactive too long.
+
+        Two cadences in one loop:
+          1. Existing 30-min stale check (active+paused) — catches
+             genuinely-idle devices.
+          2. δ2 / H6 (issue #116) long-window paused-only check —
+             catches sessions where motion-sensor wakeups refresh
+             last_active_at via Tab5 register→resume but the device
+             has been actually unused for >= paused_retention_days.
+             Once ended, the session's messages purge normally via
+             purge_old_messages.
+        """
         while True:
             try:
                 await asyncio.sleep(60)  # Check every minute
@@ -278,6 +298,20 @@ class SessionManager:
                         "Auto-ended stale session: %s (inactive for %.0fs)",
                         session["id"],
                         time.time() - session["last_active_at"],
+                    )
+                # δ2 / H6: long-window paused retention sweep.
+                old_paused = await self._db.get_old_paused_sessions(
+                    self._paused_retention_days
+                )
+                for session in old_paused:
+                    await self.end_session(session["id"])
+                    age_days = (
+                        (time.time() - session["last_active_at"]) / 86400
+                    )
+                    logger.info(
+                        "Auto-ended idle paused session: %s "
+                        "(paused for %.1f days; retention=%dd)",
+                        session["id"], age_days, self._paused_retention_days,
                     )
             except asyncio.CancelledError:
                 raise

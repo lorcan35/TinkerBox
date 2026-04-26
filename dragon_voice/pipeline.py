@@ -1158,8 +1158,17 @@ class VoicePipeline:
                 except Exception:
                     logger.debug("fallback receipt also failed", exc_info=True)
 
-            # Rich media detection on full response
+            # Rich media detection on full response.
+            # Audit D4 (#137): emit progress before render — voice path
+            # is less prone to perceived stalls (TTS is playing) but
+            # the dashboard chat view + non-speaking response_mode
+            # benefit from the same progress signal as the text path.
             if self._media_pipeline and full_response:
+                if self._media_pipeline.has_renderable_content(full_response):
+                    await self._on_event({
+                        "type": "media_rendering",
+                        "stage": "start",
+                    })
                 try:
                     media_events = await self._media_pipeline.process_response(
                         full_response, self._session_id or ""

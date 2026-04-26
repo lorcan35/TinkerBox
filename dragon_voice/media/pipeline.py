@@ -123,6 +123,26 @@ class MediaPipeline:
 
     # ── Public API ───────────────────────────────────────────────────────────
 
+    @staticmethod
+    def has_renderable_content(text: str) -> bool:
+        """True if `text` contains at least one detection target (code
+        block, markdown table, or inline image URL).
+
+        Audit D4 (#137): callers use this to decide whether to emit a
+        `media_rendering` progress frame before `process_response` —
+        the render itself can take 1-3 s for code blocks (Pygments +
+        Pillow) and another 1-2 s per image, which without a progress
+        signal looks to Tab5 like a stalled response between
+        `llm_done` and the eventual `media` frames.
+        """
+        if not text:
+            return False
+        if _RE_CODE_BLOCK.search(text):
+            return True
+        if _RE_IMAGE_URL.search(text):
+            return True
+        return bool(_extract_table(text))
+
     async def process_response(self, text: str, session_id: str = "") -> list[dict]:
         """Detect renderable content in *text* and return media event dicts.
 

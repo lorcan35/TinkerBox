@@ -64,6 +64,7 @@ jobs:
             tests/test_document_size_cap.py \
             tests/test_errors.py \
             tests/test_tinkerclaw_health_check.py \
+            tests/test_media_upload_413_no_close.py \
             tests/test_media_url_signer.py \
             tests/test_proxy_image_ssrf.py \
             tests/test_security_headers.py \

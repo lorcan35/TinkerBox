@@ -109,12 +109,17 @@ class MediaRoutes:
         # no Content-Length still fall through to the post-read check.
         declared = request.content_length
         if declared is not None and declared > _MAX_UPLOAD_BYTES:
+            # L1 (issue #121): no `Connection: close` header — Tab5
+            # doesn't pipeline today, but tearing the TCP connection
+            # for a single 413 is messy HTTP semantics and forces a
+            # fresh handshake for the next request.  The 413 status
+            # alone tells the client to back off; aiohttp + Tab5's
+            # transport layer handle the rest.
             return web.json_response(
                 {"error": "payload too large",
                  "max_bytes": _MAX_UPLOAD_BYTES,
                  "declared_bytes": declared},
                 status=413,
-                headers={"Connection": "close"},
             )
 
         raw = await request.read()

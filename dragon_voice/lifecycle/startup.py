@@ -133,19 +133,34 @@ async def run_startup(server: Any, app: web.Application) -> None:
     server._surface_mgr = SurfaceManager()
     logger.info("SurfaceManager initialized")
 
-    # Phase 5 ε1a (issue #128): in-process scheduler.  In-memory
-    # store for Tier 1 — ε2 swaps in SqliteNotificationStore via a
-    # one-line change here.  Wired AFTER SurfaceManager + SessionManager
-    # exist (manager depends on both at fire time per RFC A3) and
-    # BEFORE widget-emitting tool registration so ScheduleReminderTool
-    # can be registered alongside its peers.
+    # Phase 5 ε1a/ε2 (issues #128, #131): in-process scheduler.
+    # ε2 (this PR) switches the default store from InMemoryNotificationStore
+    # to SqliteNotificationStore so notifications survive Dragon
+    # restart.  The in-memory store remains available as a fallback
+    # if SQLite store init fails (no rows lost in that case — the
+    # tables are still in place; just no fresh insertions persist
+    # until the next restart).
     server._scheduler_mgr = None
     try:
         from dragon_voice.scheduler import (
             InMemoryNotificationStore,
             SchedulerManager,
+            SqliteNotificationStore,
         )
-        server._scheduler_store = InMemoryNotificationStore()
+        # ε2: SqliteNotificationStore is the default.  Boot replay
+        # (in manager.start) reads list_due(now) so any due-but-
+        # unfired notifications from the prior process get
+        # rescheduled within the 15-minute REPLAY_WINDOW_SECONDS
+        # cap (RFC R8).
+        try:
+            server._scheduler_store = SqliteNotificationStore(server._db)
+        except Exception as e:
+            logger.warning(
+                "SqliteNotificationStore init failed: %s — "
+                "falling back to InMemoryNotificationStore "
+                "(notifications won't survive restart this run)", e,
+            )
+            server._scheduler_store = InMemoryNotificationStore()
         server._scheduler_mgr = SchedulerManager(
             store=server._scheduler_store,
             surface_mgr=server._surface_mgr,

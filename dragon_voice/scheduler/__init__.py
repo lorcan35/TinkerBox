@@ -14,16 +14,20 @@ from dragon_voice.scheduler.manager import (
 from dragon_voice.scheduler.models import Notification
 from dragon_voice.scheduler.parser import parse_when
 from dragon_voice.scheduler.store import (
+    NOTIFICATION_QUEUE_CAP_PER_DEVICE,
     InMemoryNotificationStore,
     NotificationStore,
+    SqliteNotificationStore,
 )
 
 __all__ = [
     "Notification",
     "NotificationStore",
     "InMemoryNotificationStore",
+    "SqliteNotificationStore",
     "SchedulerManager",
     "RunawayCapError",
     "RUNAWAY_CAP_PER_DEVICE",
+    "NOTIFICATION_QUEUE_CAP_PER_DEVICE",
     "parse_when",
 ]

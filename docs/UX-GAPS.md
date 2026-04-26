@@ -53,10 +53,10 @@ Per user direction:
 | M2 | WS upgrade rejection plain text (401/503) | MED | ~3.5 h | 3 | **MERGED #112 + TinkerTab#199** |
 | M5 | Device-id collision silent eviction | MED | ~3 h | 3 | **MERGED #109 + TinkerTab#197** |
 | M6 | TC gateway down → 600 s timeout, no fast-fail | MED | ~4 h | 3 | **MERGED #107** |
-| H6 | Idle paused sessions never purge | HIGH | ~2-3 h | 4 | OPEN |
-| H7 | Media cleanup 1 h delay before first run | HIGH | ~1 h | 4 | OPEN |
-| D-mem | Memory facts unbounded (downgraded — sqlite-vec confirmed loaded) | LOW (was MED) | ~1 h | 4 | OPEN |
-| D-docs | Document ingest no size cap | MED | ~1 h | 4 | OPEN |
+| H6 | Idle paused sessions never purge | HIGH | ~2-3 h | 4 | **MERGED #117** |
+| H7 | Media cleanup 1 h delay before first run | HIGH | ~1 h | 4 | **MERGED #115** |
+| D-mem | Memory facts unbounded (downgraded — sqlite-vec confirmed loaded) | LOW (was MED) | ~1 h | 4 | OPEN (deferred — perf fine at 100k facts; ship if/when ops sees a real issue) |
+| D-docs | Document ingest no size cap | MED | ~1 h | 4 | **MERGED #119** |
 | L1 | POST 413 returns `Connection: close` | LOW | 10 min | 6 | OPEN |
 | F-T1 | Scheduler tier 1 (in-process) | DESIGN | ~7 h | 5 | OPEN |
 | F-T2 | Scheduler tier 2 (durable + offline queue) | DESIGN | +6 h | 5 | OPEN |
@@ -146,9 +146,9 @@ PRs.
 
 | PR | Scope | Effort |
 |---|---|---|
-| δ1 | H7 media cleanup runs immediately on startup | ~1 h |
-| δ2 | H6 paused-session retention policy (`paused_session_retention_days`) | ~2-3 h |
-| δ3 | D-docs document size cap; D-mem fact cap (low-priority since sqlite-vec confirmed loaded) | ~2 h |
+| δ1 | H7 media cleanup runs immediately on startup | **MERGED #115** |
+| δ2 | H6 paused-session retention policy (`paused_session_retention_days`) | **MERGED #117** |
+| δ3 | D-docs document size cap; D-mem fact cap (low-priority since sqlite-vec confirmed loaded) | **D-docs MERGED #119** (D-mem deferred) |
 
 **E2E acceptance:**
 - Soak Dragon for ~1 hour with media uploads on startup → `/home/radxa/media`

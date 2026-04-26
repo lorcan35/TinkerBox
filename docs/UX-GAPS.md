@@ -58,8 +58,8 @@ Per user direction:
 | D-mem | Memory facts unbounded (downgraded — sqlite-vec confirmed loaded) | LOW (was MED) | ~1 h | 4 | OPEN (deferred — perf fine at 100k facts; ship if/when ops sees a real issue) |
 | D-docs | Document ingest no size cap | MED | ~1 h | 4 | **MERGED #119** |
 | L1 | POST 413 returns `Connection: close` | LOW | 10 min | 6 | **MERGED #122** |
-| F-T1 | Scheduler tier 1 (in-process) | DESIGN | ~7 h | 5 | OPEN |
-| F-T2 | Scheduler tier 2 (durable + offline queue) | DESIGN | +6 h | 5 | OPEN |
+| F-T1 | Scheduler tier 1 (in-process) | DESIGN | ~7 h | 5 | **MERGED #129 + #130** |
+| F-T2 | Scheduler tier 2 (durable + offline queue) | DESIGN | +6 h | 5 | **MERGED #132** |
 
 **Architectural patterns (collapse multiple gaps into single abstractions):**
 
@@ -166,9 +166,9 @@ and risk register.  Read the RFC before starting any implementation PR.
 
 | PR | Scope | Effort |
 |---|---|---|
-| ε-design | RFC: scheduler architecture + Tab5 notification UI surface decision | ~2 h |
-| ε1 | F-T1 in-process scheduler (asyncio task + REST API + ScheduleReminderTool + WS `notification` message) | ~4 h Dragon + ~3 h Tab5 |
-| ε2 | F-T2 SQLite-backed durable + offline queue + boot replay | ~6 h Dragon |
+| ε-design | RFC: scheduler architecture + Tab5 notification UI surface decision | **MERGED #127** |
+| ε1 | F-T1 in-process scheduler (asyncio task + REST API + ScheduleReminderTool + WS `notification` message) | **MERGED #129 (ε1a) + #130 (ε1b)** |
+| ε2 | F-T2 SQLite-backed durable + offline queue + boot replay | **MERGED #132** |
 
 **E2E acceptance:**
 - "Remind me in 5 minutes" → 5 minutes later a card appears in chat with

@@ -103,4 +103,5 @@ jobs:
             tests/test_hybrid_tts_fast_path.py \
             tests/test_missing_key_gamma_arch.py \
             tests/test_d_tier_polish.py \
-            tests/test_turn_gate.py
+            tests/test_turn_gate.py \
+            tests/test_short_utterance_signal.py

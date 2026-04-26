@@ -23,6 +23,7 @@ from dragon_voice.progress_emit import emit_progress_pair
 from dragon_voice.stt import create_stt, STTBackend
 from dragon_voice.tts import create_tts, TTSBackend
 from dragon_voice.llm import create_llm, LLMBackend
+from dragon_voice.tools.response_wrap import looks_like_useful_text, synthesize_wrap
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +152,9 @@ class VoicePipeline:
         session_id: str = "",
         media_pipeline=None,
         backend_pool: Optional[dict] = None,
+        on_tool_call: Optional[Callable[[dict], Awaitable[None]]] = None,
+        on_tool_result: Optional[Callable[[dict], Awaitable[None]]] = None,
+        on_tool_error: Optional[Callable[[dict], Awaitable[None]]] = None,
     ) -> None:
         """Initialize the pipeline.
 
@@ -168,6 +172,11 @@ class VoicePipeline:
             backend_pool: Optional dict for sharing backends across pipelines
                 (see W15-C01).  When provided, compatible backends are
                 borrowed from the pool instead of re-initialising them.
+            on_tool_call / on_tool_result / on_tool_error: Optional async
+                callbacks invoked when ConversationEngine fires a tool.
+                Audit A2 (#142): voice path used to drop these silently;
+                wiring them in lets the Tab5 chat surface tool indicators
+                on voice turns the same way it already does on text turns.
         """
         self._config = config
         self._on_audio = on_audio
@@ -175,6 +184,15 @@ class VoicePipeline:
         self._conversation_engine = conversation_engine
         self._session_id = session_id
         self._media_pipeline = media_pipeline
+        self._on_tool_call = on_tool_call
+        self._on_tool_result = on_tool_result
+        self._on_tool_error = on_tool_error
+        # Audit A3 (#142): per-utterance tool-call tracker.  Mirrors the
+        # text path's `conn_state["tool_calls_this_turn"]`; populated by
+        # the wrapped callbacks below and read by the empty-reply guard
+        # so an FC-style tool-only turn produces a per-tool wrap instead
+        # of the legacy generic apology.
+        self._tool_calls_this_turn: list[dict] = []
 
         self._stt: Optional[STTBackend] = None
         self._tts: Optional[TTSBackend] = None
@@ -702,6 +720,9 @@ class VoicePipeline:
         self._cancelled = False
         self._tts_started = False
         self._tts_total_ms = 0.0
+        # Audit A3 (#142): clear the per-utterance tool tracker so the
+        # empty-reply guard at end-of-stream sees only this turn's fires.
+        self._tool_calls_this_turn = []
         pipeline_start = time.monotonic()
 
         try:
@@ -791,13 +812,54 @@ class VoicePipeline:
                 ])
             elif self._conversation_engine and self._session_id:
                 # Multi-turn: routes through ConversationEngine which stores
-                # messages in DB and builds context from history
+                # messages in DB and builds context from history.
+                #
+                # Audit A2 (#142): pass tool callbacks so Tab5 sees
+                # tool_call/tool_result/tool_args_invalid frames on voice
+                # turns the same way it does on text turns.  The wrapper
+                # callbacks below also populate self._tool_calls_this_turn
+                # for the A3 per-tool-wrap guard at end-of-stream.
                 audio_duration = len(audio_data) / (self._config.audio.input_sample_rate * 2)
+
+                async def _voice_on_tool_call(call: dict) -> None:
+                    try:
+                        self._tool_calls_this_turn.append({
+                            "tool": call.get("tool"),
+                            "args": call.get("args") or {},
+                        })
+                    except Exception:
+                        logger.debug("voice tool tracker pre-register suppressed", exc_info=True)
+                    if self._on_tool_call is not None:
+                        await self._on_tool_call(call)
+
+                async def _voice_on_tool_result(result: dict) -> None:
+                    try:
+                        merged = False
+                        for rec in self._tool_calls_this_turn:
+                            if rec.get("tool") == result.get("tool") and "result" not in rec:
+                                rec["result"] = result.get("result")
+                                rec["execution_ms"] = result.get("execution_ms")
+                                merged = True
+                                break
+                        if not merged:
+                            self._tool_calls_this_turn.append(result)
+                    except Exception:
+                        logger.debug("voice tool tracker merge suppressed", exc_info=True)
+                    if self._on_tool_result is not None:
+                        await self._on_tool_result(result)
+
+                async def _voice_on_tool_error(err: dict) -> None:
+                    if self._on_tool_error is not None:
+                        await self._on_tool_error(err)
+
                 llm_stream = self._conversation_engine.process_text_stream(
                     session_id=self._session_id,
                     text=transcript,
                     input_mode="voice",
                     audio_duration_s=audio_duration,
+                    on_tool_call=_voice_on_tool_call,
+                    on_tool_result=_voice_on_tool_result,
+                    on_tool_error=_voice_on_tool_error,
                 )
             else:
                 # Legacy stateless path (no session)
@@ -925,25 +987,36 @@ class VoicePipeline:
             if sentence_buffer.strip() and not self._cancelled:
                 await self._synthesize_and_send(sentence_buffer.strip())
 
-            # Wave 15 W15-H09: empty-response guard.  If the LLM stream
-            # finished without producing any text (common failure mode:
-            # model attempts a tool call, the tool errors out, model
-            # halts without formulating a user-facing answer — seen
-            # today with MiniMax-M2.5 on TinkerClaw when BRAVE_API_KEY
-            # is missing), the user was left staring at "thinking" until
-            # Tab5 timed out and dropped to READY with no audio.  Emit a
-            # fallback sentence so the user ALWAYS hears something.
-            # Skip the fallback if we were cancelled — that's a user
+            # Empty-response guard.  Skip if cancelled — that's a user
             # action (stop button, new session) and silence is correct.
-            if not full_response.strip() and not self._cancelled:
-                fallback = (
-                    "Sorry, I couldn't generate a response for that. "
-                    "Please try rephrasing, or try again in a moment."
-                )
-                logger.warning(
-                    "W15-H09: LLM stream produced zero text tokens — "
-                    "emitting fallback response to avoid silent drop"
-                )
+            #
+            # Audit C5 (#142): use looks_like_useful_text instead of
+            # `not full_response.strip()` so bracket-noise-only replies
+            # (residual `<` / `[tool]` from FC models) trigger the wrap
+            # too, matching the text path.
+            #
+            # Audit A3 (#142): if any tool fired this turn, synthesise a
+            # per-tool wrap from the tracker (e.g. "Got it — magenta.")
+            # instead of always emitting the legacy generic apology.  The
+            # legacy W15-H09 fallback only fires when zero tools ran.
+            if not self._cancelled and not looks_like_useful_text(full_response):
+                tool_calls = self._tool_calls_this_turn
+                if tool_calls:
+                    fallback = synthesize_wrap(tool_calls)
+                    logger.info(
+                        "voice empty-reply guard: %d tool(s) fired but LLM "
+                        "text was %r — emitting template wrap (%d chars)",
+                        len(tool_calls), full_response[:30], len(fallback),
+                    )
+                else:
+                    fallback = (
+                        "Sorry, I couldn't generate a response for that. "
+                        "Please try rephrasing, or try again in a moment."
+                    )
+                    logger.warning(
+                        "W15-H09: LLM stream produced zero usable text — "
+                        "emitting fallback response to avoid silent drop"
+                    )
                 await self._on_event({"type": "llm", "text": fallback})
                 await self._synthesize_and_send(fallback)
                 full_response = fallback

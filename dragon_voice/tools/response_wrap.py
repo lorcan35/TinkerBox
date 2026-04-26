@@ -36,7 +36,38 @@ empty-bubble pattern that motivates this module.  Refs #75.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Callable, Optional
+
+
+_BRACKET_NOISE = set("<>[]{}()\"'` \t\n\r")
+_RESIDUAL_XML_TAG = re.compile(r"<[^>]*>|\[[^]]*\]|\{[^}]*\}")
+
+
+def looks_like_useful_text(text: str) -> bool:
+    """True if `text` carries enough signal to be worth showing the user
+    over a templated tool-result ack.  Designed to fail "open" — when in
+    doubt, treat the model's text as useful (avoid clobbering real content).
+
+    Heuristic:
+      1. If the input contains a closing-tag pattern like `</word>` it is
+         almost certainly a residual tool-XML leak (ConversationEngine
+         already strips well-formed tool blocks; what reaches here would
+         be a malformed remainder like `[tool]remember</tool><args>...`).
+         Treat as junk.
+      2. Otherwise strip well-formed `<…>` / `[…]` / `{…}` blocks,
+         strip whitespace + bracket-noise chars, and require ≥ 3
+         meaningful chars.
+    """
+    if not text:
+        return False
+    if re.search(r"</\w+>", text):
+        return False
+    stripped = _RESIDUAL_XML_TAG.sub("", text).strip()
+    if len(stripped) < 3:
+        return False
+    meaningful = [c for c in stripped if c not in _BRACKET_NOISE]
+    return len(meaningful) >= 3
 
 # Each wrap function takes the tool result dict (same shape as
 # ToolRegistry.execute returns — {"tool": name, "result": ..., "execution_ms": N})

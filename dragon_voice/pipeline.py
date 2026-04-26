@@ -437,10 +437,27 @@ class VoicePipeline:
                 await self._process_task
             except asyncio.CancelledError:
                 pass
-        # DQ22: cancel lingering post-process task
+        # DQ22: cancel lingering post-process task.
+        # Audit B5 (#152): pre-fix this only called task.cancel() and
+        # nulled the handle.  If the task was inside its LLM stream when
+        # cancel ran, the CancelledError might not fire until after the
+        # LLM returned -- by which point the task could have emitted a
+        # stale `dictation_summary` to a now-closed WS, or raced a
+        # later finish_dictation's emission.  Awaiting here makes the
+        # cancellation observable: by the time cancel() returns, the
+        # task is guaranteed CANCELLED (or completed cleanly).
         if self._post_process_task and not self._post_process_task.done():
-            self._post_process_task.cancel()
+            prev = self._post_process_task
             self._post_process_task = None
+            prev.cancel()
+            try:
+                await prev
+            except (asyncio.CancelledError, Exception):
+                # Either cancellation propagated (normal) or the task
+                # raised some other error (already logged in
+                # _on_post_process_done callback).  Either way we don't
+                # want it to escape `cancel()`.
+                pass
         # Kill any in-flight Piper TTS subprocesses (US-P24)
         if self._tts and hasattr(self._tts, "kill_active_procs"):
             self._tts.kill_active_procs()
@@ -560,7 +577,16 @@ class VoicePipeline:
             # the second task raced it to write title/summary.
             prev = self._post_process_task
             if prev and not prev.done():
+                # Audit B5 (#152): await the cancellation so the prior
+                # task can't race-emit a stale dictation_summary
+                # between the LLM call returning and CancelledError
+                # firing at the next await.
+                self._post_process_task = None
                 prev.cancel()
+                try:
+                    await prev
+                except (asyncio.CancelledError, Exception):
+                    pass
                 # Phase 2 H4 (issue #94): tell Tab5 the prior post-process
                 # was abandoned for the new one.  Without this, a user who
                 # rapidly stops + restarts dictation could see a stale

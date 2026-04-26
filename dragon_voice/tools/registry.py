@@ -356,10 +356,17 @@ class ToolRegistry:
         """Minimal tool format for small models (qwen3:1.7b etc).
 
         Uses fewer tokens and simpler structure to avoid confusing small models.
-        Only shows the 4 most commonly used tools to reduce context bloat.
+        Only shows the most commonly used tools to reduce context bloat.
         """
-        # Core tools that small models handle well
-        priority_tools = ["web_search", "datetime", "remember", "recall", "calculator"]
+        # Core tools that small models handle well.  Issue #134:
+        # `schedule_reminder` was missing — local LLM hallucinated
+        # "no such tool available" when the user asked for a reminder.
+        # Adding ~30 tokens to the system prompt is a worthwhile
+        # trade for unlocking a high-value capability.
+        priority_tools = [
+            "web_search", "datetime", "remember", "recall",
+            "calculator", "schedule_reminder",
+        ]
         tools = [t for t in self._tools.values() if t.name in priority_tools]
         if not tools:
             tools = list(self._tools.values())[:4]

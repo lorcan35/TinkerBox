@@ -861,11 +861,12 @@ class VoiceServer:
                                     pass
                                 handler_tasks[slot] = None
                                 cancelled_what.append(slot)
-                        # Pipeline is the voice path's authority; cancel
-                        # whether or not we cancelled a handler task above
-                        # (handler-task cancel might have been mid-TTS, which
-                        # owns Piper subprocesses on the pipeline side).
-                        if pipeline and (pipeline._processing or not cancelled_what):
+                        # Always cancel the pipeline.  The text path calls
+                        # pipeline._tts.synthesize() directly (see _handle_text),
+                        # so a Piper subprocess can be alive even when no
+                        # handler-task slot was occupied or _processing is False.
+                        # pipeline.cancel() is idempotent.  (audit A1, #137)
+                        if pipeline:
                             logger.info("Connection %s: cancel → pipeline.cancel", ws_id)
                             await pipeline.cancel()
                             cancelled_what.append("pipeline")

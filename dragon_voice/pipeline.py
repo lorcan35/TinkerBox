@@ -417,8 +417,33 @@ class VoicePipeline:
         if self._processing:
             return
 
-        if len(self._audio_buffer) < 1600:  # Less than 50ms at 16kHz
-            logger.debug("Audio buffer too small to process (%d bytes)", len(self._audio_buffer))
+        # Audit C2 (#137): bumped threshold from 1600 (50 ms) to 4000
+        # bytes (~250 ms).  Anything below is essentially noise — sub-
+        # quarter-second of audio doesn't transcribe to anything
+        # meaningful and just wastes Moonshine cycles.  Pre-fix below-
+        # threshold returns were a silent `logger.debug` drop with no
+        # Tab5 frame; the user tapped mic, said nothing, released, and
+        # got no signal we ignored their tap.  Now: when the buffer is
+        # non-trivially short (some audio captured but too little to
+        # transcribe), surface a γ-arch TRANSIENT/STT toast so Tab5
+        # can render "Didn't catch that — try speaking a bit longer."
+        _MIN_AUDIO_BYTES = 4000  # ~250 ms at 16 kHz int16
+        if len(self._audio_buffer) < _MIN_AUDIO_BYTES:
+            buffered = len(self._audio_buffer)
+            logger.debug("Audio buffer too small to process (%d bytes)", buffered)
+            self._audio_buffer.clear()
+            # Empty buffer = no actual user input (probably mic-disabled
+            # or aborted before record); no toast.  Some bytes = user
+            # tapped + released too fast; emit toast.
+            if buffered > 0:
+                try:
+                    await self._on_event(error_event(
+                        code="stt_too_short",
+                        message="Didn't catch that — try speaking a bit longer.",
+                        severity=Severity.TRANSIENT, scope=Scope.STT,
+                    ))
+                except Exception:
+                    logger.debug("stt_too_short emit failed", exc_info=True)
             return
 
         audio_data = bytes(self._audio_buffer)

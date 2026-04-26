@@ -2040,6 +2040,26 @@ class VoiceServer:
                     })
                 return
 
+            # B7 (audit, #137): TC mode needs a token; without one the
+            # backend's __init__ raises ValueError, which would leak via
+            # the A4 raw-exception path below.  Validate up-front like
+            # the OpenRouter key check above so the user sees a clean
+            # γ-arch error and a clean revert instead of a stack trace.
+            if voice_mode == 3 and not (conn_config.llm.tinkerclaw_token or "").strip():
+                logger.error("TC mode requested but tinkerclaw_token is blank")
+                if not ws.closed:
+                    await self._safe_send_json(ws, error_event(
+                        code="tc_token_missing",
+                        message="TinkerClaw token not configured — reverted to local",
+                        severity=Severity.FATAL,
+                        scope=Scope.GATEWAY,
+                    ))
+                    await self._safe_send_json(ws, {
+                        "type": "config_update",
+                        "voice_mode": 0,
+                    })
+                return
+
             # Update session system prompt in DB for conversation engine
             # Chat v4·C (refs #27): also persist voice_mode + llm_model
             # onto the session row so the drawer surfaces the active
@@ -2097,17 +2117,35 @@ class VoiceServer:
                         if hasattr(pipeline._llm, 'set_session_key'):
                             pipeline._llm.set_session_key(
                                 conn_state.get("session_id", ""))
-                except Exception as e:
+                except DragonError as de:
+                    # Already a γ-arch structured error — emit verbatim.
+                    logger.warning("Backend swap failed (DragonError): %s", de.message)
+                    await self._safe_send_json(ws, de.to_event())
+                    await self._safe_send_json(ws, {
+                        "type": "config_update",
+                        "voice_mode": 0,
+                    })
+                    return
+                except Exception:
+                    # A4 (audit, #137): the prior code did
+                    # `f"Backend swap failed: {e}"` which leaked raw
+                    # Python exception text (e.g. the multi-line
+                    # OpenRouter / TC ValueError) into Tab5's voice
+                    # caption.  Send a γ-arch error event with a
+                    # user-friendly message instead; the full trace is
+                    # still in the logs via logger.exception below.
                     logger.exception(
                         "Backend swap failed for %s",
                         conn_state.get("ws_id", "?"),
                     )
-                    # W15-C04: `_safe_send_json` owns the closed-check + send
-                    # atomically and doesn't raise if the socket closed after
-                    # our swap started.
+                    await self._safe_send_json(ws, error_event(
+                        code="backend_swap_failed",
+                        message="Couldn't switch backends — reverted to local",
+                        severity=Severity.FATAL,
+                        scope=Scope.LLM,
+                    ))
                     await self._safe_send_json(ws, {
                         "type": "config_update",
-                        "error": f"Backend swap failed: {e}",
                         "voice_mode": 0,
                     })
                     return

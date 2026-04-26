@@ -13,6 +13,7 @@ from typing import Optional
 import aiohttp
 
 from dragon_voice.config import TTSConfig
+from dragon_voice.errors import DragonError, Scope, Severity
 from dragon_voice.tts.base import TTSBackend
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,11 @@ class OpenRouterTTSBackend(TTSBackend):
             "stream": True,
         }
 
+        # Audit B3 (#146): every failure mode used to `return b""`, which
+        # silently bypassed the pipeline's local-Piper fallback path.  Now
+        # we raise a structured DragonError so the existing
+        # `except (Exception, asyncio.TimeoutError)` block in
+        # `pipeline._synthesize_and_send` triggers fallback + Tab5 revert.
         try:
             self.total_calls += 1
             async with self._session.post(
@@ -71,7 +77,12 @@ class OpenRouterTTSBackend(TTSBackend):
                 if resp.status != 200:
                     err = await resp.text()
                     logger.error("OpenRouter TTS error %d: %s", resp.status, err[:300])
-                    return b""
+                    raise DragonError(
+                        "Cloud TTS hit an error — switching to local.",
+                        code="tts_http_error",
+                        severity=Severity.TRANSIENT,
+                        scope=Scope.TTS,
+                    )
 
                 # Collect base64 pcm16 chunks from SSE stream
                 audio_b64_parts = []
@@ -93,7 +104,12 @@ class OpenRouterTTSBackend(TTSBackend):
 
                 if not audio_b64_parts:
                     logger.warning("OpenRouter TTS: no audio chunks received")
-                    return b""
+                    raise DragonError(
+                        "Cloud TTS returned no audio — switching to local.",
+                        code="tts_empty_response",
+                        severity=Severity.TRANSIENT,
+                        scope=Scope.TTS,
+                    )
 
                 # Decode all base64 chunks into raw PCM int16
                 pcm_bytes = base64.b64decode("".join(audio_b64_parts))
@@ -102,9 +118,18 @@ class OpenRouterTTSBackend(TTSBackend):
                            len(pcm_bytes), duration, self._sample_rate_val, text)
                 return pcm_bytes
 
+        except DragonError:
+            # Already structured — re-raise for the caller's fallback path.
+            raise
         except Exception as e:
             logger.error("OpenRouter TTS request failed: %s", e)
-            return b""
+            raise DragonError(
+                "Couldn't reach cloud TTS — switching to local.",
+                code="tts_request_failed",
+                severity=Severity.TRANSIENT,
+                scope=Scope.TTS,
+                cause=e,
+            ) from e
 
     async def shutdown(self) -> None:
         if self._session and not self._session.closed:

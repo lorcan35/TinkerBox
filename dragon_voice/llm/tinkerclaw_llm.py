@@ -297,15 +297,27 @@ class TinkerClawBackend(LLMBackend):
                 token_count = 0
                 total_bytes = 0  # W14-M07: running total of SSE body bytes
                 consecutive_errors = 0  # P11: detect HTML error pages from proxy
-                # #B1 TinkerTab audit 2026-04-24: buffer the whole response
-                # so we can post-process chain-of-thought leakage before
-                # emitting it to the voice pipeline.  We lose token-level
-                # streaming for TC mode, but gain the ability to strip the
-                # "Let me try another approach:" preamble that TC agents
-                # emit when tools fail mid-loop.  For well-behaved replies
-                # this is a near no-op (sanitize is idempotent on clean
-                # text).  See sanitize_tinkerclaw_reply above.
+                # Audit A5 (#144): two-phase streaming.  We still need to
+                # peel CoT preamble that TC agents leak between tool calls
+                # ("Let me try another approach:..."), but we no longer
+                # buffer the WHOLE reply.  Instead we buffer just enough
+                # of the front to either (a) prove no preamble matched and
+                # safely passthrough, or (b) fully cover the longest known
+                # preamble pattern.  All `_COT_PREAMBLE_PATTERNS` are
+                # `^`-anchored, so they only ever peel from the front —
+                # once we've passed the preamble window the residue is
+                # identical to passthrough, sanitiser-wise.
                 accumulated: list[str] = []
+                passthrough = False
+                # Tunables: chosen so MiniMax-style happy replies (no
+                # preamble, ~10 tok/s, ~5 ch/tok) hit passthrough at
+                # roughly the first sentence end ≈ 1-2 s after the first
+                # token, while a long preamble has up to ~400 chars to
+                # finish before the safety cap forces a flush.
+                _A5_EARLY_CHECK_MIN_CHARS = 60
+                _A5_SAFETY_FLUSH_CHARS = 400
+                _A5_PARAGRAPH_BREAK = "\n\n"
+                _A5_SENTENCE_END_CHARS = (".", "!", "?")
 
                 # W14-M07: use readline with explicit byte cap so one
                 # pathologically long SSE frame can't blow memory.
@@ -372,10 +384,54 @@ class TinkerClawBackend(LLMBackend):
                                 accumulated.clear()
                             yield " ... (response aborted: too many tokens)"
                             return
-                        # #B1: buffer instead of yielding directly so we can
-                        # strip the "Let me try another approach:" preamble
-                        # once the full reply is in hand.
+                        # Audit A5 (#144): once the preamble window has
+                        # passed, stream tokens directly so the user
+                        # doesn't wait 30-60 s for a full reply to land.
+                        if passthrough:
+                            yield token
+                            continue
                         accumulated.append(token)
+                        joined = "".join(accumulated)
+                        # Hard safety: any preamble longer than this is
+                        # pathological — flush sanitised, switch to
+                        # passthrough so the rest of the reply still
+                        # streams instead of waiting on more buffering.
+                        if len(joined) >= _A5_SAFETY_FLUSH_CHARS:
+                            cleaned = sanitize_tinkerclaw_reply(joined)
+                            if cleaned:
+                                yield cleaned
+                            accumulated.clear()
+                            passthrough = True
+                            continue
+                        # Paragraph break is a strong "preamble is over"
+                        # signal — TC agents put a blank line between
+                        # internal reasoning and the final answer when
+                        # they bother to format it.
+                        if _A5_PARAGRAPH_BREAK in joined:
+                            cleaned = sanitize_tinkerclaw_reply(joined)
+                            if cleaned:
+                                yield cleaned
+                            accumulated.clear()
+                            passthrough = True
+                            continue
+                        # Early flush: at any sentence boundary past the
+                        # check threshold, run sanitise.  If the cleaned
+                        # residue carries at least ~20 chars of real
+                        # content, the answer has started — flush the
+                        # cleaned prefix (preamble peeled or not) and
+                        # passthrough the remainder so the user sees
+                        # streaming instead of a 30-60 s freeze.  Only
+                        # check at sentence ends to keep the per-token
+                        # cost low.
+                        if (
+                            len(joined) >= _A5_EARLY_CHECK_MIN_CHARS
+                            and any(c in token for c in _A5_SENTENCE_END_CHARS)
+                        ):
+                            cleaned = sanitize_tinkerclaw_reply(joined)
+                            if len(cleaned.strip()) >= 20:
+                                yield cleaned
+                                accumulated.clear()
+                                passthrough = True
 
                 # A07: Truncation detection — stream ended without [DONE]
                 if not saw_done:

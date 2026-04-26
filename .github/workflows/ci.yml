@@ -89,4 +89,5 @@ jobs:
             tests/test_incremental_tool_marker_detection.py \
             tests/test_tts_flush_and_kill.py \
             tests/test_ws_upgrade_errors.py \
-            tests/test_looks_like_useful_text.py
+            tests/test_looks_like_useful_text.py \
+            tests/test_tinkerclaw_streaming.py

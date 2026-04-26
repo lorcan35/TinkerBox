@@ -317,6 +317,15 @@ class VoicePipeline:
         if self._swapping:
             return
 
+        # Audit C6 (#137): reset the buffer-cap-emitted latches at the
+        # start of a fresh recording session (both buffers empty).
+        # Without this a user who hit the cap, stopped, and started a
+        # new recording would never see the warning again because the
+        # latch from the previous session is still set.
+        if not self._audio_buffer and not self._segment_buffer:
+            self._dictation_cap_emitted = False
+            self._audio_cap_emitted = False
+
         if self._dictation_mode:
             # Dictation: buffer in segment buffer, no Dragon-side VAD.
             # Tab5 sends {"type":"segment"} markers when it detects pauses.
@@ -326,6 +335,18 @@ class VoicePipeline:
                     "P06: segment buffer full (%d bytes), dropping audio",
                     len(self._segment_buffer),
                 )
+                # Audit C6 (#137): emit ONCE so Tab5 can show the user
+                # "Recording length limit reached -- stopping dictation"
+                # instead of silently capping at 5 min while they keep
+                # talking.  Latched per buffer-fill so we don't spam at
+                # 50 fps until they tap stop.
+                if not getattr(self, "_dictation_cap_emitted", False):
+                    self._dictation_cap_emitted = True
+                    await self._on_event(error_event(
+                        code="dictation_buffer_full",
+                        message="Recording reached 5-minute limit — finish to save.",
+                        severity=Severity.TRANSIENT, scope=Scope.MEDIA,
+                    ))
                 return
             self._segment_buffer.extend(audio_bytes)
             return
@@ -339,6 +360,17 @@ class VoicePipeline:
                 "P06: audio buffer full (%d bytes), dropping audio",
                 len(self._audio_buffer),
             )
+            # Audit C6 (#137): same latched user-visible signal as the
+            # dictation branch above so non-dictation long-utterance
+            # cases (e.g. user holds the orb open without speaking)
+            # also surface a clean "we hit the cap" frame.
+            if not getattr(self, "_audio_cap_emitted", False):
+                self._audio_cap_emitted = True
+                await self._on_event(error_event(
+                    code="audio_buffer_full",
+                    message="Recording reached 5-minute limit — finishing.",
+                    severity=Severity.TRANSIENT, scope=Scope.MEDIA,
+                ))
             return
         self._audio_buffer.extend(audio_bytes)
 
@@ -465,6 +497,10 @@ class VoicePipeline:
         self._cancelled = False
         self._audio_buffer.clear()
         self._segment_buffer.clear()
+        # Audit C6 (#137): cancel ends the recording session — reset
+        # the buffer-cap latches so the next session can emit again.
+        self._dictation_cap_emitted = False
+        self._audio_cap_emitted = False
         logger.info("Pipeline processing cancelled")
 
     # ── Dictation mode ─────────────────────────────────────────────

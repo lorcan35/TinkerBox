@@ -222,6 +222,7 @@ async def run_startup(server: Any, app: web.Application) -> None:
         voice_config=server._config,
         start_time=server._start_time,
         get_active_connections=lambda: len(server._active_connections),
+        get_active_conn_dict=lambda: server._active_connections,
         tool_registry=server._tool_registry,
         memory_service=server._memory_service,
         media_store=server._media_store,

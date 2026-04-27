@@ -35,6 +35,7 @@ def setup_all_routes(
     media_store=None,
     media_url_signer=None,
     scheduler_mgr=None,
+    get_active_conn_dict=None,   # #177: route handlers that need the dict (not just len)
 ) -> None:
     """Register all API route modules on the aiohttp app.
 
@@ -63,9 +64,11 @@ def setup_all_routes(
     # System info + backend listing
     if voice_config and get_active_connections:
         SystemRoutes(voice_config, start_time, get_active_connections, get_db=db).register(app)
-        # #177 / Phase 3B: video downlink debug injector — uses the
-        # same connection registry to find the target Tab5's WS.
-        VideoInjectRoutes(get_active_connections).register(app)
+    # #177 / Phase 3B: video downlink debug injector — needs the
+    # full conn-state dict (not just a count) so it can resolve a
+    # session_id back to the live ws handle.
+    if get_active_conn_dict:
+        VideoInjectRoutes(get_active_conn_dict).register(app)
 
     # Agentic routes (Sprint 2 — registered when available)
     if tool_registry:

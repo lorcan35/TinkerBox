@@ -366,25 +366,68 @@ class OpenRouterBackend(LLMBackend):
 # token_count / 1_000_000 gives cost in mils.  Display side (Tab5) divides
 # by 1000 for cents or 100000 for dollars.
 #
-# Prices match OpenRouter's listed rates as of April 2026.  Update in one
-# place when they change.  Unknown models fall through to a conservative
-# default so a pricing surprise never zeroes out the receipt.
+# Prices match OpenRouter's listed rates as of 2026-04-27 (verified via
+# the live /api/v1/models endpoint).  Update in one place when they
+# change.  Unknown models fall through to a conservative default so a
+# pricing surprise never zeroes out the receipt.
 _PRICING_MILS_PER_M = {
-    # OpenAI
-    "openai/gpt-4o":             {"in":   2500000, "out":  10000000},
-    "openai/gpt-4o-mini":        {"in":    150000, "out":    600000},
-    "openai/gpt-audio-mini":     {"in":    300000, "out":   1200000},
-    # Anthropic
+    # ── OpenAI ─────────────────────────────────────────────────────
+    "openai/gpt-4o":              {"in":  2500000, "out":  10000000},
+    "openai/gpt-4o-mini":         {"in":   150000, "out":    600000},
+    "openai/gpt-audio-mini":      {"in":   300000, "out":   1200000},
+    "openai/gpt-5.5":             {"in":  5000000, "out":  30000000},  # Apr 24
+    "openai/gpt-5.5-pro":         {"in": 30000000, "out": 180000000},
+    "openai/gpt-5.4":             {"in":  2500000, "out":  15000000},
+    "openai/gpt-5.4-mini":        {"in":   750000, "out":   4500000},
+    "openai/gpt-5.4-nano":        {"in":   200000, "out":   1250000},
+    # ── Anthropic ──────────────────────────────────────────────────
     "anthropic/claude-sonnet-4-20250514": {"in": 3000000, "out": 15000000},
-    "anthropic/claude-3-haiku":  {"in":    250000, "out":   1250000},
-    "anthropic/claude-3.5-haiku":{"in":    800000, "out":   4000000},
-    # Google / Gemini Flash family (2026-04-20 OpenRouter listing)
-    "google/gemini-3-flash-preview":   {"in":  500000, "out": 3000000},
-    "google/gemini-2.5-flash":         {"in":  300000, "out": 2500000},
-    "google/gemini-2.5-flash-lite":    {"in":  100000, "out":  400000},
-    "google/gemini-2.0-flash-001":     {"in":  100000, "out":  400000},
+    "anthropic/claude-3-haiku":   {"in":   250000, "out":   1250000},
+    "anthropic/claude-3.5-haiku": {"in":   800000, "out":   4000000},
+    "anthropic/claude-haiku-4.5": {"in":  1000000, "out":   5000000},  # Oct 15
+    "anthropic/claude-sonnet-4.5":{"in":  3000000, "out":  15000000},  # Sep 29
+    "anthropic/claude-sonnet-4.6":{"in":  3000000, "out":  15000000},  # Feb 17
+    "anthropic/claude-opus-4.5":  {"in":  5000000, "out":  25000000},
+    "anthropic/claude-opus-4.6":  {"in":  5000000, "out":  25000000},
+    "anthropic/claude-opus-4.7":  {"in":  5000000, "out":  25000000},  # Apr 16
+    # ── Google ─────────────────────────────────────────────────────
+    "google/gemini-3-flash-preview":      {"in":  500000, "out":  3000000},  # Dec 17
+    "google/gemini-3.1-pro-preview":      {"in": 2000000, "out": 12000000},  # Feb 19
+    "google/gemini-3.1-flash-lite-preview":{"in": 250000, "out":  1500000},
+    "google/gemini-2.5-flash":            {"in":  300000, "out":  2500000},
+    "google/gemini-2.5-flash-lite":       {"in":  100000, "out":   400000},
+    "google/gemini-2.0-flash-001":        {"in":  100000, "out":   400000},
+    "google/gemma-4-26b-a4b-it":          {"in":   60000, "out":   330000},  # Apr 3
+    "google/gemma-4-31b-it":              {"in":  130000, "out":   380000},  # Apr 2
+    # ── DeepSeek ───────────────────────────────────────────────────
+    "deepseek/deepseek-v3.2":     {"in":   250000, "out":    380000},
+    "deepseek/deepseek-v4-flash": {"in":   140000, "out":    280000},  # Apr 24
+    "deepseek/deepseek-v4-pro":   {"in":   430000, "out":    870000},  # Apr 24
+    "deepseek/deepseek-r1":       {"in":   700000, "out":   2500000},
+    # ── Qwen 3.5 / 3.6 family ──────────────────────────────────────
+    "qwen/qwen3.6-flash":         {"in":   250000, "out":  1500000},  # Apr 27 (released today)
+    "qwen/qwen3.6-27b":           {"in":   500000, "out":  2000000},
+    "qwen/qwen3.6-35b-a3b":       {"in":   160000, "out":   970000},
+    "qwen/qwen3.6-max-preview":   {"in":  1300000, "out":  7800000},
+    "qwen/qwen3.6-plus":          {"in":   330000, "out":  1950000},
+    "qwen/qwen3.5-plus-20260420": {"in":   400000, "out":  2400000},
+    "qwen/qwen3.5-flash-02-23":   {"in":    70000, "out":   260000},
+    # ── Moonshot / Kimi ────────────────────────────────────────────
+    "moonshotai/kimi-k2.6":       {"in":   740000, "out":  4660000},  # Apr 20
+    "moonshotai/kimi-k2.5":       {"in":   440000, "out":  2000000},
+    # ── x-AI Grok ──────────────────────────────────────────────────
+    "x-ai/grok-4.20":             {"in":  2000000, "out":  6000000},
+    "x-ai/grok-4.20-multi-agent": {"in":  2000000, "out":  6000000},
+    "x-ai/grok-4.1-fast":         {"in":   200000, "out":   500000},
+    # ── Z.ai GLM ───────────────────────────────────────────────────
+    "z-ai/glm-5.1":               {"in":  1050000, "out":  3500000},
+    "z-ai/glm-5v-turbo":          {"in":  1200000, "out":  4000000},
+    "z-ai/glm-4.7-flash":         {"in":    60000, "out":   400000},
+    # ── Xiaomi MiMo ────────────────────────────────────────────────
+    "xiaomi/mimo-v2.5":           {"in":   400000, "out":  2000000},
+    "xiaomi/mimo-v2.5-pro":       {"in":  1000000, "out":  3000000},
     # Fallback for anything unknown -- $2/$8 per M tokens, slightly high on purpose
-    "_default":                  {"in":   2000000, "out":   8000000},
+    "_default":                   {"in":  2000000, "out":  8000000},
 }
 
 
@@ -425,19 +468,65 @@ def price_for_model(model: str, prompt_tokens: int, completion_tokens: int) -> i
 # completions API supports tools across the board; vision/video/audio
 # are explicit per-model and must be opted in.
 _OPENROUTER_CAPS: dict[str, frozenset[Modality]] = {
-    # Anthropic (vision + tools across the line)
-    "anthropic/claude-3-haiku":   frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
-    "anthropic/claude-3.5-haiku": frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    # ── Anthropic ────────────────────────────────────────────────
+    # Note: claude-3.5-haiku is technically vision-capable per the
+    # Anthropic route, but OR's Bedrock route rejects images.  Until
+    # OR adds a way to pin the route, we conservatively declare it
+    # text-only so the router doesn't pick it for vision turns.
+    "anthropic/claude-3.5-haiku":         frozenset({Modality.TEXT, Modality.TOOL_CALLING}),
+    "anthropic/claude-3-haiku":           frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    "anthropic/claude-haiku-4.5":         frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),  # Oct 15
     "anthropic/claude-sonnet-4-20250514": frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
-    # OpenAI
-    "openai/gpt-4o":              frozenset({Modality.TEXT, Modality.VISION, Modality.AUDIO_IN, Modality.AUDIO_OUT, Modality.TOOL_CALLING}),
-    "openai/gpt-4o-mini":         frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
-    "openai/gpt-audio-mini":      frozenset({Modality.TEXT, Modality.AUDIO_IN, Modality.AUDIO_OUT}),
-    # Google Gemini Flash family — vision + native video, full tools
-    "google/gemini-3-flash-preview": frozenset({Modality.TEXT, Modality.VISION, Modality.VIDEO, Modality.AUDIO_IN, Modality.TOOL_CALLING}),
-    "google/gemini-2.5-flash":       frozenset({Modality.TEXT, Modality.VISION, Modality.VIDEO, Modality.AUDIO_IN, Modality.TOOL_CALLING}),
-    "google/gemini-2.5-flash-lite":  frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
-    "google/gemini-2.0-flash-001":   frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    "anthropic/claude-sonnet-4.5":        frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),  # Sep 29
+    "anthropic/claude-sonnet-4.6":        frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),  # Feb 17
+    "anthropic/claude-opus-4.5":          frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    "anthropic/claude-opus-4.6":          frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    "anthropic/claude-opus-4.7":          frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),  # Apr 16
+    # ── OpenAI ───────────────────────────────────────────────────
+    "openai/gpt-4o":                      frozenset({Modality.TEXT, Modality.VISION, Modality.AUDIO_IN, Modality.AUDIO_OUT, Modality.TOOL_CALLING}),
+    "openai/gpt-4o-mini":                 frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    "openai/gpt-audio-mini":              frozenset({Modality.TEXT, Modality.AUDIO_IN, Modality.AUDIO_OUT}),
+    "openai/gpt-5.4":                     frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    "openai/gpt-5.4-mini":                frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    "openai/gpt-5.4-nano":                frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    "openai/gpt-5.5":                     frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),  # Apr 24
+    "openai/gpt-5.5-pro":                 frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    # ── Google Gemini family — native video + audio_in on 3.x ──
+    "google/gemini-3-flash-preview":      frozenset({Modality.TEXT, Modality.VISION, Modality.VIDEO, Modality.AUDIO_IN, Modality.TOOL_CALLING}),
+    "google/gemini-3.1-pro-preview":      frozenset({Modality.TEXT, Modality.VISION, Modality.VIDEO, Modality.AUDIO_IN, Modality.TOOL_CALLING}),
+    "google/gemini-3.1-flash-lite-preview": frozenset({Modality.TEXT, Modality.VISION, Modality.VIDEO, Modality.AUDIO_IN, Modality.TOOL_CALLING}),
+    "google/gemini-2.5-flash":            frozenset({Modality.TEXT, Modality.VISION, Modality.VIDEO, Modality.AUDIO_IN, Modality.TOOL_CALLING}),
+    "google/gemini-2.5-flash-lite":       frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    "google/gemini-2.0-flash-001":        frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    # Gemma open-weights (vision capable since Gemma 3)
+    "google/gemma-4-26b-a4b-it":          frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    "google/gemma-4-31b-it":              frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    # ── DeepSeek (text-only across the line) ────────────────────
+    "deepseek/deepseek-v3.2":             frozenset({Modality.TEXT, Modality.TOOL_CALLING}),
+    "deepseek/deepseek-v4-flash":         frozenset({Modality.TEXT, Modality.TOOL_CALLING}),  # Apr 24
+    "deepseek/deepseek-v4-pro":           frozenset({Modality.TEXT, Modality.TOOL_CALLING}),  # Apr 24
+    "deepseek/deepseek-r1":               frozenset({Modality.TEXT, Modality.TOOL_CALLING}),
+    # ── Qwen 3.5 / 3.6 — multimodal across most of the line ────
+    "qwen/qwen3.6-flash":                 frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),  # Apr 27
+    "qwen/qwen3.6-27b":                   frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    "qwen/qwen3.6-35b-a3b":               frozenset({Modality.TEXT, Modality.VISION}),  # vision but no tools per OR meta
+    "qwen/qwen3.6-max-preview":           frozenset({Modality.TEXT, Modality.TOOL_CALLING}),  # text+tools, no vision per OR meta
+    "qwen/qwen3.6-plus":                  frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    "qwen/qwen3.5-plus-20260420":         frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    "qwen/qwen3.5-flash-02-23":           frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    # ── Moonshot Kimi ───────────────────────────────────────────
+    "moonshotai/kimi-k2.6":               frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    "moonshotai/kimi-k2.5":               frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    # ── x-AI Grok ───────────────────────────────────────────────
+    "x-ai/grok-4.20":                     frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    "x-ai/grok-4.1-fast":                 frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    # ── Z.ai GLM ────────────────────────────────────────────────
+    "z-ai/glm-5.1":                       frozenset({Modality.TEXT, Modality.TOOL_CALLING}),
+    "z-ai/glm-5v-turbo":                  frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    "z-ai/glm-4.7-flash":                 frozenset({Modality.TEXT, Modality.TOOL_CALLING}),
+    # ── Xiaomi MiMo ─────────────────────────────────────────────
+    "xiaomi/mimo-v2.5":                   frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    "xiaomi/mimo-v2.5-pro":               frozenset({Modality.TEXT, Modality.TOOL_CALLING}),
 }
 
 _OPENROUTER_DEFAULT_CAPS = frozenset({Modality.TEXT, Modality.TOOL_CALLING})

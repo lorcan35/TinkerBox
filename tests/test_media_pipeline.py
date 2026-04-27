@@ -97,6 +97,31 @@ async def test_code_block_no_language_tag():
 
 
 @pytest.mark.asyncio
+async def test_code_block_single_line_with_lang():
+    """TinkerTab #79: small models (e.g. minimax/MiniMax-M2.5 on
+    TinkerClaw) emit single-line code blocks like
+    ```python print("hi") ``` with a space after the language tag
+    instead of a newline.  The original regex required `\\n`, so these
+    silently fell through to a raw-markdown text bubble in chat.
+    Relaxing to `\\s+` makes both forms detectable."""
+    p = make_pipeline()
+    text = '```python print("Hello, World!") ```'
+    events = await p.process_response(text, "sess1")
+    assert len(events) == 1
+    assert events[0]["alt"] == "Code: python"
+
+
+@pytest.mark.asyncio
+async def test_code_block_single_line_no_lang():
+    """Empty language tag + space separator should still match."""
+    p = make_pipeline()
+    text = '``` raw code ```'
+    events = await p.process_response(text, "sess1")
+    assert len(events) == 1
+    assert events[0]["alt"] == "Code: text"
+
+
+@pytest.mark.asyncio
 async def test_multiple_code_blocks_capped():
     p = make_pipeline()
     # Four code blocks — only 3 should produce events

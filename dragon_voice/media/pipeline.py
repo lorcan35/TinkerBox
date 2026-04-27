@@ -34,8 +34,13 @@ CODE_BG     = (22, 33, 62)    # #16213e
 GRID_COLOR  = (50, 50, 70)    # subtle grid lines
 
 # Regex patterns
+# Issue #79 (TinkerTab): separator was a literal `\n`, which missed
+# single-line code blocks like ```python print("hi") ``` that small
+# models (e.g. minimax/MiniMax-M2.5 on the TinkerClaw gateway) emit.
+# Relaxed to any whitespace so newline-separated AND space-separated
+# forms both render via the media pipeline.
 _RE_CODE_BLOCK = re.compile(
-    r"```(?P<lang>[a-zA-Z0-9_+-]*)[ \t]*\n(?P<code>.*?)```",
+    r"```(?P<lang>[a-zA-Z0-9_+-]*)\s+(?P<code>.*?)```",
     re.DOTALL,
 )
 _RE_TABLE_ROW = re.compile(r"^\|(.+\|)+\s*$", re.MULTILINE)

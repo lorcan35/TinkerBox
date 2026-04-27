@@ -95,6 +95,7 @@ jobs:
             tests/test_max_tool_calls_signal.py \
             tests/test_audio_resample.py \
             tests/test_audio_codec.py \
+            tests/test_video_upstream.py \
             tests/test_dictation_post_process_race.py \
             tests/test_b6_hybrid_first_utterance.py \
             tests/test_config_update_rate_limit_signal.py \

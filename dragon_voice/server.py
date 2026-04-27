@@ -691,6 +691,20 @@ class VoiceServer:
                 _last_client_msg_time = time.monotonic()
 
                 if msg.type == WSMsgType.BINARY:
+                    # #175: video frames carry a 4-byte magic prefix
+                    # ("VID0").  Sniff the first bytes; if it matches,
+                    # route to the video handler instead of the audio
+                    # pipeline.  Audio frames are unprefixed raw PCM as
+                    # before, so absence of magic falls through to the
+                    # existing feed_audio path.
+                    from .video_upstream import parse_video_frame, get_handler as _vget
+                    if parse_video_frame.peek(msg.data):
+                        await _vget().on_frame(
+                            session_id=conn_state.get("session_id", ""),
+                            device_id=conn_state.get("device_id", ""),
+                            wire_bytes=msg.data,
+                        )
+                        continue
                     # Raw PCM audio data — forward to pipeline
                     # Note: feed_audio is NOT locked (US-P10) — it only
                     # appends to the audio buffer and the VAD check is

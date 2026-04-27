@@ -43,6 +43,7 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   const VIDEO_MAGIC = new Uint8Array([0x56, 0x49, 0x44, 0x30]); // "VID0"
+  const AUDIO_MAGIC = new Uint8Array([0x41, 0x55, 0x44, 0x30]); // "AUD0"
 
   function log(msg) {
     const ts = new Date().toLocaleTimeString();
@@ -80,10 +81,13 @@
         firmware_ver: 'web',
         platform: 'web',
         session_id: null,
-        capabilities: { video_send: true, video_recv: true },
+        capabilities: { video_send: true, video_recv: true, audio_call: true },
       }));
-      // Start camera + frame loop.
-      stream = await navigator.mediaDevices.getUserMedia({ video: { width:640, height:480 }, audio:false });
+      // Start camera + microphone + frame loops.
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { width:640, height:480 },
+        audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 16000 },
+      });
       $('local').srcObject = stream;
       const fps = Math.max(1, Math.min(10, +$('fps').value || 3));
       const period = 1000 / fps;
@@ -110,7 +114,70 @@
         stats.bytesSent += wire.byteLength;
         $('stats').textContent = `sent ${stats.sent} (${(stats.bytesSent/1024).toFixed(0)} KB) | recv ${stats.recv} (${(stats.bytesRecv/1024).toFixed(0)} KB)`;
       }, period);
+
+      /* Audio capture: AudioContext at 16 kHz (browser may resample
+       * from 48 kHz internally), AudioWorkletNode-equivalent via the
+       * deprecated-but-widely-supported ScriptProcessorNode.  Buffer
+       * 320 samples = 20 ms = 640 B int16 — same shape Tab5 uses.
+       * Wrap with AUD0 magic + length and send. */
+      try {
+        const aud = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+        const src = aud.createMediaStreamSource(stream);
+        const proc = aud.createScriptProcessor(2048, 1, 1);
+        let f32buf = new Float32Array(0);
+        proc.onaudioprocess = (ev) => {
+          if (!ws || ws.readyState !== 1) return;
+          const inp = ev.inputBuffer.getChannelData(0);
+          const merged = new Float32Array(f32buf.length + inp.length);
+          merged.set(f32buf, 0);
+          merged.set(inp, f32buf.length);
+          const FRAME = 320;
+          let off = 0;
+          while (merged.length - off >= FRAME) {
+            const i16 = new Int16Array(FRAME);
+            for (let i = 0; i < FRAME; i++) {
+              const v = Math.max(-1, Math.min(1, merged[off + i]));
+              i16[i] = v < 0 ? v * 0x8000 : v * 0x7fff;
+            }
+            const body = new Uint8Array(i16.buffer);
+            const wire = new Uint8Array(8 + body.length);
+            wire.set(AUDIO_MAGIC, 0);
+            wire[4] = (body.length >>> 24) & 0xff;
+            wire[5] = (body.length >>> 16) & 0xff;
+            wire[6] = (body.length >>> 8)  & 0xff;
+            wire[7] = (body.length)        & 0xff;
+            wire.set(body, 8);
+            ws.send(wire.buffer);
+            off += FRAME;
+          }
+          f32buf = merged.slice(off);
+        };
+        src.connect(proc);
+        proc.connect(aud.destination);
+        log('audio uplink ready (16 kHz)');
+      } catch (e) {
+        log('audio init failed: ' + e);
+      }
     };
+
+    /* Lazy-init shared AudioContext for inbound playback. */
+    let playCtx = null;
+    let playClock = 0;
+    function playPcm(int16) {
+      if (!playCtx) {
+        playCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+        playClock = playCtx.currentTime + 0.05;   // small lead
+      }
+      const buf = playCtx.createBuffer(1, int16.length, playCtx.sampleRate);
+      const ch = buf.getChannelData(0);
+      for (let i = 0; i < int16.length; i++) ch[i] = int16[i] / 32768;
+      const node = playCtx.createBufferSource();
+      node.buffer = buf;
+      node.connect(playCtx.destination);
+      const startAt = Math.max(playClock, playCtx.currentTime + 0.005);
+      node.start(startAt);
+      playClock = startAt + buf.duration;
+    }
 
     ws.onmessage = (ev) => {
       if (typeof ev.data === 'string') {
@@ -118,18 +185,29 @@
         return;
       }
       const buf = new Uint8Array(ev.data);
-      // Check VID0 magic
-      if (buf.length < 8 || buf[0] !== 0x56 || buf[1] !== 0x49 || buf[2] !== 0x44 || buf[3] !== 0x30) return;
-      const len = (buf[4]<<24) | (buf[5]<<16) | (buf[6]<<8) | buf[7];
-      const jpeg = buf.slice(8, 8 + len);
-      const blob = new Blob([jpeg], { type: 'image/jpeg' });
-      const url = URL.createObjectURL(blob);
-      const prev = $('remote').src;
-      $('remote').src = url;
-      if (prev && prev.startsWith('blob:')) URL.revokeObjectURL(prev);
-      stats.recv++;
-      stats.bytesRecv += buf.byteLength;
-      $('stats').textContent = `sent ${stats.sent} (${(stats.bytesSent/1024).toFixed(0)} KB) | recv ${stats.recv} (${(stats.bytesRecv/1024).toFixed(0)} KB)`;
+      if (buf.length < 8) return;
+      // VID0?
+      if (buf[0] === 0x56 && buf[1] === 0x49 && buf[2] === 0x44 && buf[3] === 0x30) {
+        const len = (buf[4]<<24) | (buf[5]<<16) | (buf[6]<<8) | buf[7];
+        const jpeg = buf.slice(8, 8 + len);
+        const blob = new Blob([jpeg], { type: 'image/jpeg' });
+        const url = URL.createObjectURL(blob);
+        const prev = $('remote').src;
+        $('remote').src = url;
+        if (prev && prev.startsWith('blob:')) URL.revokeObjectURL(prev);
+        stats.recv++;
+        stats.bytesRecv += buf.byteLength;
+        $('stats').textContent = `sent ${stats.sent} (${(stats.bytesSent/1024).toFixed(0)} KB) | recv ${stats.recv} (${(stats.bytesRecv/1024).toFixed(0)} KB)`;
+        return;
+      }
+      // AUD0?
+      if (buf[0] === 0x41 && buf[1] === 0x55 && buf[2] === 0x44 && buf[3] === 0x30) {
+        const len = (buf[4]<<24) | (buf[5]<<16) | (buf[6]<<8) | buf[7];
+        // 2-byte aligned int16 view of the body
+        const body = buf.slice(8, 8 + len);
+        const i16 = new Int16Array(body.buffer, body.byteOffset, body.byteLength / 2);
+        playPcm(i16);
+      }
     };
 
     ws.onclose = (ev) => {

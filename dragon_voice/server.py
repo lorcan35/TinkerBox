@@ -707,6 +707,26 @@ class VoiceServer:
                             active_connections=self._active_connections,
                         )
                         continue
+
+                    # #181 / TinkerTab #272: in-call audio frames carry
+                    # the AUD0 magic.  Broadcast verbatim to other
+                    # connected clients and bypass STT — same model as
+                    # the video relay.  Bytes are raw int16 PCM (or
+                    # OPUS) inside; peers handle playback locally.
+                    from .audio_codec import peek_call_audio_magic
+                    if peek_call_audio_magic(msg.data):
+                        sender_sid = conn_state.get("session_id", "")
+                        for c in list(self._active_connections.values()):
+                            if c.get("session_id") == sender_sid:
+                                continue
+                            peer_ws = c.get("ws")
+                            if peer_ws is None or peer_ws.closed:
+                                continue
+                            try:
+                                await peer_ws.send_bytes(msg.data)
+                            except Exception as e:
+                                logger.debug("call-audio relay drop: %s", e)
+                        continue
                     # Raw PCM audio data — forward to pipeline
                     # Note: feed_audio is NOT locked (US-P10) — it only
                     # appends to the audio buffer and the VAD check is

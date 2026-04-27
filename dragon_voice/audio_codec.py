@@ -117,6 +117,39 @@ class OpusDownlinkEncoder:
         return bytes(out)
 
 
+# #181 / TinkerTab #272: in-call audio framing.  When Tab5 is in a
+# video call (voice_video_is_in_call() == true), mic frames are
+# wrapped with this 4-byte magic + 4-byte BE length so Dragon
+# broadcasts them to peers instead of feeding STT.  Symmetric on the
+# downlink — peers' tagged frames play through Tab5's existing
+# playback ring buffer.  Wire body is raw int16 LE PCM @ 16 kHz mono
+# (or whatever the mic uplink codec produces).
+CALL_AUDIO_MAGIC = b"AUD0"
+CALL_AUDIO_HEADER_LEN = 8
+
+
+def peek_call_audio_magic(data: bytes) -> bool:
+    """True iff `data` starts with the AUD0 magic."""
+    return len(data) >= 4 and data[:4] == CALL_AUDIO_MAGIC
+
+
+def parse_call_audio_frame(wire_bytes: bytes) -> bytes:
+    """Parse one AUD0-framed audio chunk; return the body (PCM) bytes.
+
+    Raises ValueError on malformed input — server.py logs at debug
+    level so noisy clients don't spam the journal.
+    """
+    if len(wire_bytes) < CALL_AUDIO_HEADER_LEN:
+        raise ValueError(f"too short: {len(wire_bytes)} B")
+    if wire_bytes[:4] != CALL_AUDIO_MAGIC:
+        raise ValueError("bad magic")
+    (length,) = struct.unpack(">I", wire_bytes[4:8])
+    body = wire_bytes[CALL_AUDIO_HEADER_LEN:]
+    if len(body) != length:
+        raise ValueError(f"len mismatch: header={length} body={len(body)}")
+    return body
+
+
 def negotiate_uplink(client_caps: Optional[list[str]]) -> str:
     """Pick a codec given the client's advertised list.
 

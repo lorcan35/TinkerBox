@@ -4,3 +4,6 @@ Pygments>=2.17.0
 zeroconf>=0.131.0
 pyyaml>=6.0
 numpy>=1.24
+# OPUS codec for the voice WS (#173 / TinkerTab #262).  ctypes wrapper
+# around libopus — apt-get install libopus0 on Dragon if needed.
+opuslib>=3.0.1

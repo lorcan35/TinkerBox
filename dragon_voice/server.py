@@ -1429,6 +1429,31 @@ class VoiceServer:
         conn_state["pipeline"] = pipeline
         logger.info("Pipeline ready for %s", ws_id)
 
+        # #173 / TinkerTab #262: codec negotiation.  Tab5 advertises
+        # capabilities.audio_codec = ["pcm", "opus"]; pick OPUS if both
+        # sides support it, send a config_update reply telling Tab5 to
+        # switch its encoder.  Backward-compat: legacy clients without
+        # the capability stay on PCM by default — no config_update
+        # needed for them.
+        try:
+            from . import audio_codec as _ac
+            client_codecs = (caps or {}).get("audio_codec") if isinstance(caps, dict) else None
+            if isinstance(client_codecs, list):
+                chosen = _ac.negotiate_uplink(client_codecs)
+                applied = pipeline.set_uplink_codec(chosen)
+                logger.info(
+                    "Audio codec negotiation %s: client=%s chosen=%s applied=%s",
+                    device_id, client_codecs, chosen, applied,
+                )
+                if applied != "pcm" and not ws.closed:
+                    await self._safe_send_json(ws, {
+                        "type": "config_update",
+                        "audio_uplink_codec": applied,
+                        "reason": "codec_negotiation",
+                    })
+        except Exception:
+            logger.exception("audio codec negotiation failed (non-fatal)")
+
     async def _spawn_handler_task(
         self,
         conn_state: dict,
@@ -2021,6 +2046,23 @@ class VoiceServer:
         cloud_mode = cmd.get("cloud_mode")
         if cloud_mode is not None and voice_mode is None:
             voice_mode = 2 if cloud_mode else 0
+
+        # #173 / TinkerTab #262: client-driven codec switch.  Tab5 may
+        # send config_update with audio_uplink_codec to swap mid-session
+        # (e.g. from a Settings toggle).  Apply via pipeline; reply with
+        # the codec actually applied so a fallback (opus -> pcm because
+        # libopus missing) is observable on the client.
+        client_uplink_codec = cmd.get("audio_uplink_codec") or cmd.get("audio_codec")
+        if client_uplink_codec is not None:
+            pipeline = conn_state.get("pipeline")
+            if pipeline is not None:
+                applied = pipeline.set_uplink_codec(str(client_uplink_codec))
+                if not ws.closed:
+                    await self._safe_send_json(ws, {
+                        "type": "config_update",
+                        "audio_uplink_codec": applied,
+                        "reason": "codec_negotiation",
+                    })
 
         if voice_mode is not None:
             # STT+TTS: local for mode 0, cloud for mode 1+2+3

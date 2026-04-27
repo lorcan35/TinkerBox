@@ -221,6 +221,13 @@ class VoicePipeline:
         self._last_voice_time = 0.0
         self._is_speaking = False
 
+        # #173 / TinkerTab #262: per-direction audio codec.  Default
+        # PCM (raw int16 binary frames as today).  set_uplink_codec()
+        # is called by server.py after the WS register handshake when
+        # the client advertised opus support.
+        self._uplink_codec = "pcm"
+        self._uplink_opus_dec = None  # OpusUplinkDecoder, lazy-init
+
         # Conversation history (last N turns) — only used without conversation_engine
         self._max_history = 10
 
@@ -311,17 +318,59 @@ class VoicePipeline:
             self._llm.name, " (pooled)" if self._pooled_llm else "",
         )
 
+    def set_uplink_codec(self, codec: str) -> str:
+        """Switch the uplink decoder.  Returns the codec actually applied.
+
+        If the requested codec can't be initialised (e.g. opuslib not
+        importable), falls back to "pcm" and logs a warning so the
+        caller's config_update reply matches reality.
+        """
+        codec = (codec or "pcm").lower()
+        if codec == "pcm":
+            self._uplink_codec = "pcm"
+            self._uplink_opus_dec = None
+            return "pcm"
+        if codec == "opus":
+            from . import audio_codec as ac
+            try:
+                self._uplink_opus_dec = ac.OpusUplinkDecoder()
+            except ac.CodecUnavailable as e:
+                logger.warning("OPUS uplink unavailable: %s — staying PCM", e)
+                self._uplink_codec = "pcm"
+                self._uplink_opus_dec = None
+                return "pcm"
+            self._uplink_codec = "opus"
+            logger.info("Uplink codec: PCM -> OPUS")
+            return "opus"
+        logger.warning("set_uplink_codec: unknown codec %r — staying %s",
+                       codec, self._uplink_codec)
+        return self._uplink_codec
+
+    def get_uplink_codec(self) -> str:
+        return self._uplink_codec
+
     async def feed_audio(self, audio_bytes: bytes) -> None:
         """Feed incoming PCM int16 audio data into the pipeline.
 
         Buffers audio and uses simple VAD to detect end of speech.
         When silence is detected after speech, triggers processing.
         In dictation mode, Tab5 handles VAD — Dragon just buffers.
+
+        #173: if uplink codec is OPUS, the incoming bytes are an OPUS
+        packet — decode to PCM before buffering.
         """
         # US-P01: drop all incoming audio while backends are being swapped.
         # Prevents stale audio from accumulating during the swap window.
         if self._swapping:
             return
+
+        # #173: decode OPUS upstream if active.  PCM is the bytes-as-is
+        # path matching the legacy behavior.
+        if self._uplink_codec == "opus" and self._uplink_opus_dec is not None:
+            decoded = self._uplink_opus_dec.decode(audio_bytes)
+            if not decoded:
+                return  # decode failure — already logged
+            audio_bytes = decoded
 
         # Audit C6 (#137): reset the buffer-cap-emitted latches at the
         # start of a fresh recording session (both buffers empty).

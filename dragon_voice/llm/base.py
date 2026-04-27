@@ -1,7 +1,25 @@
 """Abstract base class for LLM backends."""
 
 from abc import ABC, abstractmethod
+from enum import StrEnum
 from typing import AsyncIterator
+
+
+class Modality(StrEnum):
+    """Capabilities a backend can declare for the multi-model router (#183).
+
+    A backend's `capabilities` property returns a frozenset of these.
+    The router infers the *required* set from the inbound message
+    (image_url content -> +VISION, etc.) and picks the lowest-priority
+    backend whose capabilities are a superset.
+    """
+
+    TEXT = "text"
+    VISION = "vision"
+    VIDEO = "video"
+    AUDIO_IN = "audio_in"
+    AUDIO_OUT = "audio_out"
+    TOOL_CALLING = "tool_calling"
 
 
 class LLMBackend(ABC):
@@ -83,3 +101,14 @@ class LLMBackend(ABC):
     def name(self) -> str:
         """Human-readable backend name for logging and status pages."""
         ...
+
+    @property
+    def capabilities(self) -> frozenset[Modality]:
+        """Modalities this backend can handle.
+
+        Default is text-only. Concrete backends should override based on
+        the configured model_id (e.g. ollama checks if `vision` is in the
+        model name; openrouter consults a static OR-model registry).
+        Used by the multi-model router (#183) to pick a backend per turn.
+        """
+        return frozenset({Modality.TEXT})

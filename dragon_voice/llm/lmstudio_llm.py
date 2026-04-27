@@ -12,7 +12,7 @@ from typing import AsyncIterator
 import aiohttp
 
 from dragon_voice.config import LLMConfig
-from dragon_voice.llm.base import LLMBackend
+from dragon_voice.llm.base import LLMBackend, Modality
 
 logger = logging.getLogger(__name__)
 
@@ -154,3 +154,32 @@ class LMStudioBackend(LLMBackend):
     @property
     def name(self) -> str:
         return f"LM Studio ({self._model})"
+
+    @property
+    def capabilities(self) -> frozenset[Modality]:
+        """Detect modalities by inspecting the model id.
+
+        LM Studio serves arbitrary GGUFs the user has loaded — there's
+        no canonical capability lookup. We use the same name-substring
+        heuristic as ollama for vision/multimodal families, since most
+        users name the model after the upstream HF repo it came from.
+        For tool-calling, LM Studio supports OpenAI-format tools across
+        the board on its `/chat/completions` endpoint, so we always
+        declare TOOL_CALLING (the actual model may or may not be
+        trained for it; the parser is tolerant).
+        """
+        model_lc = self._model.lower()
+        caps = {Modality.TEXT, Modality.TOOL_CALLING}
+
+        VISION_HINTS = ("llava", "bakllava", "minicpm-v", "minicpm-o",
+                        "moondream", "vision", "qwen2-vl", "qwen2.5-vl",
+                        "pixtral", "internvl")
+        if any(hint in model_lc for hint in VISION_HINTS):
+            caps.add(Modality.VISION)
+            caps.add(Modality.VIDEO)
+
+        if "minicpm-o" in model_lc:
+            caps.add(Modality.AUDIO_IN)
+            caps.add(Modality.AUDIO_OUT)
+
+        return frozenset(caps)

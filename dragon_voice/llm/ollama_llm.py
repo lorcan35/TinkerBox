@@ -12,7 +12,7 @@ from typing import AsyncIterator
 import aiohttp
 
 from dragon_voice.config import LLMConfig
-from dragon_voice.llm.base import LLMBackend
+from dragon_voice.llm.base import LLMBackend, Modality
 
 logger = logging.getLogger(__name__)
 
@@ -286,3 +286,45 @@ class OllamaBackend(LLMBackend):
     @property
     def name(self) -> str:
         return f"Ollama ({self._model})"
+
+    @property
+    def capabilities(self) -> frozenset[Modality]:
+        """Detect modalities by inspecting the configured model id.
+
+        Most ollama-served vision/multimodal models advertise themselves
+        in the model name itself: `llava`, `bakllava`, `minicpm-v`,
+        `minicpm-o`, `moondream`, `llama3.2-vision`. The audio-capable
+        omni line (minicpm-o) adds `_in`/`_out` audio. Tool-calling is
+        the harder one to detect from the name alone; we conservatively
+        gate on a curated list of known function-calling families.
+        """
+        model_lc = self._model.lower()
+        caps = {Modality.TEXT}
+
+        # Vision: substring match across the common ollama vision families
+        VISION_HINTS = ("llava", "bakllava", "minicpm-v", "minicpm-o",
+                        "moondream", "vision", "qwen2-vl", "qwen2.5-vl",
+                        "pixtral", "internvl")
+        if any(hint in model_lc for hint in VISION_HINTS):
+            caps.add(Modality.VISION)
+            # Vision-capable ollama models also accept multi-image inputs,
+            # which is the same path frame-sampled video uses.
+            caps.add(Modality.VIDEO)
+
+        # Audio in/out: only the omni line (minicpm-o) currently carries
+        # both directions in ollama-served form.
+        if "minicpm-o" in model_lc:
+            caps.add(Modality.AUDIO_IN)
+            caps.add(Modality.AUDIO_OUT)
+
+        # Tool-calling: known FC-trained families. Conservative — the
+        # parser is tolerant enough to wring tool calls out of others, but
+        # the router should only declare TOOL_CALLING for models actually
+        # trained for it.
+        TOOLCALL_HINTS = ("ministral", "gemma3", "xlam", "llama3.1",
+                          "llama3.2", "qwen2.5", "hermes", "functiongemma",
+                          "lfm2", "smollm3")
+        if any(hint in model_lc for hint in TOOLCALL_HINTS):
+            caps.add(Modality.TOOL_CALLING)
+
+        return frozenset(caps)

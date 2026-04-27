@@ -642,6 +642,7 @@ class VoiceServer:
         # Connection state — populated after register
         conn_state: dict = {
             "ws_id": ws_id,
+            "ws": ws,                # #177: route handlers (video_inject) need the live WS
             "pipeline": None,
             "session_id": None,
             "device_id": None,

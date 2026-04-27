@@ -16,6 +16,7 @@ from dragon_voice.api.media_routes import MediaRoutes
 from dragon_voice.api.synthesize import SynthesizeRoutes
 from dragon_voice.api.completions import CompletionRoutes
 from dragon_voice.api.system import SystemRoutes
+from dragon_voice.api.video_inject import VideoInjectRoutes
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +63,9 @@ def setup_all_routes(
     # System info + backend listing
     if voice_config and get_active_connections:
         SystemRoutes(voice_config, start_time, get_active_connections, get_db=db).register(app)
+        # #177 / Phase 3B: video downlink debug injector — uses the
+        # same connection registry to find the target Tab5's WS.
+        VideoInjectRoutes(get_active_connections).register(app)
 
     # Agentic routes (Sprint 2 — registered when available)
     if tool_registry:

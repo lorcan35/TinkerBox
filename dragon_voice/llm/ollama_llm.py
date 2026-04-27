@@ -14,6 +14,48 @@ import aiohttp
 from dragon_voice.config import LLMConfig
 from dragon_voice.llm.base import LLMBackend, Modality
 
+
+def _translate_to_ollama_format(message: dict) -> dict:
+    """Convert an OpenAI-format message to Ollama /api/chat format.
+
+    OpenAI multimodal puts image data in a content-array part:
+        {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,XXX"}},
+            {"type": "text", "text": "describe"},
+        ]}
+
+    Ollama wants a flat content string + a sibling `images` array of
+    raw base64 (no `data:image/...;base64,` prefix):
+        {"role": "user", "content": "describe", "images": ["XXX"]}
+
+    Plain string-content messages pass through unchanged.
+    """
+    content = message.get("content")
+    if not isinstance(content, list):
+        return message
+    text_parts: list[str] = []
+    image_b64_parts: list[str] = []
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        ptype = part.get("type", "")
+        if ptype == "image_url":
+            url = (part.get("image_url") or {}).get("url", "")
+            # Strip data:image/jpeg;base64, prefix if present
+            if "," in url and url.startswith("data:"):
+                url = url.split(",", 1)[1]
+            if url:
+                image_b64_parts.append(url)
+        elif ptype == "text":
+            text = part.get("text", "")
+            if text:
+                text_parts.append(text)
+    out = {"role": message.get("role", "user"),
+           "content": " ".join(text_parts)}
+    if image_b64_parts:
+        out["images"] = image_b64_parts
+    return out
+
 logger = logging.getLogger(__name__)
 
 
@@ -198,9 +240,17 @@ class OllamaBackend(LLMBackend):
                 timeout=aiohttp.ClientTimeout(total=None, sock_read=None)
             )
 
+        # Ollama /api/chat expects content as a string + a separate
+        # `images` array of base64-encoded bytes (no data: prefix).
+        # OpenAI multimodal format (used by openrouter, lmstudio,
+        # tinkerclaw, and the router internally) carries these as a
+        # `content` array of typed parts.  Translate before sending
+        # so router-fed multimodal turns don't break here. (#183 PR 3)
+        translated_messages = [_translate_to_ollama_format(m) for m in messages]
+
         payload = {
             "model": self._model,
-            "messages": messages,
+            "messages": translated_messages,
             "stream": True,
             "keep_alive": self._keep_alive,
             "options": {

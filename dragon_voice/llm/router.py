@@ -102,12 +102,20 @@ def _spec_from_dict(entry: dict) -> ModelSpec:
 def infer_required_caps(messages: list[dict]) -> frozenset[Modality]:
     """Inspect OpenAI-format messages to infer the modality requirements.
 
-    - Image content (`type: image_url`) → +VISION
-    - Video content (`type: video_url`) → +VIDEO
-    - Audio content (`type: input_audio` or audio attachment) → +AUDIO_IN
-    - Tool definitions in the system prompt → +TOOL_CALLING (light heuristic;
-      the parser is tolerant so we set this conservatively whenever any
-      message mentions a tool call marker).
+    Only modalities that appear in the user's *content* are required:
+      - Image content (`type: image_url`) → +VISION
+      - Video content (`type: video_url`) → +VIDEO
+      - Audio content (`type: input_audio` or audio attachment) → +AUDIO_IN
+
+    TOOL_CALLING is intentionally NOT a required cap.  The system
+    prompt routinely contains tool descriptions whether or not the
+    model is expected to actually call tools on this turn — making it a
+    requirement would force every turn through a tool-capable model
+    even when none is needed (e.g., "describe this image" should pick
+    MiniCPM-V even though the system prompt mentions `<tool>` markers).
+    Tool capability is therefore a *bonus* the router can prefer when
+    picking among same-priority candidates, not a gate.
+
     Always includes TEXT.
     """
     caps: set[Modality] = {Modality.TEXT}
@@ -124,13 +132,6 @@ def infer_required_caps(messages: list[dict]) -> frozenset[Modality]:
                     caps.add(Modality.VIDEO)
                 elif ptype == "input_audio" or ptype == "audio":
                     caps.add(Modality.AUDIO_IN)
-        elif isinstance(content, str):
-            # Cheap heuristic: tool-call markers in system prompt mean
-            # the caller wants tool support.
-            if msg.get("role") == "system" and (
-                "<tool>" in content or "<tool_call>" in content
-            ):
-                caps.add(Modality.TOOL_CALLING)
     return frozenset(caps)
 
 

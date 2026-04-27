@@ -1352,20 +1352,34 @@ class VoiceServer:
         # doesn't propagate an exception up to the WS handler and force
         # a session pause. If the send drops, the client will reconnect
         # shortly and we'll replay session_start on the next handshake.
+        # #183 PR 3: include `fleet_summary` so Tab5 firmware can
+        # advertise vision/video/audio caps dynamically without a
+        # hardcoded substring lookup.  Only present when the router is
+        # active; legacy single-backend deployments emit the same
+        # session_start as today.
+        session_start_config = {
+            "stt": conn_config.stt.backend,
+            "tts": conn_config.tts.backend,
+            "llm": conn_config.llm.backend,
+            "tts_sample_rate": conn_config.audio.input_sample_rate,
+            "response_mode": "match_input",
+            "system_prompt": conn_config.llm.system_prompt,
+        }
+        if self._conversation:
+            from dragon_voice.llm.router import CapabilityAwareRouter
+            if isinstance(self._conversation._llm, CapabilityAwareRouter):
+                session_start_config["fleet_summary"] = (
+                    self._conversation._llm.summarize(
+                        conn_state.get("voice_mode", 0)
+                    )
+                )
         if not await self._safe_send_json(ws, {
             "type": "session_start",
             "session_id": session_id,
             "device_id": device_id,
             "resumed": resumed,
             "message_count": session.get("message_count", 0),
-            "config": {
-                "stt": conn_config.stt.backend,
-                "tts": conn_config.tts.backend,
-                "llm": conn_config.llm.backend,
-                "tts_sample_rate": conn_config.audio.input_sample_rate,
-                "response_mode": "match_input",
-                "system_prompt": conn_config.llm.system_prompt,
-            },
+            "config": session_start_config,
         }):
             logger.info("session_start send dropped on %s — client likely reconnecting", ws_id)
             return
@@ -2318,36 +2332,51 @@ class VoiceServer:
             # W15-C01: prefer the pooled instance so we don't re-load Ollama /
             # re-open the aiohttp session on every config_update.  Only the
             # pipeline owns the shutdown of a pooled backend.
+            #
+            # #183 PR 3: when the active backend is the capability-aware
+            # router, voice_mode changes don't require a backend swap —
+            # the router holds the entire fleet and just flips its tier
+            # policy via set_voice_mode().  Saves the cost of recreating
+            # sub-backends + losing their warm-loaded models.
             if self._conversation:
-                try:
-                    from dragon_voice.llm import create_llm
-                    from dragon_voice.pipeline import _llm_sig
-                    new_key = _llm_sig(conn_config.llm)
-                    pooled = self._backend_pool.get(new_key)
-                    old_llm = self._conversation._llm
-                    if pooled is not None:
-                        new_llm = pooled
-                    else:
-                        new_llm = create_llm(conn_config.llm)
-                        await new_llm.initialize()
-                        self._backend_pool[new_key] = new_llm
-                    # Only shutdown the OLD one if nobody in the pool
-                    # references it (i.e. it wasn't pooled).
-                    if old_llm is not None and old_llm not in self._backend_pool.values():
-                        await old_llm.shutdown()
-                    self._conversation._llm = new_llm
-                    # 2026-04-23 (#58): also swap _llm_config so the
-                    # compact-vs-full tool prompt logic in
-                    # ConversationEngine._augment_context_with_tools picks the
-                    # right format for the active backend.  Without this,
-                    # cloud-mode agents stayed on the top-5 compact tool list
-                    # and never saw weather, stock_ticker, timesense_timer,
-                    # quick_poll, note, system_info, or unit_converter.
+                from dragon_voice.llm.router import CapabilityAwareRouter
+                if isinstance(self._conversation._llm, CapabilityAwareRouter):
+                    self._conversation._llm.set_voice_mode(voice_mode)
                     self._conversation._llm_config = conn_config.llm
-                    logger.info("ConversationEngine LLM swapped to %s%s (backend=%s)",
-                                new_llm.name, " (pooled)" if pooled else "", conn_config.llm.backend)
-                except Exception as e:
-                    logger.exception("ConversationEngine LLM swap failed: %s", e)
+                    logger.info(
+                        "router: voice_mode set to %d (no backend swap)",
+                        voice_mode,
+                    )
+                else:
+                    try:
+                        from dragon_voice.llm import create_llm
+                        from dragon_voice.pipeline import _llm_sig
+                        new_key = _llm_sig(conn_config.llm)
+                        pooled = self._backend_pool.get(new_key)
+                        old_llm = self._conversation._llm
+                        if pooled is not None:
+                            new_llm = pooled
+                        else:
+                            new_llm = create_llm(conn_config.llm)
+                            await new_llm.initialize()
+                            self._backend_pool[new_key] = new_llm
+                        # Only shutdown the OLD one if nobody in the pool
+                        # references it (i.e. it wasn't pooled).
+                        if old_llm is not None and old_llm not in self._backend_pool.values():
+                            await old_llm.shutdown()
+                        self._conversation._llm = new_llm
+                        # 2026-04-23 (#58): also swap _llm_config so the
+                        # compact-vs-full tool prompt logic in
+                        # ConversationEngine._augment_context_with_tools picks the
+                        # right format for the active backend.  Without this,
+                        # cloud-mode agents stayed on the top-5 compact tool list
+                        # and never saw weather, stock_ticker, timesense_timer,
+                        # quick_poll, note, system_info, or unit_converter.
+                        self._conversation._llm_config = conn_config.llm
+                        logger.info("ConversationEngine LLM swapped to %s%s (backend=%s)",
+                                    new_llm.name, " (pooled)" if pooled else "", conn_config.llm.backend)
+                    except Exception as e:
+                        logger.exception("ConversationEngine LLM swap failed: %s", e)
 
             # Update displayed names
             self._stt_name = stt_be
@@ -2365,42 +2394,81 @@ class VoiceServer:
                     active_model = conn_config.llm.ollama_model
                 else:
                     active_model = ""
+                # #183 PR 3: when the router is active, advertise the
+                # full per-modality fleet summary so Tab5 firmware can
+                # light up vision/video/audio capability chips
+                # dynamically.  Existing single-backend advertisements
+                # below are unchanged for backward-compat with current
+                # firmware that only reads `vision_capability`.
+                config_payload = {
+                    "stt": stt_be, "tts": tts_be,
+                    "llm": llm_be,
+                    "llm_model": active_model,
+                    "voice_mode": voice_mode,
+                    "cloud_mode": voice_mode >= 1,
+                }
+                if self._conversation:
+                    from dragon_voice.llm.router import CapabilityAwareRouter
+                    if isinstance(self._conversation._llm, CapabilityAwareRouter):
+                        config_payload["fleet_summary"] = (
+                            self._conversation._llm.summarize(voice_mode)
+                        )
                 await ws.send_json({
                     "type": "config_update",
-                    "config": {
-                        "stt": stt_be, "tts": tts_be,
-                        "llm": llm_be,
-                        "llm_model": active_model,
-                        "voice_mode": voice_mode,
-                        "cloud_mode": voice_mode >= 1,
-                    },
+                    "config": config_payload,
                 })
 
                 # v4·D Phase 4b vision capability advertisement.  Tab5's
                 # camera screen renders a "VISION · <model> READY" chip based
-                # on this.
+                # on this.  #183 PR 3: prefer the router's per-modality
+                # pick when available; fall back to the legacy
+                # substring-on-model-name heuristic for single-backend
+                # configurations.
                 try:
-                    vm = conn_config.llm.openrouter_model.lower() \
-                        if voice_mode == 2 else ""
-                    om = conn_config.llm.ollama_model.lower() \
-                        if voice_mode == 0 else ""
                     vision_model = ""
                     per_frame_mils = 0
-                    if voice_mode == 2:
-                        if "gpt-4o" in vm:
-                            vision_model = active_model
-                            per_frame_mils = 1200  # ~$0.012/frame
-                        elif "sonnet" in vm:
-                            vision_model = active_model
-                            per_frame_mils = 4500  # ~$0.045/frame
-                        elif "haiku" in vm:
-                            # Haiku 3.5 supports vision per OR
-                            vision_model = active_model
-                            per_frame_mils = 400
-                    elif voice_mode == 0:
-                        if "vision" in om or "llava" in om:
-                            vision_model = active_model
-                            per_frame_mils = 0  # local = free
+                    if (self._conversation
+                            and isinstance(
+                                self._conversation._llm,
+                                CapabilityAwareRouter,
+                            )):
+                        from dragon_voice.llm.base import Modality
+                        spec = self._conversation._llm.choose(
+                            {Modality.TEXT, Modality.VISION}, voice_mode,
+                        )
+                        if spec:
+                            vision_model = spec.model_id
+                            # Per-frame cost: cloud tier carries a known
+                            # rough rate; local tier is free.
+                            if spec.tier == "local":
+                                per_frame_mils = 0
+                            elif "gpt-4o" in spec.model_id:
+                                per_frame_mils = 1200
+                            elif "sonnet" in spec.model_id:
+                                per_frame_mils = 4500
+                            elif "haiku" in spec.model_id:
+                                per_frame_mils = 400
+                            elif "gemini" in spec.model_id:
+                                per_frame_mils = 200
+                    else:
+                        vm = conn_config.llm.openrouter_model.lower() \
+                            if voice_mode == 2 else ""
+                        om = conn_config.llm.ollama_model.lower() \
+                            if voice_mode == 0 else ""
+                        if voice_mode == 2:
+                            if "gpt-4o" in vm:
+                                vision_model = active_model
+                                per_frame_mils = 1200
+                            elif "sonnet" in vm:
+                                vision_model = active_model
+                                per_frame_mils = 4500
+                            elif "haiku" in vm:
+                                vision_model = active_model
+                                per_frame_mils = 400
+                        elif voice_mode == 0:
+                            if "vision" in om or "llava" in om:
+                                vision_model = active_model
+                                per_frame_mils = 0
                     await ws.send_json({
                         "type":           "vision_capability",
                         "can_see":        bool(vision_model),
@@ -2429,12 +2497,17 @@ class VoiceServer:
                 logger.exception("cap_downgrade alert failed")
 
     async def _handle_user_media(self, ws, conn_state, cmd):
-        """Handle image/audio uploaded by Tab5 for multimodal LLM analysis."""
-        import base64
+        """Handle image/audio uploaded by Tab5 for multimodal LLM analysis.
+
+        #183 PR 3: route through ConversationEngine instead of bypassing it.
+        The vision turn becomes a first-class conversation turn — it gets
+        memory injection, tool-calling, and (most importantly) the
+        multimodal user message is persisted so subsequent text turns can
+        still see the image (cross-modal continuity).
+        """
         media_id = cmd.get("media_id", "")
         text = cmd.get("text", "What's in this image?")
         session_id = conn_state.get("session_id", "")
-        conn_config = conn_state.get("config", self._config)
 
         image_path = await self._media_store.get_path(media_id)
         if not image_path:
@@ -2446,42 +2519,14 @@ class VoiceServer:
                 ))
             return
 
-        backend = conn_config.llm.backend
-        if backend == "ollama" and "vision" not in conn_config.llm.ollama_model:
-            if not ws.closed:
-                await ws.send_json(error_event(
-                    code="vision_unsupported",
-                    message="Image analysis needs Cloud or TinkerClaw mode.",
-                    severity=Severity.FATAL, scope=Scope.LLM,
-                ))
-            return
-
-        # Wave 13 H2: image may be up to ~8 MB (camera JPEG) -- reading on the
-        # event loop thread stalls every other WS connection. Offload the
-        # blocking read + base64 to the default executor.
-        def _read_and_encode(path: str) -> str:
-            with open(path, "rb") as f:
-                return base64.b64encode(f.read()).decode()
-        image_b64 = await asyncio.to_thread(_read_and_encode, image_path)
-
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
-                {"type": "text", "text": text},
-            ]
-        }]
-
-        # #75 phase 1b: reset per-turn tool tracker on this path too.
-        conn_state["tool_calls_this_turn"] = []
-
-        full_response = []
-        llm = conn_state.get("conversation")
-        if llm and hasattr(llm, '_llm'):
-            llm_backend = llm._llm
-        else:
-            llm_backend = None
-
+        # #183 PR 3: capability-driven vision check.  Replaces the old
+        # substring check on the model name.  Works uniformly for all
+        # backend types — single-backend setups query the active model's
+        # declared caps; router setups query the union of caps available
+        # in the current tier.
+        from dragon_voice.llm.base import Modality
+        conv = conn_state.get("conversation") or self._conversation
+        llm_backend = getattr(conv, "_llm", None) if conv else None
         if not llm_backend:
             if not ws.closed:
                 await ws.send_json(error_event(
@@ -2490,14 +2535,33 @@ class VoiceServer:
                     severity=Severity.FATAL, scope=Scope.LLM,
                 ))
             return
+        if Modality.VISION not in llm_backend.capabilities:
+            if not ws.closed:
+                await ws.send_json(error_event(
+                    code="vision_unsupported",
+                    message="Image analysis needs a vision-capable model.",
+                    severity=Severity.FATAL, scope=Scope.LLM,
+                ))
+            return
 
+        # #75 phase 1b: reset per-turn tool tracker on this path too.
+        conn_state["tool_calls_this_turn"] = []
+
+        # #183 PR 3: route through ConversationEngine.process_text_stream
+        # with media_id set — ConvEngine persists the multimodal user
+        # message via MessageStore (encoded with the multimodal marker)
+        # and on context build hydrates it back to an OpenAI image_url
+        # content array.  Tools, memory, and cross-modal continuity all
+        # work the same as text turns.
+        full_response = []
         try:
-            # #75 phase 1a: same PING-during-inference protection as the
-            # TC text path above — vision-upload LLM turns can run 30+ s
-            # on multimodal models, long enough for Tab5's PONG-watch to
-            # trip without the helper.
             async with self._ws_keepalive_during_inference(ws, label="vision"):
-                async for token in llm_backend.generate_stream_with_messages(messages):
+                async for token in conv.process_text_stream(
+                    session_id=session_id,
+                    text=text,
+                    input_mode="vision",
+                    media_id=media_id,
+                ):
                     full_response.append(token)
                     if not ws.closed:
                         await ws.send_json({"type": "llm", "text": token})
@@ -2535,16 +2599,9 @@ class VoiceServer:
         if not ws.closed:
             await ws.send_json({"type": "llm_done", "llm_ms": 0})
 
-        if full_response and self._message_store:
-            try:
-                await self._message_store.add_message(
-                    session_id=session_id,
-                    role="assistant",
-                    content="".join(full_response),
-                    input_mode="vision",
-                )
-            except Exception as e:
-                logger.warning("Failed to store vision response: %s", e)
+        # ConversationEngine already persisted the assistant response
+        # via process_text_stream (look for `add_message(role="assistant"
+        # ...)` in conversation.py).  No second persist needed here.
 
     async def _handle_disconnect(self, conn_state: dict) -> None:
         """Handle WebSocket disconnect: pause session, mark device offline."""

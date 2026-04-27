@@ -77,3 +77,40 @@ def test_codec_unavailable_when_no_libopus():
         ac.OpusUplinkDecoder()
     with pytest.raises(ac.CodecUnavailable):
         ac.OpusDownlinkEncoder()
+
+
+# #181 / TinkerTab #272: AUD0-framed call-audio helpers.
+
+def _wrap_call_audio(pcm: bytes) -> bytes:
+    return ac.CALL_AUDIO_MAGIC + struct.pack(">I", len(pcm)) + pcm
+
+
+def test_peek_call_audio_magic_recognises():
+    assert ac.peek_call_audio_magic(_wrap_call_audio(b"\x00" * 8))
+
+
+def test_peek_call_audio_magic_rejects_video_and_pcm():
+    # Video frame magic
+    assert not ac.peek_call_audio_magic(b"VID0" + b"\x00" * 4)
+    # Plain PCM (raw int16)
+    assert not ac.peek_call_audio_magic(b"\x00\x80\x00\x80")
+    # Too short
+    assert not ac.peek_call_audio_magic(b"AU")
+
+
+def test_parse_call_audio_extracts_body():
+    pcm = bytes(range(40))
+    body = ac.parse_call_audio_frame(_wrap_call_audio(pcm))
+    assert body == pcm
+
+
+def test_parse_call_audio_rejects_bad_magic():
+    bad = b"BAD!" + struct.pack(">I", 4) + b"\x00\x00\x00\x00"
+    with pytest.raises(ValueError, match="bad magic"):
+        ac.parse_call_audio_frame(bad)
+
+
+def test_parse_call_audio_rejects_len_mismatch():
+    bad = ac.CALL_AUDIO_MAGIC + struct.pack(">I", 100) + b"only10byte"
+    with pytest.raises(ValueError, match="len mismatch"):
+        ac.parse_call_audio_frame(bad)

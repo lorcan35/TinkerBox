@@ -704,6 +704,7 @@ class VoiceServer:
                             session_id=conn_state.get("session_id", ""),
                             device_id=conn_state.get("device_id", ""),
                             wire_bytes=msg.data,
+                            active_connections=self._active_connections,
                         )
                         continue
                     # Raw PCM audio data — forward to pipeline

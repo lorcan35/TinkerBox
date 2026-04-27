@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>TinkerClaw Call</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin:0; padding:0; background:#000; color:#eee; font-family:system-ui, sans-serif; }
+  header { padding:8px 12px; background:#111; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+  header input, header button { padding:6px 10px; font-size:14px; border:1px solid #333; background:#111; color:#eee; border-radius:4px; }
+  header button { cursor:pointer; }
+  #status { font-size:12px; color:#aaa; margin-left:auto; }
+  #stage  { display:grid; grid-template-columns: 1fr 240px; gap:8px; padding:8px; }
+  #remoteWrap { background:#111; aspect-ratio: 1280/720; display:flex; align-items:center; justify-content:center; min-height:240px; }
+  #remote { max-width:100%; max-height:100%; object-fit:contain; }
+  #localWrap { background:#111; }
+  video#local { width:100%; display:block; transform: scaleX(-1); }
+  #stats { font-size:11px; color:#888; padding:4px 8px; }
+  #log { max-height:120px; overflow:auto; font-family: ui-monospace, monospace; font-size:11px; padding:4px 8px; color:#bbb; background:#111; }
+</style>
+</head>
+<body>
+<header>
+  <strong>TinkerClaw Call</strong>
+  <label>Server <input id="server" value="" placeholder="ws://192.168.1.91:3502/ws/voice" size="40"/></label>
+  <label>Token <input id="token" placeholder="dragon API token (optional)" size="36"/></label>
+  <label>FPS <input id="fps" type="number" value="3" min="1" max="10" style="width:50px"/></label>
+  <button id="connect">Connect</button>
+  <button id="disconnect" disabled>Disconnect</button>
+  <span id="status">disconnected</span>
+</header>
+<section id="stage">
+  <div id="remoteWrap"><img id="remote" alt="remote video" /></div>
+  <div id="localWrap">
+    <video id="local" autoplay playsinline muted></video>
+    <div id="stats">no stats yet</div>
+  </div>
+</section>
+<section id="log"></section>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const VIDEO_MAGIC = new Uint8Array([0x56, 0x49, 0x44, 0x30]); // "VID0"
+
+  function log(msg) {
+    const ts = new Date().toLocaleTimeString();
+    $('log').innerHTML = `[${ts}] ${msg}<br>` + $('log').innerHTML;
+  }
+
+  // Default WS URL: same host as the page, port 3502.
+  $('server').value = `ws://${location.hostname || '192.168.1.91'}:3502/ws/voice`;
+
+  let ws = null;
+  let stream = null;
+  let timer = null;
+  let stats = { sent: 0, recv: 0, bytesSent: 0, bytesRecv: 0 };
+
+  async function connect() {
+    const url = $('server').value.trim();
+    const token = $('token').value.trim();
+    const wsUrl = token ? `${url}?token=${encodeURIComponent(token)}` : url;
+    log('connecting ' + wsUrl);
+    ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = async () => {
+      log('connected');
+      $('status').textContent = 'connected';
+      $('disconnect').disabled = false;
+      $('connect').disabled = true;
+      // Minimal register so Dragon knows we're a real client.
+      const did = 'webcall_' + Math.random().toString(16).slice(2,8);
+      ws.send(JSON.stringify({
+        type: 'register',
+        device_id: did,
+        hardware_id: did + '_hw',
+        name: 'WebCall',
+        firmware_ver: 'web',
+        platform: 'web',
+        session_id: null,
+        capabilities: { video_send: true, video_recv: true },
+      }));
+      // Start camera + frame loop.
+      stream = await navigator.mediaDevices.getUserMedia({ video: { width:640, height:480 }, audio:false });
+      $('local').srcObject = stream;
+      const fps = Math.max(1, Math.min(10, +$('fps').value || 3));
+      const period = 1000 / fps;
+      const cv = document.createElement('canvas');
+      cv.width = 640; cv.height = 480;
+      const ctx = cv.getContext('2d');
+      timer = setInterval(async () => {
+        if (!ws || ws.readyState !== 1) return;
+        ctx.drawImage($('local'), 0, 0, cv.width, cv.height);
+        const blob = await new Promise(r => cv.toBlob(r, 'image/jpeg', 0.6));
+        if (!blob) return;
+        const ab = await blob.arrayBuffer();
+        const len = ab.byteLength;
+        const wire = new Uint8Array(8 + len);
+        wire.set(VIDEO_MAGIC, 0);
+        // 4-byte BE length
+        wire[4] = (len >>> 24) & 0xff;
+        wire[5] = (len >>> 16) & 0xff;
+        wire[6] = (len >>> 8)  & 0xff;
+        wire[7] = (len)        & 0xff;
+        wire.set(new Uint8Array(ab), 8);
+        ws.send(wire.buffer);
+        stats.sent++;
+        stats.bytesSent += wire.byteLength;
+        $('stats').textContent = `sent ${stats.sent} (${(stats.bytesSent/1024).toFixed(0)} KB) | recv ${stats.recv} (${(stats.bytesRecv/1024).toFixed(0)} KB)`;
+      }, period);
+    };
+
+    ws.onmessage = (ev) => {
+      if (typeof ev.data === 'string') {
+        log('text: ' + ev.data.slice(0, 200));
+        return;
+      }
+      const buf = new Uint8Array(ev.data);
+      // Check VID0 magic
+      if (buf.length < 8 || buf[0] !== 0x56 || buf[1] !== 0x49 || buf[2] !== 0x44 || buf[3] !== 0x30) return;
+      const len = (buf[4]<<24) | (buf[5]<<16) | (buf[6]<<8) | buf[7];
+      const jpeg = buf.slice(8, 8 + len);
+      const blob = new Blob([jpeg], { type: 'image/jpeg' });
+      const url = URL.createObjectURL(blob);
+      const prev = $('remote').src;
+      $('remote').src = url;
+      if (prev && prev.startsWith('blob:')) URL.revokeObjectURL(prev);
+      stats.recv++;
+      stats.bytesRecv += buf.byteLength;
+      $('stats').textContent = `sent ${stats.sent} (${(stats.bytesSent/1024).toFixed(0)} KB) | recv ${stats.recv} (${(stats.bytesRecv/1024).toFixed(0)} KB)`;
+    };
+
+    ws.onclose = (ev) => {
+      log('closed (' + ev.code + ' ' + ev.reason + ')');
+      $('status').textContent = 'closed';
+      cleanup();
+    };
+    ws.onerror = (e) => log('error: ' + (e?.message || e));
+  }
+
+  function cleanup() {
+    if (timer) { clearInterval(timer); timer = null; }
+    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+    $('local').srcObject = null;
+    ws = null;
+    $('disconnect').disabled = true;
+    $('connect').disabled = false;
+  }
+
+  $('connect').onclick = () => connect().catch(e => { log('connect failed: ' + e); cleanup(); });
+  $('disconnect').onclick = () => { if (ws) ws.close(); cleanup(); };
+})();
+</script>
+</body>
+</html>

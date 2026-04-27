@@ -1,17 +1,27 @@
-"""Video upstream from Tab5 (#175 / TinkerTab #266).
+"""Video upstream from Tab5 (#175 / TinkerTab #266) + relay (#179 Phase 3C).
 
 Accepts JPEG frames sent by Tab5 over the existing voice WebSocket as
 binary frames prefixed with the 4-byte magic tag ``b"VID0"`` + a
-big-endian uint32 length.  Frames are stored to disk (most-recent only,
-in /tmp) for now; Phase 3C will swap that out for a relay queue
-delivering to a peer client.
+big-endian uint32 length.
+
+Two consumers per inbound frame:
+- Disk snapshot (most-recent frame at /home/radxa/media/...) for
+  inspection + the dashboard preview.
+- **Relay broadcast**: forwards the wire bytes verbatim to every
+  other connected client so two Tab5s (or a Tab5 + a web client) see
+  each other's video in real time.  This is the simplest possible
+  pairing model — anyone who's connected and isn't the sender gets
+  the frame.
 
 Caller pattern (server.py binary handler):
 
     from .video_upstream import parse_video_frame, get_handler
 
     if parse_video_frame.peek(msg.data):
-        await get_handler().on_frame(session_id, device_id, msg.data)
+        await get_handler().on_frame(
+            session_id, device_id, msg.data,
+            active_connections=server._active_connections,
+        )
     else:
         await pipeline.feed_audio(msg.data)
 """
@@ -59,11 +69,14 @@ class VideoUpstreamHandler:
         session_id: str,
         device_id: str,
         wire_bytes: bytes,
+        active_connections: dict | None = None,
     ) -> None:
-        """Validate + extract the JPEG payload + store it.
+        """Validate + extract + persist + relay.
 
-        Quietly drops malformed frames (logs at debug level so noisy
-        clients don't spam the journal).
+        `active_connections` is the server-wide ws_id → conn_state
+        registry; when provided, every other connected client receives
+        the same wire bytes verbatim.  Quietly drops malformed frames
+        so noisy clients don't spam the journal.
         """
         s = self._stats.setdefault(session_id, _SessionVideoStats())
         try:
@@ -89,10 +102,29 @@ class VideoUpstreamHandler:
         except OSError as e:
             logger.warning("video latest-write failed: %s", e)
 
+        # Relay broadcast: forward the wire bytes to every other
+        # connected client.  Phase 3C minimum-viable pairing; later
+        # work will add explicit call signaling so unpaired peers
+        # don't see each other's feeds.
+        relayed = 0
+        if active_connections:
+            for conn in list(active_connections.values()):
+                if conn.get("session_id") == session_id:
+                    continue
+                ws = conn.get("ws")
+                if ws is None or getattr(ws, "closed", False):
+                    continue
+                try:
+                    await ws.send_bytes(wire_bytes)
+                    relayed += 1
+                except Exception as e:
+                    logger.debug("video relay drop: %s", e)
+
         if s.frames == 1 or s.frames % 20 == 0:
             logger.info(
-                "video frame #%d from %s session=%s (%d B JPEG, %d B wire)",
-                s.frames, device_id, session_id, len(jpeg), len(wire_bytes),
+                "video frame #%d from %s session=%s (%d B JPEG, %d B wire) relayed=%d",
+                s.frames, device_id, session_id,
+                len(jpeg), len(wire_bytes), relayed,
             )
 
     def stats(self, session_id: str) -> dict:

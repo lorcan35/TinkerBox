@@ -211,6 +211,19 @@ async def run_startup(server: Any, app: web.Application) -> None:
     )
     await server._conversation.initialize()
 
+    # #179: serve the minimal video-call web client at /call
+    # (matches the WS port so opening the page on a phone "just
+    # works" without configuring a separate dashboard host).
+    import os as _os
+    _static_dir = _os.path.join(_os.path.dirname(__file__), "..", "static")
+    if _os.path.isdir(_static_dir):
+        app.router.add_static("/static/", _os.path.realpath(_static_dir),
+                              show_index=False)
+        async def _call_redirect(_req):
+            from aiohttp import web as _web
+            raise _web.HTTPFound("/static/call.html")
+        app.router.add_get("/call", _call_redirect)
+
     # REST API routes (modular package)
     from dragon_voice.api import setup_all_routes
     setup_all_routes(

@@ -28,7 +28,9 @@ logger = logging.getLogger(__name__)
 
 VIDEO_MAGIC = b"VID0"
 VIDEO_HEADER_LEN = 8         # 4 magic + 4 length
-DEFAULT_LATEST_PATH = "/tmp/tab5_video_latest.jpg"
+# /tmp would be private under systemd's PrivateTmp=true, so dashboards
+# + scp users can't see the frame.  Use the existing media dir instead.
+DEFAULT_LATEST_PATH = "/home/radxa/media/tab5_video_latest.jpg"
 
 
 @dataclass

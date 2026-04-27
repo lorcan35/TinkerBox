@@ -123,6 +123,13 @@ class LLMConfig:
     dual_picker_model: str = "hf.co/Salesforce/xLAM-2-1b-fc-r-gguf:Q4_K_M"
     dual_responder_backend: str = ""
     dual_responder_model: str = "ministral-3:3b"
+    # Multi-model router (#183) fleet — when `backend == "router"`,
+    # this list defines the pool the router picks from per-turn.
+    # Each entry mirrors `ModelSpec` (defined in dragon_voice.llm.router
+    # to avoid an import cycle on this module).  Empty list + non-router
+    # backend selection = legacy single-backend dispatch (no behavior
+    # change).
+    fleet: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -208,7 +215,7 @@ class VoiceConfig:
                 f"stt.backend must be one of {valid_stt}, got '{self.stt.backend}'"
             )
 
-        valid_llm = ("ollama", "openrouter", "lmstudio", "npu_genie", "tinkerclaw", "dual")
+        valid_llm = ("ollama", "openrouter", "lmstudio", "npu_genie", "tinkerclaw", "dual", "router")
         if self.llm.backend not in valid_llm:
             errors.append(
                 f"llm.backend must be one of {valid_llm}, got '{self.llm.backend}'"

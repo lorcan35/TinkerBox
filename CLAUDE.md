@@ -78,7 +78,7 @@ A file is too big when it has more than one *reason to change*.  Before extracti
 - **SSH:** `ssh radxa@192.168.1.91  # password in ~/.ssh/config or use key auth`
 - **OS:** Ubuntu (Dragon Q6A — Qualcomm QCS6490, ARM64)
 - **Connection:** Ethernet only (WiFi disabled). Static IP on enp1s0.
-- **Services stripped:** gdm3, snapd, ollama, nanobot masked. Only tinkerclaw-voice, tinkerclaw-dashboard, tinkerclaw-ngrok run.
+- **Services stripped:** gdm3, snapd, nanobot, rustdesk, fwupd masked.  Active services: tinkerclaw-voice, tinkerclaw-dashboard, tinkerclaw-ngrok, **ollama** (active for embeddings + Local-mode LLM inference; was previously masked but unmasked when the multi-model router landed in #185).
 
 ## Service Map
 | Service | Port | SystemD Unit | Description |
@@ -129,12 +129,136 @@ Tab5 sends `{"type":"config_update","voice_mode":0|1|2|3,"llm_model":"..."}`. Dr
 - **Auto-Fallback:** If cloud STT/TTS fails (timeout, API error), pipeline auto-falls back to local (Moonshine/Piper) for that request AND sends `config_update` with `error` field to Tab5 → auto-reverts to Local mode.
 - **Backward compat:** Old `cloud_mode` boolean still accepted (maps to voice_mode 0 or 2).
 - **Config fields:** `LLMConfig.local_backend` (remembers original for fallback), `LLMConfig.openrouter_model` (user-selectable).
-- **Valid backends:** STT: `moonshine`, `whisper_cpp`, `vosk`, `openrouter`. TTS: `piper`, `kokoro`, `edge_tts`, `openrouter`. LLM: `ollama`, `npu_genie`, `openrouter`, `lmstudio`, `tinkerclaw`.
+- **Valid backends:** STT: `moonshine`, `whisper_cpp`, `vosk`, `openrouter`. TTS: `piper`, `kokoro`, `edge_tts`, `openrouter`. LLM: `ollama`, `npu_genie`, `openrouter`, `lmstudio`, `tinkerclaw`, `dual`, `router` (#183).
 - **Mode-aware system prompts:** Each voice mode sets a different system prompt length — Local (concise, 128 tokens), Hybrid (medium, 256 tokens), Cloud (rich, 512 tokens). This keeps local model context tight while giving cloud models room for nuanced instructions.
 - **Mode-aware pipeline timeouts:** Local mode = 300s (5 min) for tool-calling chains on slow local models. Cloud mode = 60s (1 min). TinkerClaw mode = 180s (3 min, tool execution gaps). Timeouts configured per voice mode in pipeline.py.
 - **Session system_prompt updated on mode switch:** When voice_mode changes, the session's `system_prompt` is updated in the DB immediately so the conversation engine picks it up on the next turn.
 - **Pipeline init resets to local defaults on reconnect:** When a device reconnects, the pipeline is re-initialized with local defaults (voice_mode 0) regardless of the previous session's mode. The client must re-send `config_update` to restore cloud mode.
 - **Per-connection config (deep copy):** Each WebSocket connection gets a deep copy of the global config via `copy.deepcopy()`. This prevents one device's config_update (e.g., switching to cloud mode) from corrupting another device's pipeline config. Without deep copy, two Tab5s connected simultaneously would share the same mutable config object.
+
+## Multi-Model Router (#183, April 2026)
+
+**The single voice-mode-picks-one-backend assumption is gone.** Dragon now supports a *fleet* of LLM backends declared in `LLMConfig.fleet`, with a `CapabilityAwareRouter` that picks per-turn based on the modalities present in the message and the active voice_mode tier.
+
+The router is opt-in: keep `backend: "ollama"` (or any single backend) and behavior is identical to today. Set `backend: "router"` and populate `fleet` to activate.
+
+### Capability declarations
+Every `LLMBackend` subclass declares a frozenset of `Modality` values via the `capabilities` property.  See `dragon_voice/llm/base.py`.
+
+| Modality | Used when |
+|----------|-----------|
+| `TEXT` | Always required |
+| `VISION` | Message content has `{"type":"image_url"}` |
+| `VIDEO` | Message content has `{"type":"video_url"}` |
+| `AUDIO_IN` | Message content has `{"type":"input_audio"}` |
+| `AUDIO_OUT` | Backend can emit audio responses |
+| `TOOL_CALLING` | Backend trained for function-calling (informational; *not* a router gate) |
+
+Per-backend declaration logic:
+- **ollama** — substring scan of model id (vision: `llava`, `minicpm-v`, `minicpm-o`, `moondream`, `qwen2-vl`, `pixtral`, `internvl`; audio: `minicpm-o`; tools: known FC families).
+- **openrouter** — static registry in `_OPENROUTER_CAPS` (`openrouter_llm.py`). 35 models tracked as of 2026-04-27 (see PR #187). Unknown models default to `{TEXT, TOOL_CALLING}`.
+- **lmstudio** — same name-substring heuristic as ollama (LM Studio serves arbitrary GGUFs).
+- **npu_genie** — text-only (QAIRT has no vision support).
+- **tinkerclaw** — TEXT+TOOL_CALLING + VISION when gateway model is `anthropic/`, `openai/gpt-4o`, `google/gemini`, `minimax/`.
+- **dual** — forwards to responder's caps (responder is the backend whose tokens reach the user).
+
+### Tier policy from voice_mode
+```
+TIER_FOR_MODE = {
+    0: {"local"},          # Local
+    1: {"local"},          # Hybrid (LLM stays local; STT/TTS go cloud — unchanged)
+    2: {"cloud", "lan"},   # Full Cloud (LAN tier eligible — e.g., LM Studio on workstation)
+    3: None,               # TinkerClaw — bypass router, gateway picks
+}
+```
+
+### Routing rule
+```python
+def choose(required_caps, voice_mode):
+    tier_filter = TIER_FOR_MODE[voice_mode]
+    if tier_filter is None:
+        return None  # tinkerclaw mode — router not used
+    candidates = [m for m in fleet
+                  if required_caps <= m.capabilities
+                  and m.tier in tier_filter]
+    return min(candidates, key=lambda m: m.priority) if candidates else None
+```
+
+Lowest priority wins. `infer_required_caps(messages)` walks OpenAI-format content arrays — image_url → +VISION, video_url → +VIDEO, input_audio → +AUDIO_IN. TOOL_CALLING is intentionally NOT inferred (would gate vision turns from picking MiniCPM-V which lacks tools); tool detection happens at runtime when the model emits a tool marker.
+
+### Fleet config example
+Drop into `dragon_voice/config.yaml`. Verified live against OpenRouter 2026-04-27.
+
+```yaml
+llm:
+  backend: "router"
+  fleet:
+    # ── Local tier ──
+    - {id: ministral,    backend: ollama,     model_id: "ministral-3:3b",
+       caps: [text, tool_calling],          tier: local, priority: 0,  keep_alive_s: 600}
+    - {id: minicpm_v4,   backend: ollama,
+       model_id: "hf.co/openbmb/MiniCPM-V-4-gguf:Q4_K_M",
+       caps: [text, vision, video],         tier: local, priority: 10, keep_alive_s: 120}
+    # ── Cloud tier ──
+    - {id: ds_v4_flash,  backend: openrouter, model_id: "deepseek/deepseek-v4-flash",
+       caps: [text, tool_calling],          tier: cloud, priority: 0}      # cheapest text+tools
+    - {id: qwen36_flash, backend: openrouter, model_id: "qwen/qwen3.6-flash",
+       caps: [text, vision, tool_calling],  tier: cloud, priority: 5}      # cheapest multimodal
+    - {id: gemini_flash, backend: openrouter, model_id: "google/gemini-3-flash-preview",
+       caps: [text, vision, video, audio_in, tool_calling],
+                                            tier: cloud, priority: 8}      # native video
+    - {id: sonnet_46,    backend: openrouter, model_id: "anthropic/claude-sonnet-4.6",
+       caps: [text, vision, tool_calling],  tier: cloud, priority: 12}     # quality vision
+    - {id: gemini_pro,   backend: openrouter, model_id: "google/gemini-3.1-pro-preview",
+       caps: [text, vision, video, audio_in, tool_calling],
+                                            tier: cloud, priority: 18}     # frontier multimodal
+    - {id: opus_47,      backend: openrouter, model_id: "anthropic/claude-opus-4.7",
+       caps: [text, vision, tool_calling],  tier: cloud, priority: 25}     # premium agentic
+    - {id: gpt_55,       backend: openrouter, model_id: "openai/gpt-5.5",
+       caps: [text, vision, tool_calling],  tier: cloud, priority: 30}     # frontier
+```
+
+### How the router behaves
+- **Local mode, text turn:** picks `ministral` (priority 0).
+- **Local mode, vision turn (photo):** picks `minicpm_v4` (only local-tier vision-capable).
+- **Cloud mode, text turn:** picks `ds_v4_flash` ($0.14/$0.28 per M, 7× cheaper than Sonnet for plain chat).
+- **Cloud mode, vision turn:** picks `qwen36_flash` ($0.25/$1.50, 1M context).
+- **Cloud mode, video turn (.MJP from Tab5):** picks `gemini_flash` (only cloud-tier with VIDEO at priority ≤ 18).
+- **Voice-mode swap (e.g. Local → Cloud):** router calls `set_voice_mode(2)` — no backend recreate, instantiated sub-backends survive the switch.
+
+### `fleet_summary` in protocol
+When the router is active, `session_start.config` and `config_update` ACK include a per-modality summary so Tab5 can light up vision/video/audio capability chips dynamically:
+```json
+{
+  "type": "session_start",
+  "config": {
+    ...,
+    "fleet_summary": {
+      "text":     "ministral-3:3b",
+      "vision":   "hf.co/openbmb/MiniCPM-V-4-gguf:Q4_K_M",
+      "video":    "hf.co/openbmb/MiniCPM-V-4-gguf:Q4_K_M",
+      "audio_in": null,
+      "audio_out": null,
+      "tool_calling": "ministral-3:3b"
+    }
+  }
+}
+```
+Tab5 firmware can ignore `fleet_summary` (legacy `vision_capability` event keeps firing for backward compat).
+
+### Cross-modal continuity
+`_handle_user_media` no longer bypasses ConversationEngine. Multimodal user messages persist via `MessageStore.add_message(media_id=...)` with a `__mm__:` JSON marker. `get_context(media_store=...)` hydrates them back to OpenAI `image_url` content arrays on context build. **Result: send a photo, then ask "what color was the chair?" — the text follow-up turn still sees the photo.**
+
+`OllamaBackend.generate_stream_with_messages` translates OpenAI-format multimodal content arrays to Ollama's flat `content + images` format. Without this, router-fed vision turns failed with `json: cannot unmarshal array into Go struct field`.
+
+### Files
+- `dragon_voice/llm/router.py` — `CapabilityAwareRouter`, `ModelSpec`, `TIER_FOR_MODE`, `infer_required_caps()`, `summarize()`
+- `dragon_voice/llm/base.py` — `Modality` enum + `LLMBackend.capabilities` default
+- `dragon_voice/llm/openrouter_llm.py` — `_OPENROUTER_CAPS` + `_PRICING_MILS_PER_M` registries (35 models, last sync 2026-04-27)
+- `dragon_voice/messages.py` — multimodal marker encode/decode
+- `tests/test_router_routing.py` — 29 routing-rule assertions
+- `tests/test_capability_declaration.py` — 31 per-backend cap assertions
+- `tests/test_multimodal_persistence.py` — 14 marker + hydration tests
 
 ## TinkerClaw Integration (Optional Sidecar)
 
@@ -161,6 +285,22 @@ Dragon renders rich content (code blocks, markdown tables, image URLs) from LLM 
 - **Protocol messages (Tab5 → Dragon):** `user_media` (camera photo for multimodal LLM). See `docs/protocol.md`.
 - **Dependencies:** Pillow (existing), Pygments>=2.17.0 (new — syntax highlighting). System font `fonts-dejavu-core` required on Dragon for Pygments.
 - **Both code paths:** Media detection runs in both ConvEngine and TinkerClaw (voice_mode 3) paths, inside the WS voice handler in `dragon_voice/server.py`. The TinkerClaw path has an early `return` — media detection is placed before it.
+
+## Video Relay + Web Call Client (April 2026)
+
+Tab5 ↔ Dragon ↔ (Tab5 or web) two-way video + audio calls. Dragon is a dumb fan-out relay — no transcoding.
+
+- **Module:** `dragon_voice/video_upstream.py` — receives `VID0`-tagged binary frames from one connected Tab5 and **broadcasts verbatim to all OTHER connected clients**. Same fan-out applies to `AUD0`-tagged frames in the call audio path. No re-encode, no buffering beyond the WS write queue.
+- **Wire format (see `docs/protocol.md` §18):** `"VID0"` (4 bytes) + `len_be` (4 bytes BE u32) + JPEG payload. `"AUD0"` (4 bytes) + `len_be` + raw 16 kHz mono int16 PCM. Untagged binary frames are still mic-PCM bound for STT.
+- **`POST /api/video/inject`** — debug endpoint that pushes a JPEG into the relay as if it had come from a Tab5; useful for testing the Tab5 downlink decode path without a second device. Bearer-auth.
+- **`/call`** — serves `dragon_voice/static/call.html`, a minimal browser call client (HTML + JS, `getUserMedia` for camera + mic, Web Audio API for 16 kHz PCM capture and playback). The web client is just another participant on the relay — Dragon doesn't know or care it's a browser. Shipped in #180 (video) + #181 (audio).
+- **Audio in calls:** Web client captures 16 kHz mono PCM via Web Audio, wraps with `AUD0`, and plays inbound `AUD0` frames back through an `AudioBufferSourceNode` chain.
+
+## OPUS Audio Codec (April 2026 — partial)
+
+- **Capability negotiation works end-to-end** (TinkerBox #174 + TinkerTab #263/#265): Tab5's `register` frame advertises codec capabilities; Dragon responds in `session_start.config` with the negotiated codec.
+- **Decoder ready** for Phase 2B Dragon→Tab5 OPUS TTS — Tab5 can decode OPUS frames if Dragon emits them.
+- **Encoder BROKEN on Tab5** — SILK NSQ crash on ESP32-P4 mid-encode. Encoder is gated OFF in TinkerTab `voice_codec.h` pending TinkerTab #264 root-cause. Don't enable the OPUS uplink path until #264 closes.
 
 ## OTA Firmware Endpoints
 Dragon serves firmware updates for Tab5 via two endpoints:
@@ -502,7 +642,18 @@ dragon_voice/         — Voice pipeline package (port 3502)
     note_tool.py      — NoteTool (registered after NotesService)
   stt/                — STT backends (moonshine, whisper_cpp, vosk, openrouter)
   tts/                — TTS backends (piper, kokoro, edge_tts, openrouter)
-  llm/                — LLM backends (ollama, openrouter, lmstudio, npu_genie, tinkerclaw)
+  llm/                — LLM backends + multi-model router (#183-#187)
+    base.py             — LLMBackend ABC + Modality enum + capabilities default
+    router.py           — CapabilityAwareRouter, ModelSpec, TIER_FOR_MODE,
+                          infer_required_caps, summarize.  Opt-in via
+                          backend: "router" + a populated fleet[].
+    ollama_llm.py       — Ollama (multimodal-aware translator added in #186)
+    openrouter_llm.py   — OpenRouter + _OPENROUTER_CAPS (35 models, sync 2026-04-27)
+                          + _PRICING_MILS_PER_M (matched 1:1 with caps registry)
+    lmstudio_llm.py     — Local OpenAI-compatible server (LAN tier in fleet)
+    npu_genie.py        — QAIRT/Genie (text-only, ~8 tok/s on QCS6490 HTP)
+    tinkerclaw_llm.py   — TinkerClaw gateway adapter (voice_mode=3)
+    dual.py             — Two-backend picker+responder (predates router)
   notes/              — Notes module (CRUD + search + audio ingestion)
   media/              — Rich media rendering package
     __init__.py       — Package exports (MediaStore, MediaPipeline)

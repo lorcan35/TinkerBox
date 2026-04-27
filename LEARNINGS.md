@@ -718,3 +718,40 @@ sequentially across the whole file (don't restart per section).
   1. **`asyncio.wait_for` timeouts are user-perception budgets — calibrate them to "the user has already given up" not "the network might recover".**  15 s in a real-time voice pipeline is forever.
   2. **Lazy-init on the critical path is the same anti-pattern as cold caches in HTTP servers.**  If a fallback exists, prewarm it the moment the primary becomes "this might fail" — for STT, that's the swap into a cloud backend.
   3. **Every multi-second wait in a synchronous user path needs a paired progress emit.**  "No signal" is worse UX than "negative signal" — Tab5 can render a transient toast for "Cloud STT slow", but it can't render anything from silence.
+
+### 90. OpenAI multimodal `content` array sent to Ollama hits a 400 unmarshal error
+- **Date:** 2026-04-27
+- **Symptom:** First end-to-end test of the multi-model router with MiniCPM-V on Dragon: router correctly picked the vision model, lazy-instantiated the backend, but every vision turn returned `[Ollama error: 400]`. Server log: `Ollama error 400: {"error":"json: cannot unmarshal array into Go struct field ChatRequest.messages.content of type string"}`.
+- **Root Cause:** The `messages` list our caller sends is OpenAI multimodal format — `{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:..."}},{"type":"text","text":"..."}]}` (a content *array* of typed parts).  Ollama's `/api/chat` expects a flat `content` *string* + a sibling `images: [base64]` array (raw bytes, no `data:` prefix).  Three other backends (openrouter, lmstudio, tinkerclaw) all natively accept the OpenAI shape; OllamaBackend was passing the multimodal messages straight through to Ollama, which JSON-rejected them.
+- **Fix:** Added `_translate_to_ollama_format(message)` in `dragon_voice/llm/ollama_llm.py` that walks any list-typed `content`, extracts `image_url` URLs (strips the `data:image/jpeg;base64,` prefix if present), collects `text` parts into a flat string, and emits `{"role":..., "content": "<joined text>", "images": ["<base64>", ...]}`.  Plain string-content messages pass through unchanged.  Translation runs on every `messages[]` element before the request body is built.
+- **Prevention:**
+  1. **Every backend that claims `Modality.VISION` must accept the canonical OpenAI multimodal content-array shape OR translate from it.**  The router emits one canonical format (#183); each backend either matches that format natively or owns the translation.
+  2. **Vision capability declaration is a contract, not a hint.**  If `OllamaBackend.capabilities` returns `{VISION}` for a vision-trained model, the backend must successfully serve a vision turn — not 400.  The new `tests/test_router_routing.py` covers routing logic; vision-actually-works integration is exercised by `tests/e2e/runner.py story_full` (Tab5 photo → /api/media/upload → router → MiniCPM-V → reply).
+
+### 91. Long-poll on ESP-IDF httpd is a footgun (PANIC under sustained load)
+- **Date:** 2026-04-27
+- **Symptom:** Tab5 e2e harness ran a `story_smoke` scenario with the experimental `?block_until=&timeout_ms=` long-poll variant of `/events`. Smoke completed but Tab5 became unreachable on the next run. `GET /info` after watchdog reset returned `"reset_reason":"PANIC"`.
+- **Root Cause:** ESP-IDF httpd is single-task by design — one `httpd_task` services all connections via `select()`. When the long-poll handler `vTaskDelay`s waiting for a matching event, all other requests queue behind it. Worse, the experimental implementation re-allocated the cJSON events array on every 200 ms iteration of the wait loop. Across a multi-minute test run, the per-iteration alloc/free churn (or possibly the `cJSON` walks themselves) accumulated heap fragmentation that eventually pushed the device into PANIC.
+- **Fix:** Reverted the long-poll feature entirely. `GET /events?since=N` stays instant-return only. Documented the caveat in `debug_server.c` so the next person who reaches for "but long-poll would be nice" sees the prior art. Harness in `tests/e2e/driver.py` falls back to 250 ms polling — burns more HTTP round-trips but doesn't risk the device.
+- **Prevention:**
+  1. **Single-thread http servers cannot host long-poll handlers.**  vTaskDelay inside a request handler is equivalent to taking the whole server offline for the duration.  If you need push-style notification, use a different transport (a dedicated WebSocket on a separate task, server-sent events with a per-request task spawned via `httpd_queue_work`, or just tell the client to poll faster).
+  2. **Per-iteration heap allocation in tight loops on embedded devices is suspicious.**  Even if each iteration is balanced (alloc + free), the TLSF heap can fragment.  Allocate-once + reuse, or batch the work outside the loop.
+  3. **"Reverted" is a valid commit message body.**  Documenting *why* a feature was removed (with the reset_reason and the timing) saves the next contributor from re-implementing it the same way.
+
+### 92. Diagnostic side-snapshots steal events from the cursor that subsequent waiters need
+- **Date:** 2026-04-27
+- **Symptom:** Tab5 e2e harness's `await_event("camera.capture", timeout_s=10)` failed even though `/screenshot` clearly showed "Photo saved!" toast (event obviously fired).  Direct `/events?since=0` query confirmed `camera.capture` was in the ring.
+- **Root Cause:** `Tab5Driver.events()` advances `_last_event_ms` to the latest event's timestamp on every call, so the next call only returns *newer* events.  The scenario runner's per-step diagnostic block called `events(since_ms=events_before)` to capture what fired during the step — and inadvertently advanced the cursor *past* the events it captured.  The next step's `await_event` started polling from a cursor that was already in the future relative to the events it was looking for.
+- **Fix:** Added `peek=True` parameter to `events()`.  When `peek=True`, the cursor doesn't advance.  The scenario runner's diagnostic snapshot uses `peek=True`; explicit await calls still advance the cursor.
+- **Prevention:**
+  1. **Stateful side effects in "read" methods are easy to write and hard to debug.**  Whenever a read advances a cursor, give callers an opt-out for the side effect.
+  2. **Diagnostic plumbing should never compete with primary control plumbing.**  Capturing "what happened" for a report is observation; consuming events for routing is action.  Separate the two.
+
+### 93. claude-3.5-haiku via OpenRouter's Bedrock route rejects images at runtime
+- **Date:** 2026-04-27
+- **Symptom:** Router correctly picked `anthropic/claude-3.5-haiku` for a vision turn in cloud mode (the registry declared it vision-capable per Anthropic's published specs).  OpenRouter returned: `{"error":{"code":400,"metadata":{"raw":"{\"message\":\"'claude-3-5-haiku-20241022' does not support image input.\"}","provider_name":"Amazon Bedrock"}}}`.
+- **Root Cause:** OpenRouter brokers the same model across multiple providers (Anthropic-direct, Amazon Bedrock, Google Vertex, etc.). Bedrock's claude-3.5-haiku endpoint is text-only even though Anthropic's native endpoint serves images. Our capability registry was based on the Anthropic-native truth — wrong for the Bedrock route OpenRouter happened to pick.
+- **Fix:** Downgraded `anthropic/claude-3.5-haiku` to `{TEXT, TOOL_CALLING}` in `_OPENROUTER_CAPS` (PR #187). Vision-capable cheap-tier alternatives in the curated fleet: `qwen/qwen3.6-flash` ($0.25/$1.50, 1M ctx) and `google/gemini-3-flash-preview` ($0.50/$3, native video).
+- **Prevention:**
+  1. **OpenRouter capability declarations should be based on the route OR is most likely to pick, not the model's published native capabilities.**  When in doubt, conservatively declare text-only and let the user opt back in.
+  2. **Add an integration test that hits each declared-vision-capable OR model with a tiny test image** — would have caught the Bedrock mismatch before the e2e harness did.  Parking this as a follow-up.

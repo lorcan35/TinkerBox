@@ -139,6 +139,7 @@ class ConversationEngine:
         llm_config: LLMConfig,
         tool_registry=None,
         memory_service=None,
+        media_store=None,
     ) -> None:
         self._db = db
         self._messages = message_store
@@ -146,6 +147,12 @@ class ConversationEngine:
         self._llm: Optional[LLMBackend] = None
         self._tool_registry = tool_registry
         self._memory_service = memory_service
+        # #183 PR 3: when set, multimodal user messages stored via
+        # add_message(media_id=...) get hydrated back to OpenAI
+        # image_url content arrays at context-build time, enabling
+        # cross-modal continuity (photo turn -> text follow-up that
+        # still sees the photo).
+        self._media_store = media_store
 
     async def initialize(self) -> None:
         """Create and initialize the LLM backend."""
@@ -266,7 +273,9 @@ class ConversationEngine:
         # cloud models (128K+) can use much more conversation history.
         is_local = self._llm_config.backend in ("ollama", "npu_genie", "lmstudio")
         max_msgs = 10 if is_local else 30
-        context = await self._messages.get_context(session_id, max_messages=max_msgs)
+        context = await self._messages.get_context(
+            session_id, max_messages=max_msgs, media_store=self._media_store
+        )
 
         # Inject memory context before the user's message
         if self._memory_service:
@@ -304,6 +313,7 @@ class ConversationEngine:
         on_tool_call=None,
         on_tool_result=None,
         on_tool_error=None,
+        media_id: Optional[str] = None,
     ) -> AsyncIterator[str]:
         """Process text input with streaming response and tool-calling support.
 
@@ -327,13 +337,19 @@ class ConversationEngine:
         if not self._llm:
             raise RuntimeError("ConversationEngine not initialized")
 
-        # Store user message
+        # Store user message — multimodal turns pass media_id to encode
+        # the content with the multimodal marker (#183 PR 3). Uses
+        # input_mode="text" because the schema's CHECK constraint is
+        # ('voice','text','system') only; the multimodal nature is
+        # captured in the marker-prefixed content. Follow-up: add a
+        # DB migration adding 'vision' to the allowed set.
         await self._messages.add_message(
             session_id=session_id,
             role="user",
             content=text,
-            input_mode=input_mode,
+            input_mode="text" if media_id else input_mode,
             audio_duration_s=audio_duration_s,
+            media_id=media_id,
         )
 
         # Touch session activity

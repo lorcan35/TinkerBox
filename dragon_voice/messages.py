@@ -6,13 +6,51 @@ All SQL goes through db.py — this module adds the context-building logic.
 refs #17
 """
 
+import base64
+import json
 import logging
+import os
 import secrets
-from typing import Optional
+from typing import Any, Optional
 
 from dragon_voice.db import Database
 
 logger = logging.getLogger(__name__)
+
+
+# ── Multimodal content marker (#183 PR 3) ─────────────────────────
+# Multimodal user messages (image + text) are persisted as JSON in the
+# `content` text column with a recognisable marker so we can hydrate
+# them back to OpenAI multimodal format on context build, and so we
+# never confuse a plain text message that happens to start with `{`
+# with a multimodal payload.
+_MM_MARKER = "__mm__:"
+
+
+def encode_multimodal_content(media_id: str, text: str) -> str:
+    """Encode a multimodal user message for storage in `messages.content`.
+
+    Stores the media_id reference (not the raw base64) to keep the DB
+    small. Hydration happens at context-build time via
+    `_hydrate_multimodal_content` which reads the file off disk and
+    inlines it as a data URI.
+    """
+    payload = {"media_id": media_id, "text": text}
+    return _MM_MARKER + json.dumps(payload, separators=(",", ":"))
+
+
+def is_multimodal_content(content: str) -> bool:
+    return isinstance(content, str) and content.startswith(_MM_MARKER)
+
+
+def _decode_multimodal_marker(content: str) -> Optional[dict]:
+    if not is_multimodal_content(content):
+        return None
+    try:
+        return json.loads(content[len(_MM_MARKER):])
+    except json.JSONDecodeError:
+        logger.warning("Malformed multimodal marker in stored content")
+        return None
 
 
 # ── Token budget helpers ──────────────────────────────────────────────
@@ -67,6 +105,46 @@ def _generate_message_id() -> str:
     return secrets.token_hex(6)
 
 
+async def _hydrate_multimodal_content(content: str, media_store: Any) -> Any:
+    """Convert a stored multimodal-marker string to OpenAI multimodal content.
+
+    Returns the original string unchanged when:
+      - Content isn't multimodal-marked (the common case — text turns)
+      - media_store is None (caller didn't opt in to hydration)
+      - The referenced media file is gone (TTL expired or deleted)
+
+    On expiry, returns a placeholder text so the LLM doesn't hallucinate
+    against a missing image.
+    """
+    decoded = _decode_multimodal_marker(content)
+    if decoded is None:
+        return content
+    media_id = decoded.get("media_id", "")
+    text = decoded.get("text", "")
+    if media_store is None or not media_id:
+        return f"{text} [image attached: {media_id}]"
+    try:
+        path = await media_store.get_path(media_id)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("media_store.get_path(%s) failed: %s", media_id, e)
+        return f"{text} [image expired]"
+    if not path or not os.path.exists(path):
+        return f"{text} [image expired]"
+    # Read + base64 inline.  Done sync because we're inside an async
+    # context-build that's not on the request hot path; the file is
+    # already cached by MediaStore so this is fast.
+    try:
+        with open(path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+    except OSError as e:
+        logger.warning("media file read failed (%s): %s", path, e)
+        return f"{text} [image expired]"
+    return [
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+        {"type": "text", "text": text},
+    ]
+
+
 class MessageStore:
     """Append-only message store with LLM context building.
 
@@ -88,6 +166,7 @@ class MessageStore:
         token_count: Optional[int] = None,
         model: Optional[str] = None,
         latency_ms: Optional[float] = None,
+        media_id: Optional[str] = None,
     ) -> dict:
         """Store a message. Returns the message row as dict.
 
@@ -101,8 +180,14 @@ class MessageStore:
             token_count: LLM tokens used (None for user messages).
             model: Which LLM model generated this (None for user messages).
             latency_ms: End-to-end processing time in ms (None for user messages).
+            media_id: When present, persist as a multimodal message —
+                content gets encoded with the multimodal marker so
+                `get_context` can hydrate it back into OpenAI multimodal
+                format.  Used by `_handle_user_media` (#183).
         """
         message_id = _generate_message_id()
+        if media_id:
+            content = encode_multimodal_content(media_id, content)
         msg = await self._db.add_message(
             message_id=message_id,
             session_id=session_id,
@@ -132,6 +217,7 @@ class MessageStore:
         session_id: str,
         max_messages: int = 20,
         system_prompt: Optional[str] = None,
+        media_store: Optional[Any] = None,
     ) -> list[dict]:
         """Build an OpenAI-format message list for LLM context.
 
@@ -170,9 +256,12 @@ class MessageStore:
             # Include user, assistant, and tool messages in LLM context
             # (tool results are needed for the LLM to see what tools returned)
             if msg["role"] in ("user", "assistant", "tool"):
+                content = await _hydrate_multimodal_content(
+                    msg["content"], media_store
+                )
                 context.append({
                     "role": msg["role"],
-                    "content": msg["content"],
+                    "content": content,
                 })
 
         return context

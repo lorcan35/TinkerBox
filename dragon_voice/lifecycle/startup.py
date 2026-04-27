@@ -203,11 +203,16 @@ async def run_startup(server: Any, app: web.Application) -> None:
             except Exception as e:
                 logger.warning("ScheduleReminderTool registration failed: %s", e)
 
-    # Conversation engine (shared LLM backend for text/API input)
+    # Conversation engine (shared LLM backend for text/API input).
+    # #183 PR 3: pass media_store so multimodal user messages persist
+    # via add_message(media_id=...) and hydrate back to OpenAI
+    # multimodal format on context build, enabling cross-modal
+    # continuity (photo turn -> text follow-up still sees the photo).
     server._conversation = ConversationEngine(
         server._db, server._message_store, server._config.llm,
         tool_registry=server._tool_registry,
         memory_service=server._memory_service,
+        media_store=server._media_store,
     )
     await server._conversation.initialize()
 

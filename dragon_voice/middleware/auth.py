@@ -26,6 +26,11 @@ PUBLIC_PREFIXES: tuple[str, ...] = (
     "/ws/voice",
     "/dashboard",
     "/api/media/",
+    # #179: video-call web client + its static assets — opens on a
+    # phone browser without an API token.  Sensitive surfaces stay
+    # under /api/v1/* which still gates auth.
+    "/call",
+    "/static/",
 )
 
 

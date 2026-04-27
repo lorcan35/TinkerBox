@@ -79,3 +79,46 @@ def test_handler_counts_parse_errors_quietly(tmp_path):
     assert s["frames"] == 0
     assert s["parse_errors"] == 1
     assert not latest.exists()
+
+
+# Phase 3C relay: any frame from one session is broadcast to all OTHER
+# connected sessions verbatim.
+
+class _FakeWS:
+    def __init__(self):
+        self.sent = []
+        self.closed = False
+    async def send_bytes(self, b):
+        if self.closed: raise RuntimeError("closed")
+        self.sent.append(bytes(b))
+
+
+def test_relay_broadcasts_to_other_sessions(tmp_path):
+    h = VideoUpstreamHandler(latest_path=str(tmp_path / "latest.jpg"))
+    ws_a, ws_b, ws_c = _FakeWS(), _FakeWS(), _FakeWS()
+    conns = {
+        "ws_a": {"session_id": "S_A", "ws": ws_a},
+        "ws_b": {"session_id": "S_B", "ws": ws_b},
+        "ws_c": {"session_id": "S_C", "ws": ws_c},
+    }
+    wire = _wrap(b"\xff\xd8\xff\xd9JPEGBYTES")
+    asyncio.run(h.on_frame("S_A", "dev_a", wire, active_connections=conns))
+    # Sender does NOT receive its own frame.
+    assert ws_a.sent == []
+    # Other clients each receive the wire bytes verbatim.
+    assert ws_b.sent == [wire]
+    assert ws_c.sent == [wire]
+
+
+def test_relay_skips_closed_peers(tmp_path):
+    h = VideoUpstreamHandler(latest_path=str(tmp_path / "latest.jpg"))
+    ws_a, ws_b = _FakeWS(), _FakeWS()
+    ws_b.closed = True
+    conns = {
+        "ws_a": {"session_id": "S_A", "ws": ws_a},
+        "ws_b": {"session_id": "S_B", "ws": ws_b},
+    }
+    wire = _wrap(b"\xff\xd8\xff\xd9JPEG")
+    asyncio.run(h.on_frame("S_A", "dev_a", wire, active_connections=conns))
+    # Closed peer is silently skipped — no exception.
+    assert ws_b.sent == []

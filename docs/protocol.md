@@ -30,6 +30,9 @@ This document defines the WebSocket protocol between **Tab5** (ESP32-P4 thin cli
 14. [config_update Backward Compatibility](#14-config_update-backward-compatibility)
 15. [Rich Media Messages](#15-rich-media-messages)
 16. [Message Reference](#16-message-reference)
+17. [Widget Platform Messages](#17-widget-platform-messages-v1-april-2026)
+18. [Video + Call Audio](#18-video--call-audio-april-2026)
+19. [Progress Event Bus](#19-progress-event-bus-β-arch-april-2026)
 
 ---
 
@@ -154,10 +157,18 @@ Sent immediately after registration is processed and the pipeline is fully initi
   "config": {
     "stt": "moonshine",
     "tts": "piper",
-    "llm": "npu_genie",
+    "llm": "router",
     "tts_sample_rate": 22050,
     "response_mode": "match_input",
-    "system_prompt": "You are Tinker..."
+    "system_prompt": "You are Tinker...",
+    "fleet_summary": {
+      "text":         "ministral-3:3b",
+      "vision":       "hf.co/openbmb/MiniCPM-V-4-gguf:Q4_K_M",
+      "video":        "hf.co/openbmb/MiniCPM-V-4-gguf:Q4_K_M",
+      "audio_in":     null,
+      "audio_out":    null,
+      "tool_calling": "ministral-3:3b"
+    }
   }
 }
 ```
@@ -170,6 +181,7 @@ Sent immediately after registration is processed and the pipeline is fully initi
 | `resumed` | bool | `true` if this is a resumed session with existing history. |
 | `message_count` | int | Number of messages in the resumed session (`0` for new). |
 | `config` | object | Active backend configuration for this session. |
+| `config.fleet_summary` | object\|null | **(#186, present only when `llm == "router"`)** Per-modality model_id the router would currently pick at the active voice_mode tier.  Keys are `Modality` values (text, vision, video, audio_in, audio_out, tool_calling). Value is the chosen model_id or `null` if no fleet entry has that capability in the current tier. Tab5 firmware can ignore this field — the legacy `vision_capability` event keeps firing for backward compat. New firmware can use it to light up dynamic capability chips. Re-sent on every `config_update` ACK after a voice_mode change. |
 
 **When sent:** After Dragon finishes initializing the pipeline (may take several seconds on first connect as models load).
 
@@ -1611,7 +1623,30 @@ widget_card is its superset (adds action).
 
 ---
 
-## 18. Progress Event Bus (β-arch, April 2026)
+## 18. Video + Call Audio (April 2026)
+
+Two-way video calls between Tab5, Dragon, and a browser client. Dragon is a verbatim broadcast relay — no transcode, no buffering beyond the WS write queue.
+
+Wire framing for both directions:
+
+| Magic (4 bytes ASCII) | Length (4 bytes BE u32) | Payload |
+|-----------------------|--------------------------|---------|
+| `VID0`                | `len`                    | JPEG frame (Tab5 HW JPEG encoder, web `getUserMedia` MediaRecorder, or `/api/video/inject`) |
+| `AUD0`                | `len`                    | Raw 16 kHz mono int16 PCM (Tab5 mic in `VOICE_MODE_CALL`, web Web Audio capture) |
+
+Untagged binary frames remain raw mic PCM bound for STT (existing §3.2 behaviour) — the magic tag is what disambiguates.
+
+**Relay model:** A frame received from one connection is forwarded byte-for-byte to all OTHER connections (sender excluded). Implemented in `dragon_voice/video_upstream.py`.
+
+**Endpoints:**
+- `POST /api/video/inject` — debug push of a JPEG into the relay (bearer-auth)
+- `GET /call` — serves `dragon_voice/static/call.html`, the browser call client
+
+**Tab5 atomic helpers:** `voice_video_start_call()` / `voice_video_end_call()` flip `VOICE_MODE_CALL`, open/close the camera, and show/hide the video pane in one call.
+
+---
+
+## 19. Progress Event Bus (β-arch, April 2026)
 
 **Added with the β-arch refactor (TinkerBox PR #N, issue #123).** A unified `progress` channel that supersedes the per-phase ad-hoc events introduced by Phase 2 (`dictation_postprocessing`, `tool_call`/`tool_result`, etc.).  The vision: one Tab5 renderer for all in-flight signals; new progress phases plug in for free without protocol churn.
 

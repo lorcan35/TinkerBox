@@ -10,6 +10,7 @@ _BACKENDS = {
     "npu_genie": "dragon_voice.llm.npu_genie.NPUGenieBackend",
     "tinkerclaw": "dragon_voice.llm.tinkerclaw_llm.TinkerClawBackend",
     "dual": "dragon_voice.llm.dual.DualModelBackend",
+    "router": "dragon_voice.llm.router.CapabilityAwareRouter",
 }
 
 

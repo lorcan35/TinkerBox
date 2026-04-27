@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from dragon_voice.config import LLMConfig
-from dragon_voice.llm.base import LLMBackend
+from dragon_voice.llm.base import LLMBackend, Modality
 
 logger = logging.getLogger(__name__)
 
@@ -196,3 +196,9 @@ class NPUGenieBackend(LLMBackend):
     @property
     def name(self) -> str:
         return f"NPU Genie ({self._config_file})"
+
+    @property
+    def capabilities(self) -> frozenset[Modality]:
+        # QAIRT/Genie text-only. No vision/audio support today —
+        # multimodal would need a fresh QAIRT model + Genie pipeline.
+        return frozenset({Modality.TEXT})

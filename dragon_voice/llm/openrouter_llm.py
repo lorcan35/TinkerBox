@@ -13,7 +13,7 @@ from typing import AsyncIterator
 import aiohttp
 
 from dragon_voice.config import LLMConfig
-from dragon_voice.llm.base import LLMBackend
+from dragon_voice.llm.base import LLMBackend, Modality
 
 logger = logging.getLogger(__name__)
 
@@ -349,6 +349,16 @@ class OpenRouterBackend(LLMBackend):
     def name(self) -> str:
         return f"OpenRouter ({self._model})"
 
+    @property
+    def capabilities(self) -> frozenset[Modality]:
+        """Look up the configured OpenRouter model in the capability registry.
+
+        Used by the multi-model router (#183). Unknown models default to
+        text + tool_calling (a safe baseline for OR — every modern OR
+        model supports tools via the chat-completions API).
+        """
+        return _openrouter_capabilities(self._model)
+
 
 # ── Pricing table (Phase 3) ───────────────────────────────────────────
 # Values are in MILS per 1M tokens ($USD * 1000 * 1000).  Storing in mils
@@ -403,3 +413,38 @@ def price_for_model(model: str, prompt_tokens: int, completion_tokens: int) -> i
     cost_in  = (in_num  + 999_999) // 1_000_000 if in_num  > 0 else 0
     cost_out = (out_num + 999_999) // 1_000_000 if out_num > 0 else 0
     return cost_in + cost_out
+
+
+# ── Capability registry (#183) ─────────────────────────────────────────
+# Per-model declared modalities for the multi-model router.  Each entry
+# is the set of caps OpenRouter exposes for that model.  Keep in sync
+# with OpenRouter's documented multimodal endpoints; new entries added
+# as we use new models.
+#
+# Default for unknown OR models: {TEXT, TOOL_CALLING}.  OR's chat
+# completions API supports tools across the board; vision/video/audio
+# are explicit per-model and must be opted in.
+_OPENROUTER_CAPS: dict[str, frozenset[Modality]] = {
+    # Anthropic (vision + tools across the line)
+    "anthropic/claude-3-haiku":   frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    "anthropic/claude-3.5-haiku": frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    "anthropic/claude-sonnet-4-20250514": frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    # OpenAI
+    "openai/gpt-4o":              frozenset({Modality.TEXT, Modality.VISION, Modality.AUDIO_IN, Modality.AUDIO_OUT, Modality.TOOL_CALLING}),
+    "openai/gpt-4o-mini":         frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    "openai/gpt-audio-mini":      frozenset({Modality.TEXT, Modality.AUDIO_IN, Modality.AUDIO_OUT}),
+    # Google Gemini Flash family — vision + native video, full tools
+    "google/gemini-3-flash-preview": frozenset({Modality.TEXT, Modality.VISION, Modality.VIDEO, Modality.AUDIO_IN, Modality.TOOL_CALLING}),
+    "google/gemini-2.5-flash":       frozenset({Modality.TEXT, Modality.VISION, Modality.VIDEO, Modality.AUDIO_IN, Modality.TOOL_CALLING}),
+    "google/gemini-2.5-flash-lite":  frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+    "google/gemini-2.0-flash-001":   frozenset({Modality.TEXT, Modality.VISION, Modality.TOOL_CALLING}),
+}
+
+_OPENROUTER_DEFAULT_CAPS = frozenset({Modality.TEXT, Modality.TOOL_CALLING})
+
+
+def _openrouter_capabilities(model_id: str) -> frozenset[Modality]:
+    """Return declared modalities for an OpenRouter model id."""
+    if not model_id:
+        return _OPENROUTER_DEFAULT_CAPS
+    return _OPENROUTER_CAPS.get(model_id, _OPENROUTER_DEFAULT_CAPS)

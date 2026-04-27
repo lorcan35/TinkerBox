@@ -17,7 +17,7 @@ import aiohttp
 
 from dragon_voice.config import LLMConfig
 from dragon_voice.errors import DragonError, Scope, Severity
-from dragon_voice.llm.base import LLMBackend
+from dragon_voice.llm.base import LLMBackend, Modality
 
 logger = logging.getLogger(__name__)
 
@@ -486,3 +486,20 @@ class TinkerClawBackend(LLMBackend):
     @property
     def name(self) -> str:
         return f"TinkerClaw ({self._model})"
+
+    @property
+    def capabilities(self) -> frozenset[Modality]:
+        """TinkerClaw gateway routes through whichever model is configured.
+
+        The gateway itself is agentic — every model it serves goes
+        through its tool-execution layer. Vision is model-dependent.
+        Declared mostly for completeness + diagnostic surfaces; the
+        router doesn't pick TinkerClaw (voice_mode=3 short-circuits
+        the router entirely).
+        """
+        model_lc = (self._model or "").lower()
+        caps = {Modality.TEXT, Modality.TOOL_CALLING}
+        if any(prefix in model_lc for prefix in
+               ("minimax/", "anthropic/", "openai/gpt-4o", "google/gemini")):
+            caps.add(Modality.VISION)
+        return frozenset(caps)

@@ -36,7 +36,7 @@ import re
 from typing import AsyncIterator
 
 from dragon_voice.config import LLMConfig
-from dragon_voice.llm.base import LLMBackend
+from dragon_voice.llm.base import LLMBackend, Modality
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +138,17 @@ class DualModelBackend(LLMBackend):
     @property
     def name(self) -> str:
         return f"Dual(picker={self._picker.name} | responder={self._responder.name})"
+
+    @property
+    def capabilities(self) -> frozenset[Modality]:
+        """Forward to the responder.
+
+        The responder is the model whose tokens reach the user; if it
+        can't see images, the dual pipeline can't see images. Picker is
+        text-only by design (xLAM-style FC head) and doesn't constrain
+        the user-visible modality set.
+        """
+        return self._responder.capabilities
 
     async def initialize(self) -> None:
         await self._picker.initialize()

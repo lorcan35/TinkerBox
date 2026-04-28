@@ -8,6 +8,12 @@
 > scratch yourself, see [`dev-setup.md`](dev-setup.md) instead —
 > that path is more involved.
 
+<p align="center">
+  <img src="images/home.jpg" alt="Tab5 home screen — golden orb on black background, 'ready' caption, Local mode pill, daily spend tracker, hold-to-speak bar at bottom" width="320"/>
+  <br/>
+  <em>Home screen on first boot — that's the glowing orb you tap to talk.</em>
+</p>
+
 ---
 
 ## What you're looking at
@@ -265,6 +271,77 @@ If none of this works, **file an issue** with:
 - What happened instead
 - The output of `http://<tab5-ip>:8080/info` if you can get it
 - A screenshot if visual
+
+---
+
+## A tour of the screens
+
+There are five main screens you'll bounce between. Swipe up from the bottom of any screen to bring up the nav sheet that switches between them.
+
+### Home
+
+<p align="center">
+  <img src="images/home.jpg" alt="Tab5 home screen with golden orb, 'ready' caption, Local mode pill, daily spend tracker" width="280"/>
+</p>
+
+The orb is the microphone. The pill below the orb (here showing **Local · ON-DEVICE**) is the current voice mode — tap or long-press to swap. The "Today" bar at the bottom shows how much you've spent on cloud LLM calls today; in Local mode this stays at $0.
+
+### Chat
+
+<p align="center">
+  <img src="images/chat.jpg" alt="Tab5 chat overlay" width="280"/>
+</p>
+
+The text-input alternative to voice. Type a question, hit Done, get an answer. Same AI brain as voice — just skips the speech step. Useful when you don't want to speak out loud.
+
+### Camera
+
+<p align="center">
+  <img src="images/camera.jpg" alt="Tab5 camera viewfinder with shutter, REC, and Gallery buttons" width="280"/>
+</p>
+
+White circle in the middle takes a photo (saves to SD card). Red REC button records video to SD as motion-JPEG. The dropdown picks resolution; the **Rot 1** button at the top cycles camera rotation. From the chat screen you can tap a "Send photo" button that arms the camera to share its next capture with the AI.
+
+### Notes
+
+<p align="center">
+  <img src="images/notes.jpg" alt="Tab5 notes screen" width="280"/>
+</p>
+
+Voice notes — long-press the orb on the home screen to start dictation. After 5 seconds of silence it auto-stops and the AI generates a title + summary. Notes show up here, searchable.
+
+### Settings
+
+<p align="center">
+  <img src="images/settings.jpg" alt="Tab5 settings screen" width="280"/>
+</p>
+
+Volume, brightness, mic mute, voice mode, daily spend cap, Wi-Fi info, OTA updates, "About". The three dials at the bottom (intelligence / voice / autonomy) are a more granular way to control what mode you're in than the simple Local/Hybrid/Cloud chip.
+
+---
+
+## Plain-English glossary
+
+The technical [`GLOSSARY.md`](../GLOSSARY.md) is for developers. Here's the user-facing one:
+
+- **Tab5** — the touchscreen device you talk to. It's the "face" of the system.
+- **Dragon** — the small Linux computer that does the actual AI thinking. Lives somewhere on your home network. Always on.
+- **Voice mode** — controls *where* the AI thinking happens.  See the table above. Tap or long-press the mode pill on the home screen to swap.
+- **Orb** — the glowing circle on the home screen. Tap it to speak; long-press to record a long note.
+- **Local mode** — everything stays on your Dragon, nothing leaves your house. Slow but private.
+- **Cloud mode** — uses a paid AI service (Anthropic/OpenAI/Google etc.). Fast and high-quality, but costs money and sends your audio + question to the cloud.
+- **Hybrid mode** — middle ground — fast voice (cloud) with private thinking (local). Good balance.
+- **TinkerClaw mode** — for big multi-step tasks that need the AI to take actions on your behalf (browse the web, send messages, etc.). Most powerful, but enables the most autonomy.
+- **Daily cap** — your maximum spend per day on cloud-mode AI. Defaults to $1. When you hit it, Tab5 auto-switches you back to Local mode for the rest of the day.
+- **Skill** — a feature someone (a developer) added to the system. Examples: a Pomodoro timer skill, a calendar skill, a smart-home control skill. Most users won't need to think about skills; they just exist.
+- **Widget** — a thing a skill draws on Tab5's screen. Live timers, cards, lists, charts, prompts. Different from chat messages.
+- **Memory** — facts you've told the AI to remember. ("Remember that my favourite colour is blue.") Stored on your Dragon, recalled automatically when relevant.
+- **Session** — a single conversation. Each new "New Chat" starts a new session. Your history is saved on Dragon for 30 days.
+- **NVS / settings** — the tiny bit of memory inside Tab5 that remembers your Wi-Fi password, the Dragon address, and your preferences across reboots. You don't need to touch this.
+- **OTA** — "over the air" — Tab5 checks Dragon hourly for firmware updates. When one's available, you tap "Apply Update" in Settings and the device reboots into the new version.
+- **PTT** — "push to talk" — the "tap and hold the orb to speak" workflow.
+
+That's the user-facing vocabulary. Anything else you bump into is in the [main GLOSSARY.md](../GLOSSARY.md) but is mostly for developers.
 
 ---
 

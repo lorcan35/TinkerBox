@@ -2,10 +2,14 @@
 
 **The Brain of TinkerClaw** -- Dragon Q6A server stack for the TinkerClaw voice assistant platform.
 
+📚 **Docs:** [Architecture](docs/ARCHITECTURE.md) · [Protocol](docs/protocol.md) · [Router cookbook](docs/router-cookbook.md) · [Flows](docs/flows/) · [Glossary](GLOSSARY.md) · [Lessons](LEARNINGS.md) · [CLAUDE.md](CLAUDE.md) (runbook)
+
+> **First time here?** Start with [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system overview, diagrams, where every piece fits.  Then pick a [flow trace](docs/flows/) for a concrete walk-through.
+
 TinkerBox runs on a Radxa Dragon Q6A (Qualcomm QCS6490, ARM64) and provides the
 complete AI pipeline for TinkerClaw devices: speech-to-text, language model
 inference, text-to-speech synthesis, multi-turn conversation management, session
-persistence, a REST API, browser streaming, and a web dashboard. The companion
+persistence, a REST API, and a web dashboard.  The companion
 [TinkerTab](https://github.com/lorcan35/TinkerTab) firmware (ESP32-P4 / M5Stack
 Tab5) is a thin client -- it captures audio and displays results, but all
 intelligence lives here.

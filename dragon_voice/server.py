@@ -1984,8 +1984,24 @@ class VoiceServer:
                             })
                         except Exception:
                             pass
-                except Exception:
-                    logger.exception("TTS for text input failed")
+                except (asyncio.TimeoutError, Exception) as tts_err:
+                    # #89 Phase 2 L3: kill any in-flight Piper subprocess
+                    # before bailing.  Without this the text path leaks
+                    # the zombie until Python exits — same class of bug
+                    # as A1 (cancel) but on the timeout edge.  Mirrors
+                    # the voice-path pattern at pipeline.py:1411-1421.
+                    if pipeline._tts and hasattr(pipeline._tts, "kill_active_procs"):
+                        try:
+                            pipeline._tts.kill_active_procs()
+                        except Exception:
+                            logger.debug("kill_active_procs raised", exc_info=True)
+                    if isinstance(tts_err, asyncio.TimeoutError):
+                        logger.warning(
+                            "Text-path TTS timed out after %ds — killed Piper procs",
+                            tts_timeout,
+                        )
+                    else:
+                        logger.exception("TTS for text input failed")
                     # Always send tts_end so Tab5 doesn't hang in SPEAKING
                     if not ws.closed:
                         await ws.send_json({"type": "tts_end", "tts_ms": 0})

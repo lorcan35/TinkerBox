@@ -1,5 +1,7 @@
 # TinkerBox — Dragon Server Stack (THE BRAIN)
 
+> **Trying to understand what this project IS rather than how to operate it?** Read [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) first — system overview, component diagram, data flows. This file is the *runbook* (deploy, debug, restart, monitor); ARCHITECTURE.md is the *map*.  [`GLOSSARY.md`](GLOSSARY.md) covers any unfamiliar terms.
+
 ## Active investigations — READ FIRST before related work
 
 - **UX-gap remediation (2026-04-25)** → see [`docs/UX-GAPS.md`](docs/UX-GAPS.md)

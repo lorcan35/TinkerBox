@@ -4,6 +4,7 @@ All routes are registered via setup_all_routes() called from server.py.
 """
 
 import logging
+from typing import Any, Callable
 
 from aiohttp import web
 
@@ -21,21 +22,25 @@ from dragon_voice.api.video_inject import VideoInjectRoutes
 logger = logging.getLogger(__name__)
 
 
+# DI entry-point types — kept loose (Any) here because the concrete
+# Database / SessionManager / MessageStore / ConversationEngine classes
+# come from outside this strict-checked island and would force every
+# transitive import to be strict-clean too.  W14-M15 carry-over.
 def setup_all_routes(
     app: web.Application,
-    db,
-    session_mgr,
-    message_store,
-    conversation=None,
-    voice_config=None,
+    db: Any,
+    session_mgr: Any,
+    message_store: Any,
+    conversation: Any = None,
+    voice_config: Any = None,
     start_time: float = 0,
-    get_active_connections=None,
-    tool_registry=None,
-    memory_service=None,
-    media_store=None,
-    media_url_signer=None,
-    scheduler_mgr=None,
-    get_active_conn_dict=None,   # #177: route handlers that need the dict (not just len)
+    get_active_connections: Callable[[], int] | None = None,
+    tool_registry: Any = None,
+    memory_service: Any = None,
+    media_store: Any = None,
+    media_url_signer: Any = None,
+    scheduler_mgr: Any = None,
+    get_active_conn_dict: Callable[[], dict[str, Any]] | None = None,  # #177
 ) -> None:
     """Register all API route modules on the aiohttp app.
 

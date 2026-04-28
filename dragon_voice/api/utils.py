@@ -1,5 +1,7 @@
 """Shared API utilities: error responses, pagination, JSON parsing."""
 
+from typing import Any
+
 from aiohttp import web
 
 
@@ -8,7 +10,9 @@ def json_error(message: str, status: int = 400) -> web.Response:
     return web.json_response({"error": message}, status=status)
 
 
-def paginated_response(items: list[dict], limit: int, offset: int) -> web.Response:
+def paginated_response(
+    items: list[dict[str, Any]], limit: int, offset: int
+) -> web.Response:
     """Return a paginated JSON response."""
     return web.json_response({
         "items": items,
@@ -38,10 +42,12 @@ def parse_pagination(request: web.Request, default_limit: int = 50,
     return limit, offset
 
 
-async def parse_json_body(request: web.Request) -> tuple[dict | None, web.Response | None]:
+async def parse_json_body(
+    request: web.Request,
+) -> tuple[dict[str, Any] | None, web.Response | None]:
     """Parse JSON body. Returns (body, None) on success, (None, error_response) on failure."""
     try:
-        body = await request.json()
+        body: dict[str, Any] = await request.json()
         return body, None
     except Exception:
         return None, json_error("Invalid JSON body")

@@ -7,6 +7,7 @@ and how to integrate it.
 | Folder | What it shows |
 |--------|--------------|
 | [`tool-hello-world/`](tool-hello-world/) | Smallest possible agentic tool — single file, fully tested, registers in 2 lines |
+| [`skill-hello-world/`](skill-hello-world/) | Smallest possible widget-emitting skill — shows a greeting on Tab5's home screen for 30 s, then auto-dismisses |
 
 More examples land here as the skill platform matures. If you've
 built something useful for a custom deployment, PR it as an example.

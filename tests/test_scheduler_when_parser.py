@@ -90,6 +90,81 @@ def test_iso_without_tz_uses_dragon_tz() -> None:
     assert fire_at == pytest.approx(expected)
 
 
+# ───────────────────────── verbose relative phrases (LLM-natural; #136)
+#
+# Local LLMs almost never emit `5m` — they reach for the conversational
+# shapes a user would actually say.  These tests pin the three accepted
+# verbose forms so a future regex tweak can't quietly break the LLM
+# tool-call path.
+
+
+def test_verbose_in_minutes() -> None:
+    """`in 5 minutes` — the most common LLM phrasing for a near-term
+    reminder.  Maps to the same semantics as `5m`."""
+    fire_at = parse_when("in 5 minutes", now=_FIXED_NOW, tz=_UTC)
+    assert fire_at == pytest.approx(_FIXED_NOW + 5 * 60)
+
+
+def test_verbose_minutes_from_now() -> None:
+    """`8 minutes from now` — the exact phrase that surfaced in the
+    issue (#136) where ministral fired schedule_reminder and got
+    rejected.  Pin it."""
+    fire_at = parse_when("8 minutes from now", now=_FIXED_NOW, tz=_UTC)
+    assert fire_at == pytest.approx(_FIXED_NOW + 8 * 60)
+
+
+def test_verbose_seconds_later() -> None:
+    """`30 seconds later` — third accepted phrasing.  `later` is a
+    common English suffix; some models reach for it instead of
+    `from now`."""
+    fire_at = parse_when("30 seconds later", now=_FIXED_NOW, tz=_UTC)
+    assert fire_at == pytest.approx(_FIXED_NOW + 30)
+
+
+def test_verbose_singular_unit() -> None:
+    """`in 1 hour` (singular) parses too.  English drops the trailing
+    `s` for n=1 and the parser must follow."""
+    fire_at = parse_when("in 1 hour", now=_FIXED_NOW, tz=_UTC)
+    assert fire_at == pytest.approx(_FIXED_NOW + 3600)
+
+
+def test_verbose_seconds() -> None:
+    """`in 90 seconds` works; pins the second-unit path against the
+    minute/hour ones."""
+    fire_at = parse_when("in 90 seconds", now=_FIXED_NOW, tz=_UTC)
+    assert fire_at == pytest.approx(_FIXED_NOW + 90)
+
+
+def test_verbose_days() -> None:
+    """`in 2 days` works; days are wall-clock 86400 s, no DST math,
+    matches the relative-duration contract."""
+    fire_at = parse_when("in 2 days", now=_FIXED_NOW, tz=_UTC)
+    assert fire_at == pytest.approx(_FIXED_NOW + 2 * 86400)
+
+
+def test_verbose_case_insensitive() -> None:
+    """`In 5 Minutes` (sentence case) parses — LLM output isn't
+    always lowercase."""
+    fire_at = parse_when("In 5 Minutes", now=_FIXED_NOW, tz=_UTC)
+    assert fire_at == pytest.approx(_FIXED_NOW + 5 * 60)
+
+
+def test_verbose_far_future_capped() -> None:
+    """The 365-day cap applies to verbose phrases too — a hallucinated
+    `in 400 days` raises like `400d` does."""
+    with pytest.raises(ValueError, match="365"):
+        parse_when("in 400 days", now=_FIXED_NOW, tz=_UTC)
+
+
+def test_verbose_bare_number_unit_rejected() -> None:
+    """`5 minutes` (no `in` prefix and no `from now` / `later` suffix)
+    is ambiguous — could mean "for 5 minutes" rather than "in 5
+    minutes".  Reject so we never schedule a wrong-meaning reminder.
+    The user / LLM can disambiguate by saying `in 5 minutes`."""
+    with pytest.raises(ValueError):
+        parse_when("5 minutes", now=_FIXED_NOW, tz=_UTC)
+
+
 # ───────────────────────── natural phrases
 
 

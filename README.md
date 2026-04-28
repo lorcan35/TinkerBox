@@ -2,9 +2,9 @@
 
 **The Brain of TinkerClaw** -- Dragon Q6A server stack for the TinkerClaw voice assistant platform.
 
-📚 **Docs:** [Architecture](docs/ARCHITECTURE.md) · [Protocol](docs/protocol.md) · [Router cookbook](docs/router-cookbook.md) · [Flows](docs/flows/) · [Glossary](GLOSSARY.md) · [Lessons](LEARNINGS.md) · [CLAUDE.md](CLAUDE.md) (runbook)
+📚 **Docs:** [WELCOME](WELCOME.md) · [Get started](docs/getting-started-user.md) · [Architecture](docs/ARCHITECTURE.md) · [Protocol](docs/protocol.md) · [Router cookbook](docs/router-cookbook.md) · [Flows](docs/flows/) · [Glossary](GLOSSARY.md) · [Security](SECURITY.md) · [Contributing](CONTRIBUTING.md) · [Lessons](LEARNINGS.md) · [CLAUDE.md](CLAUDE.md) (runbook)
 
-> **First time here?** Start with [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — system overview, diagrams, where every piece fits.  Then pick a [flow trace](docs/flows/) for a concrete walk-through.
+> **First time here?** [`WELCOME.md`](WELCOME.md) is the multi-audience landing page — pick your track (use it / build it / hack it).  If you're an end user, jump straight to [`docs/getting-started-user.md`](docs/getting-started-user.md).
 
 TinkerBox runs on a Radxa Dragon Q6A (Qualcomm QCS6490, ARM64) and provides the
 complete AI pipeline for TinkerClaw devices: speech-to-text, language model

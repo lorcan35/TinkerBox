@@ -25,8 +25,10 @@ jobs:
           # aiosqlite is used by dragon_voice.db but wasn't in requirements.txt.
           pip install aiosqlite
           pip install -r requirements.txt
-          # Test + lint tooling.
-          pip install ruff pytest pytest-asyncio
+          # Test + lint + type-check tooling.  W14-M15 / #51: mypy
+          # gates a curated strict-clean list (see "Type-check" step
+          # below); not all of dragon_voice/ is strict-clean yet.
+          pip install ruff pytest pytest-asyncio mypy
 
       - name: Lint (ruff — real-bug gate)
         run: |
@@ -43,6 +45,20 @@ jobs:
           #   BLE001 blind except (~100 hits)       → W14-H13
           ruff check --select F821,F722,F811,F823,B006,B904,E722,B007,RUF006 \
             dragon_voice/ dashboard.py tests/
+
+      - name: Type-check (mypy --strict, curated clean list)
+        run: |
+          # W14-M15 / #51: mypy --strict on a deliberately-narrow set of
+          # files.  Adding a file to this list means it must pass strict
+          # checks today AND every PR that touches it.  Use
+          # --follow-imports=silent so transitive untyped modules don't
+          # fail the gate; the strict invariant only applies to the
+          # NAMED files.  Expand the list as more modules get annotated
+          # — see docs/MYPY-CLEAN-LIST.md for the policy.
+          python -m mypy --strict --follow-imports=silent \
+            dragon_voice/api/__init__.py \
+            dragon_voice/api/utils.py \
+            dragon_voice/api/system.py
 
       - name: Run unit + middleware tests
         env:

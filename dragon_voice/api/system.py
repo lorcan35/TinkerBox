@@ -3,6 +3,7 @@
 import logging
 import os
 import time
+from typing import Any, Callable
 
 from aiohttp import web
 
@@ -15,8 +16,13 @@ logger = logging.getLogger(__name__)
 
 
 class SystemRoutes:
-    def __init__(self, voice_config: VoiceConfig, start_time: float,
-                 get_active_connections: callable, get_db=None) -> None:
+    def __init__(
+        self,
+        voice_config: VoiceConfig,
+        start_time: float,
+        get_active_connections: Callable[[], int],
+        get_db: Any = None,
+    ) -> None:
         self._config = voice_config
         self._start_time = start_time
         self._get_active_connections = get_active_connections
@@ -37,14 +43,14 @@ class SystemRoutes:
         # so system polls from the dashboard don't jitter the event loop.
         import asyncio as _asyncio
 
-        def _read_meminfo():
+        def _read_meminfo() -> str:
             try:
                 with open("/proc/meminfo") as f:
                     return f.read()
             except Exception:
                 return ""
 
-        def _read_loadavg():
+        def _read_loadavg() -> str:
             try:
                 with open("/proc/loadavg") as f:
                     return f.read()
@@ -54,10 +60,12 @@ class SystemRoutes:
         meminfo_raw = await _asyncio.to_thread(_read_meminfo)
         loadavg_raw = await _asyncio.to_thread(_read_loadavg)
 
-        mem = {"total_mb": 0, "used_mb": 0, "available_mb": 0, "percent": 0}
+        mem: dict[str, float] = {
+            "total_mb": 0, "used_mb": 0, "available_mb": 0, "percent": 0,
+        }
         if meminfo_raw:
             try:
-                info = {}
+                info: dict[str, int] = {}
                 for line in meminfo_raw.splitlines():
                     parts = line.split()
                     if len(parts) >= 2:
@@ -71,7 +79,7 @@ class SystemRoutes:
             except Exception:
                 pass
 
-        cpu_percent = 0
+        cpu_percent: float = 0
         if loadavg_raw:
             try:
                 load_1m = float(loadavg_raw.split()[0])
@@ -80,7 +88,7 @@ class SystemRoutes:
             except Exception:
                 pass
 
-        result = {
+        result: dict[str, Any] = {
             "uptime_s": round(uptime_s, 1),
             "cpu_percent": cpu_percent,
             "memory": mem,

@@ -276,7 +276,7 @@ If none of this works, **file an issue** with:
 
 ## A tour of the screens
 
-There are five main screens you'll bounce between. Swipe up from the bottom of any screen to bring up the nav sheet that switches between them.
+There are six main screens plus two important overlays.  Swipe up from the bottom of any screen to bring up the nav sheet that switches between them.
 
 ### Home
 
@@ -313,10 +313,34 @@ Voice notes — long-press the orb on the home screen to start dictation. After 
 ### Settings
 
 <p align="center">
-  <img src="images/settings.jpg" alt="Tab5 settings screen" width="280"/>
+  <img src="images/settings.jpg" alt="Tab5 settings screen with voice mode picker, sliders for daily cap / brightness / volume, quiet hours, network info" width="280"/>
 </p>
 
-Volume, brightness, mic mute, voice mode, daily spend cap, Wi-Fi info, OTA updates, "About". The three dials at the bottom (intelligence / voice / autonomy) are a more granular way to control what mode you're in than the simple Local/Hybrid/Cloud chip.
+Voice mode picker (Local / Hybrid / Cloud / TinkerClaw with the active backend named under each), mic mute, quiet hours start/end sliders, daily spend cap, brightness/volume, auto-rotate toggle, camera rotation dropdown, network status, and storage info further down. This is the one screen where you change anything persistent.
+
+### Files
+
+<p align="center">
+  <img src="images/files.jpg" alt="Tab5 SD card file browser" width="280"/>
+</p>
+
+Browse the SD card. Photos saved from the camera screen (`IMG_NNNN.jpg`), video recordings (`VID_NNNN.MJP`), and offline-queued voice recordings show up here. Tap a JPEG to preview; tap a WAV to play.
+
+### Voice overlay (the orb in action)
+
+<p align="center">
+  <img src="images/voice-thinking.jpg" alt="Tab5 voice overlay — golden orb with breathing rings, 'Thinking.' caption" width="280"/>
+</p>
+
+When you tap the home-screen orb to talk, this overlay takes over. The orb breathes (animated pulsing rings) and the caption updates as the AI moves through states: *Listening* → *Thinking* (shown above) → *Speaking*. Tap the X in the corner to cancel mid-thought; the next tap on the orb starts a fresh turn.
+
+### Mode picker sheet
+
+<p align="center">
+  <img src="images/mode-sheet.jpg" alt="Tab5 mode picker — three dials (Intelligence / Voice / Autonomy), preset shortcuts, resolved mode card" width="280"/>
+</p>
+
+Long-press the mode pill on the home screen to open this. Three orthogonal dials — **Intelligence** (Fast / Balanced / Smart), **Voice** (Local / Neutral / Studio), **Autonomy** (Ask / Agent) — let you fine-tune what mode you're in beyond the simple Local/Hybrid/Cloud picker. The preset row at the bottom is a one-tap shortcut for the most common combos. The "Resolves to" card at the bottom shows what your dial settings translate to (here: *Hybrid · Studio voice · Local brain · ~$0.02 per turn*).
 
 ---
 

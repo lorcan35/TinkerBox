@@ -50,7 +50,7 @@ class MemoryMonitorLoopTests(unittest.TestCase):
     patched ``get_rss_mb`` / ``get_cpu_temp`` + a tiny stub ``server``.
     """
 
-    def _make_server(self, warn=2048, crit=3072):
+    def _make_server(self, warn=3072, crit=4096):
         s = MagicMock()
         s._mem_warn_mb = warn
         s._mem_crit_mb = crit

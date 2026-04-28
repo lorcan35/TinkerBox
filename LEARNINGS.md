@@ -602,7 +602,7 @@ sequentially across the whole file (don't restart per section).
   2. **Pick non-memorized test inputs.**  The prior qwen3:0.6b audit passed on "12 + 7" because the model answered from weights.  The re-benchmark switched to `456 × 789` and three models that "passed" old tests returned wrong numbers (356,664 / 356,184 / 359,964).
   3. **Cross-check tool claims against the memory DB.**  Several models say "I've stored that for you" but `GET /api/v1/memory` shows zero rows.  Verbal-ack ≠ tool-fire.
   4. **Three failure classes to screen against:** *too small* (qwen3 0.6b/1.7b — malformed XML), *too slow* (all 4B models), *fluent hallucinator* (llama3.2:3b, hermes3:3b, phi4-mini — confident chatty answers with zero tool fires).
-- **See also:** `docs/AUDIT.md` → "Local-mode model gauntlet 2026-04-24" section.  W15-OPS-2 in `docs/WAVE-15-PROGRESS.md` for the config-change audit trail.  The P13-eviction fix and `aut_tier` wiring are tracked separately — neither is a model-choice problem.
+- **See also:** `docs/historical/AUDIT-WAVE-14.md` → "Local-mode model gauntlet 2026-04-24" section.  W15-OPS-2 in `docs/WAVE-15-PROGRESS.md` for the config-change audit trail.  The P13-eviction fix and `aut_tier` wiring are tracked separately — neither is a model-choice problem.
 
 ### 79. Tool-call dialect fragmentation: parser was fighting the training prior
 - **Date:** 2026-04-24 (TinkerTab audit round 2/3, same day as #78)
@@ -613,7 +613,7 @@ sequentially across the whole file (don't restart per section).
   1. **When adopting a purpose-built tool-calling fine-tune, accept its native dialect rather than fight its training prior.**  Parsers are cheap; retraining is not.
   2. **Any tool-format change has to be a UNION, not a swap.**  Dialect A models still exist (ministral-3 emits A correctly); legacy must keep working.
   3. **Don't support open-ended tag-name dialects** (LFM2.5-Nova's `<tool_X>{args}</tool_X>` style) — tool names collide with the tag grammar and the disambiguation gets ugly fast.  Better fix is a per-model Jinja template that coerces the output toward a supported shape.
-- **See also:** `docs/AUDIT.md` → "Local-mode gauntlet Round 2 + 3".  The "xLAM + responder" dual-model pipeline is tracked as a future proposal — same parser change unblocks it without further code.
+- **See also:** `docs/historical/AUDIT-WAVE-14.md` → "Local-mode gauntlet Round 2 + 3".  The "xLAM + responder" dual-model pipeline is tracked as a future proposal — same parser change unblocks it without further code.
 
 ### 80. Dual-model local pipeline doesn't fit Dragon's RAM ceiling
 - **Date:** 2026-04-25 (PR #80, dual-model pipeline implementation + bench)

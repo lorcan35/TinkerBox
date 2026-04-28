@@ -64,7 +64,7 @@ Same algorithm in `pipeline.swap_backends`, `pipeline.initialize`, `server.py:22
 **Fix:** Extract `class BackendPool` with `acquire(kind, key, factory) -> (backend, was_new)`.  Eliminates `_pooled_*` flags (pool tracks ownership).
 
 ### S6: Tool registration is open in *intent*, closed in *practice*  (TinkerBox · OCP · M · low)
-[`lifecycle/startup.py:75-204`](../dragon_voice/lifecycle/startup.py#L75) — adding a new tool requires editing 5 places: tool file, ordinal-position registration in startup, CLAUDE.md, the hardcoded `priority_tools` list at [`tools/registry.py:366`](../dragon_voice/tools/registry.py#L366) for small-LLM compact format, and docs/AUDIT.md gauntlet.  Issue #134 was opened just to add ONE name to the priority list.
+[`lifecycle/startup.py:75-204`](../dragon_voice/lifecycle/startup.py#L75) — adding a new tool requires editing 5 places: tool file, ordinal-position registration in startup, CLAUDE.md, the hardcoded `priority_tools` list at [`tools/registry.py:366`](../dragon_voice/tools/registry.py#L366) for small-LLM compact format, and docs/historical/AUDIT-WAVE-14.md gauntlet.  Issue #134 was opened just to add ONE name to the priority list.
 **Fix:** Tool self-registration via discovery loop.  Tools declare `requires: list[str]`; `ToolBootstrap` topo-sorts.  Replace hardcoded priority list with `Tool.priority: int = 50` + filter by `priority >= 70`.
 
 ### S7: SchedulerManager ↔ SurfaceManager coupling leaking through TurnGate  (TinkerBox · SRP+ISP · S · low)

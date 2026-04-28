@@ -80,9 +80,16 @@ class VoiceServer:
         self._purge_task: Optional[asyncio.Task] = None
         self._memory_monitor_task: Optional[asyncio.Task] = None
 
-        # Memory thresholds (MB) — Dragon has 8GB total, Ollama ~1.5GB, TinkerClaw ~300MB
-        self._mem_warn_mb = 2048   # Force GC above this
-        self._mem_crit_mb = 3072   # Restart pipeline above this (after GC)
+        # Memory thresholds (MB) — Dragon has 11 GB total.  Ollama runs in
+        # a separate process and doesn't count toward voice-server RSS.
+        # Post-W15-C01 (STT/TTS/LLM pooled across reconnects), Moonshine's
+        # ~2.5 GB plus Piper + Python steady-state lands the voice server
+        # at ~2.7 GB resident — the prior 2048/3072 thresholds fired warn
+        # constantly and triggered crit-restart on legitimate steady-state
+        # peaks (#29).  Bumped so warn fires above the floor and crit
+        # gives real headroom before the pipeline-restart hammer.
+        self._mem_warn_mb = 3072   # Force GC above this
+        self._mem_crit_mb = 4096   # Restart pipeline above this (after GC)
 
         # Backend names for status page
         self._stt_name = config.stt.backend

@@ -10,6 +10,10 @@ client and a voice command get identical semantics.
 Accepted grammar (RFC C.1):
 
   * Relative duration:    ``5m``, ``2h``, ``1h30m``, ``90s``, ``1d``
+  * Verbose relative:     ``in 5 minutes``, ``8 minutes from now``,
+                          ``30 seconds later`` (#136 — LLMs rarely emit
+                          the compact ``5m`` form; pin the conversational
+                          shapes the tool gets in practice)
   * ISO 8601 absolute:    ``2026-04-26T15:00:00-04:00`` (with TZ)
                           ``2026-04-27T15:00:00`` (resolves in tz=)
   * Natural phrase:       ``today at 17:00``, ``tomorrow at 3pm``
@@ -42,6 +46,22 @@ _NATURAL = re.compile(
     r"^\s*(today|tomorrow)\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*$",
     re.IGNORECASE,
 )
+
+# Verbose relative phrasing the LLM emits in practice (#136).  Either an
+# `in N <unit>` prefix OR an `N <unit> from now` / `N <unit> later`
+# suffix is required — bare `5 minutes` is intentionally rejected
+# because it's ambiguous between "in 5 minutes" and "for 5 minutes".
+_VERBOSE_PREFIX = re.compile(
+    r"^\s*in\s+(\d+)\s+(second|minute|hour|day)s?\s*$",
+    re.IGNORECASE,
+)
+_VERBOSE_SUFFIX = re.compile(
+    r"^\s*(\d+)\s+(second|minute|hour|day)s?\s+(?:from\s+now|later)\s*$",
+    re.IGNORECASE,
+)
+_VERBOSE_UNIT_TO_SECONDS = {
+    "second": 1, "minute": 60, "hour": 3600, "day": 86400,
+}
 
 # 365-day far-future cap (RFC E1)
 _MAX_FUTURE_SECONDS = 365 * 86400
@@ -92,6 +112,12 @@ def parse_when(
         _check_far_future(fire_at, now=now)
         return fire_at
 
+    # ── 1b. Verbose relative ("in 5 minutes", "8 minutes from now") ──
+    fire_at = _try_parse_verbose_relative(s_clean, now=now)
+    if fire_at is not None:
+        _check_far_future(fire_at, now=now)
+        return fire_at
+
     # ── 2. ISO 8601 ─────────────────────────────────────────────────
     fire_at = _try_parse_iso(s_clean, tz=tz)
     if fire_at is not None:
@@ -108,7 +134,7 @@ def parse_when(
 
     raise ValueError(
         f"could not parse 'when': {s!r} — expected '5m', "
-        f"ISO 8601 timestamp, or 'tomorrow at 3pm' shape"
+        f"'in 5 minutes', ISO 8601 timestamp, or 'tomorrow at 3pm' shape"
     )
 
 
@@ -130,6 +156,20 @@ def _try_parse_relative(s: str, *, now: float) -> Optional[float]:
     for value, unit in _DURATION_PART.findall(s):
         total_seconds += int(value) * _UNIT_TO_SECONDS[unit]
     return now + total_seconds
+
+
+def _try_parse_verbose_relative(s: str, *, now: float) -> Optional[float]:
+    """Parse `in 5 minutes` / `8 minutes from now` / `30 seconds later`.
+
+    Returns None if the input doesn't match one of the verbose shapes
+    so the caller can fall through to the next grammar branch.
+    """
+    m = _VERBOSE_PREFIX.match(s) or _VERBOSE_SUFFIX.match(s)
+    if not m:
+        return None
+    value = int(m.group(1))
+    unit = m.group(2).lower()
+    return now + value * _VERBOSE_UNIT_TO_SECONDS[unit]
 
 
 def _try_parse_iso(s: str, *, tz: tzinfo) -> Optional[float]:

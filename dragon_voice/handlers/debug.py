@@ -231,19 +231,37 @@ async def handle_debug_widget_card(request: web.Request, *, surface_mgr) -> web.
     title = data.get("title", "Workshop draft ready")
     body = data.get("body", "Two edits queued from yesterday. Review before 10:30.")
     tone = data.get("tone", "info")
+    # Phase 2 (#70): optional action button.  Pass {"action_label":"View",
+    # "action_event":"audit_open"} to render an amber pill at bottom-right
+    # that fires widget_action(card_id, action_event) on tap.  Backwards-
+    # compat: omitting both leaves the legacy plain-card render unchanged.
+    action_label = data.get("action_label")
+    action_event = data.get("action_event")
+    action = (action_label, action_event) if action_label and action_event else None
     if surface_mgr is None:
         return web.json_response({"error": "surface_mgr not ready"}, status=503)
     count = 0
     for sid, state in _iter_surface_sessions(surface_mgr):
         try:
+            cid = "audit_card_" + sid[:6]
             await state.surface.card(
                 title=title, body=body, tone=tone,
-                skill_id="audit", card_id="audit_card_" + sid[:6],
+                skill_id="audit", card_id=cid, action=action,
             )
+            # Register a default-dismiss handler for the action so the
+            # tap round-trip lands in the surface manager's logger
+            # without needing a real skill behind it.
+            if action:
+                async def _action_handler(event, payload, _sid=sid, _cid=cid):
+                    logger.info(
+                        "audit widget_card action: session=%s card=%s event=%s",
+                        _sid, _cid, event,
+                    )
+                surface_mgr.register_action(sid, cid, _action_handler)
             count += 1
         except Exception as e:
             logger.warning("debug card emit failed for %s: %s", sid, e)
-    return web.json_response({"emitted": count})
+    return web.json_response({"emitted": count, "with_action": bool(action)})
 
 
 async def handle_debug_widget_media(request: web.Request, *, surface_mgr) -> web.Response:

@@ -59,6 +59,25 @@ def _translate_to_ollama_format(message: dict) -> dict:
 logger = logging.getLogger(__name__)
 
 
+# Reasoning-model families on Ollama — these emit a hidden ``<think>``
+# block that Ollama 0.21+ strips into a separate ``thinking`` field
+# before returning content.  With our default ``num_predict`` budget
+# (a few hundred tokens) the entire output is consumed by thinking and
+# the user-visible ``content`` is empty (#84).  Sending ``think: false``
+# makes Ollama skip the reasoning step and emit the answer directly,
+# matching how these models appeared to behave on Ollama < 0.21.
+#
+# Substring match against the lowercased model id covers tag suffixes
+# like ``qwen3:1.7b``, ``qwen3.5:4b``, ``deepseek-r1:7b``, ``qwq:32b``.
+# For non-reasoning models the field is a no-op (Ollama ignores it).
+_REASONING_MODEL_HINTS = ("qwen3", "deepseek-r1", "qwq", "phi4-reasoning")
+
+
+def _is_reasoning_model(model_id: str) -> bool:
+    m = model_id.lower()
+    return any(hint in m for hint in _REASONING_MODEL_HINTS)
+
+
 class OllamaBackend(LLMBackend):
     """LLM backend using Ollama's REST API."""
 
@@ -98,6 +117,13 @@ class OllamaBackend(LLMBackend):
         # back to the class constant for backward compat with anything
         # still poking KEEP_ALIVE directly.
         self._keep_alive = getattr(config, "ollama_keep_alive", "") or self.KEEP_ALIVE
+        # Reasoning models hide their answer behind a <think> block that
+        # Ollama 0.21+ strips into a separate field; with our default
+        # token budget the visible content ends up empty (#84).  Default
+        # those families to think:false so the model goes straight to
+        # the answer.  Non-reasoning models are unaffected (Ollama
+        # ignores the field).
+        self._send_think_false = _is_reasoning_model(self._model)
         self._session: aiohttp.ClientSession | None = None
         self._last_usage: dict = {}
         self._conversation: list[dict] = []
@@ -180,6 +206,8 @@ class OllamaBackend(LLMBackend):
                     "temperature": self._config.temperature,
                 },
             }
+            if self._send_think_false:
+                payload["think"] = False
 
             full_response = []
 
@@ -258,6 +286,8 @@ class OllamaBackend(LLMBackend):
                 "temperature": self._config.temperature,
             },
         }
+        if self._send_think_false:
+            payload["think"] = False
 
         try:
             resp_ctx = self._session.post(

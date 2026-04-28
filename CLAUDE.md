@@ -354,7 +354,7 @@ on-tool-fire) are now fixed.
 The 10 prompts exercise: G1 datetime, G2 calculator (456×789 = 359,784
 — deliberately not a memorized number), G3 store_fact, G4 unit_converter,
 G5 timesense, G6 weather, G7 web_search, G8 recall_facts, G9 system_info,
-G10 quick_poll.  See `docs/AUDIT.md` "Local-mode gauntlet Round 2 + 3"
+G10 quick_poll.  See `docs/historical/AUDIT-WAVE-14.md` "Local-mode gauntlet Round 2 + 3"
 for the full per-prompt matrix and the prior 5-prompt baseline.
 
 | Model | Size | Median latency | Correct-tool fires | User-visible replies | Math correct (G2) | Verdict |
@@ -433,7 +433,7 @@ of model choice.
 | #16 | Session management infrastructure | DONE (sessions.py, db.py) |
 | #17 | Multi-turn conversation engine | DONE (conversation.py, messages.py) |
 | #18 | Unified voice + text input | DONE (server.py handles both voice and text) |
-| #21 | REST API framework | DONE (api/ package, 47 endpoints — see header) |
+| #21 | REST API framework | DONE (api/ package, 53 endpoints — see header) |
 | #19 | Notes feature | DONE (notes/ module wired into server.py, API routes registered) |
 | — | Cloud mode (OpenRouter STT+TTS) | DONE (openrouter_stt.py, openrouter_tts.py, config_update WS command) |
 | — | Dictation mode + post-processing | DONE (dictation in pipeline.py, auto-generated title/summary) |
@@ -445,7 +445,7 @@ of model choice.
 | — | Settings crash fix (WDT) | DONE (f_getfree cached at boot, esp_task_wdt_reset fed between settings sections) |
 | — | Tolerant tool parser | DONE (handles stray `>`, missing `</args>`, small model XML quirks) |
 | — | Response timeout (local mode) | DONE (disabled/5 min for local mode, 35s for cloud mode) |
-| — | Default local LLM | DONE (ministral-3:3b, ~65 s median, 7/10 correct-tool fires post-#74/#76/#77) — switched from qwen3:0.6b on 2026-04-24 after the 11-model re-benchmark, then upgraded again on 2026-04-25 with the 10-prompt gauntlet on the integration branch.  See Local LLM Benchmarks section + `docs/AUDIT.md` "Local-mode gauntlet Round 2 + 3". |
+| — | Default local LLM | DONE (ministral-3:3b, ~65 s median, 7/10 correct-tool fires post-#74/#76/#77) — switched from qwen3:0.6b on 2026-04-24 after the 11-model re-benchmark, then upgraded again on 2026-04-25 with the 10-prompt gauntlet on the integration branch.  See Local LLM Benchmarks section + `docs/historical/AUDIT-WAVE-14.md` "Local-mode gauntlet Round 2 + 3". |
 | — | Rich Media Chat | DONE (MediaPipeline renders code/tables/images as JPEG, MediaStore with 24h cleanup, camera uploads, 44 tests) |
 
 ### Architecture Decisions (from scaffolding research)
@@ -460,7 +460,7 @@ of model choice.
 - **Patterns stolen:** LiveKit ChatContext item model, Vocode Transcript metadata, Pipecat Frame taxonomy, StackFlow lifecycle verbs (create/resume/pause/end).
 
 ### Schema
-See `schema.sql` — 6 tables: devices, sessions, messages, notes, events, config.
+See `schema.sql` — **11 tables**: 6 foundation (devices, sessions, messages, notes, events, config), 3 memory (memory_facts, memory_documents, memory_chunks), and 2 scheduler (scheduled_notifications, notification_queue).
 
 ### Acceptance Tests (must pass before features)
 - Create session → send 5 messages → retrieve full history
@@ -579,7 +579,7 @@ modules take deps explicitly (server handle or specific args), so each
 can be unit-tested without instantiating the full server.
 
 ```
-schema.sql            — Database schema (9 tables: 6 foundation + 3 memory)
+schema.sql            — Database schema (11 tables: 6 foundation + 3 memory + 2 scheduler)
 dashboard.py          — Web dashboard (port 3500, aggregates device state + voice state)
 dragon_voice/         — Voice pipeline package (port 3502)
   __init__.py         — Package init
@@ -613,7 +613,7 @@ dragon_voice/         — Voice pipeline package (port 3502)
     purge.py          — periodic_purge_loop (US-DQ14 message retention) + media_cleanup_loop (W13-H3 mid-sleep cancel fix preserved)
     startup.py        — run_startup(server, app): DB → sessions → memory + tools → surfaces → conversation → REST routes → notes → MCP → periodic tasks
     shutdown.py       — run_shutdown(server, app): cancel+await monitors (W14-M09) → drain pipelines → release backend pool (W15-C01) → close HTTP clients (W14-H12)
-  api/                — Modular REST API package (47 endpoints, counted from code)
+  api/                — Modular REST API package (53 endpoints, counted from code)
     __init__.py       — setup_all_routes() entry point
     utils.py          — Shared helpers (json_error, pagination)
     sessions.py       — Session CRUD + lifecycle routes
@@ -662,10 +662,11 @@ dragon_voice/         — Voice pipeline package (port 3502)
     url_signer.py     — MediaUrlSigner: HMAC-signed + time-bounded /api/media/{id} URLs (W14-H04)
   surfaces/           — Tab5 widget-surface abstraction (widget_live/card/list/chart/media/prompt)
   mcp/                — Model Context Protocol client + bridge
-tests/                — Test suite (112 functions across 14 files in CI named-set; 153 tests
-                        collected when running pytest tests/ directly excluding the audit/
-                        async suite; the test_api_e2e.py CLI runner contributes another 29
-                        live-Dragon scenarios that don't run in CI)
+tests/                — Test suite (69 test_*.py files; **556 tests collected** when
+                        running pytest tests/ directly excluding tests/audit/ which needs
+                        pytest-asyncio; the test_api_e2e.py CLI runner contributes another
+                        29 live-Dragon scenarios that don't run in CI.  Last verified
+                        2026-04-28 post-#187 router catalog refresh.)
   test_api_e2e.py               — 29 live-device tests (local-only, not CI)
   test_e2e_dragon.py            — Dragon end-to-end (local-only, not CI)
   test_auth_middleware.py       — 6 tests for bearer-token gate (CI)
@@ -681,14 +682,27 @@ tests/                — Test suite (112 functions across 14 files in CI named-
   test_media_fd_leak.py, test_foundation.py       — all in CI named set
 docs/
   protocol.md         — WebSocket protocol spec (Tab5 ↔ Dragon)
+  router-cookbook.md  — Multi-model router fleet recipes (#188)
   npu-setup.md        — Qualcomm NPU / QAIRT SDK setup guide
-  AUDIT.md / AUDIT-WAVE-15.md / WAVE-14-PROGRESS.md / WAVE-15-PROGRESS.md
-                      — Wave audit tracking; note that file:line citations for
-                        server.py from before 2026-04-24 pre-date the #65
-                        refactor and may need mapping to the new module paths
+  AUDIT-WAVE-15.md    — Current wave audit (Wave 14 archived; see below)
+  WAVE-15-PROGRESS.md — Per-item checklist for the active Wave 15 sprint
+  PLAN-dual-model-pipeline.md — Dual-model pipeline plan + post-mortem
+  RFC-scheduler.md    — Scheduler/notifications subsystem design
   SKILL_AUTHORING.md  — Skill SDK reference (uses tools/quick_poll_tool.py as example)
+  SOLID-AUDIT.md      — SOLID/structural audit of both repos
+  UX-GAPS.md          — Master UX gap tracker (issue #89)
+  telegram-bot.md     — Telegram bot deployment guide
+  historical/         — Closed waves + superseded audits
+    README.md         — Index of archived docs + why each was moved
+    AUDIT-WAVE-14.md  — Wave 14 audit (closed 2026-04-21)
+    WAVE-14-PROGRESS.md — Wave 14 per-item checklist (all items shipped)
 LEARNINGS.md          — Institutional knowledge (MANDATORY reading)
 ```
+
+Note that file:line citations in any audit doc that pre-dates 2026-04-24
+target the pre-#65 monolithic `server.py`; many of those positions now
+live under `dragon_voice/middleware/`, `dragon_voice/handlers/`, or
+`dragon_voice/lifecycle/`.
 
 **Note on legacy files:** `dragon_server.py` (CDP browser streaming on port 3501) and `udp_streamer.py` (UDP JPEG streaming) were retired on the Tab5 side in #155 ("voice-first is the product").  If copies still exist on a deployed Dragon they're no longer wired up by systemd; the active dashboard now aggregates state from `dragon_voice` directly.
 
@@ -705,7 +719,7 @@ LEARNINGS.md          — Institutional knowledge (MANDATORY reading)
   - `tests/test_media_store.py` — 12 unit tests for MediaStore (disk storage, cleanup, capacity limits)
   - `tests/test_media_pipeline.py` — 29 unit tests for MediaPipeline (code block detection, table rendering, image URL handling, strip logic)
 
-Aggregate pytest run (excluding `tests/audit/` which needs pytest-asyncio): **153 tests collected, 153 passing** (April 2026, post-wave-15 + #79/#85 follow-up).  Verify with `python3 -m pytest tests/ -q --ignore=tests/audit`.  The CI named-set is a tighter subset — 14 files, 112 functions — picked so each can run without a live server; everything else is local-only.
+Aggregate pytest run (excluding `tests/audit/` which needs pytest-asyncio): **556 tests collected, all passing** as of 2026-04-28 (post-#185-#188 multi-model router landing).  Verify with `python3 -m pytest tests/ -q --ignore=tests/audit`.  The CI named-set is a tighter subset of files picked so each can run without a live server; everything else is local-only.
 
 ### Dashboard Debug Tab E2E Suite
 - **55 tests** — runnable from the Debug tab in the dashboard

@@ -471,9 +471,9 @@ See `schema.sql` — **11 tables**: 6 foundation (devices, sessions, messages, n
 - Paginate through old sessions via REST API
 - Dashboard shows live conversation via WebSocket events
 
-## API-First Architecture (52 REST endpoints + 1 WebSocket)
+## API-First Architecture (53 REST endpoints + 1 WebSocket)
 
-_Counted from code: `for f in dragon_voice/api/*.py dragon_voice/notes/api.py; do grep -c 'app.router.add_' "$f"; done | paste -sd+ | bc` → 52 (was 47 before Phase 5 ε1b added the 5 scheduler endpoints).  Drifted from "46" to "52" and back — see wave-14 H23._
+_Counted from code: `for f in dragon_voice/api/*.py dragon_voice/notes/api.py; do grep -c 'app.router.add_' "$f"; done | paste -sd+ | bc` → 53 (was 52 before TT #328 Wave 12 added `/api/v1/agent_log`; was 47 before Phase 5 ε1b added the 5 scheduler endpoints).  Drifted from "46" to "53" — see wave-14 H23 + TT #328 Wave 12._
 
 Dragon is an API-first server. Every capability is accessible via REST so any hardware client can use it.
 
@@ -502,6 +502,7 @@ Dragon is an API-first server. Every capability is accessible via REST so any ha
 | | PUT | `/api/v1/config/{key}` | Set config value |
 | | DELETE | `/api/v1/config/{key}` | Delete config key |
 | **Events** | GET | `/api/v1/events` | List events (filter by type/session/device) |
+| **Agent log** | GET | `/api/v1/agent_log` | Cross-session tool-call activity feed (last 64; populated at `ToolRegistry.execute` chokepoint).  TT #328 Wave 12. |
 | **Media** | POST | `/api/v1/transcribe` | STT: audio bytes → text |
 | | POST | `/api/v1/synthesize` | TTS: text → audio bytes |
 | | POST | `/api/v1/completions` | Direct LLM (stateless, no session) |
@@ -623,6 +624,10 @@ dragon_voice/         — Voice pipeline package (port 3502)
     devices.py        — Device CRUD routes
     config_routes.py  — Config CRUD + delete routes
     events.py         — Events listing with device_id filter
+    agent_log.py      — Cross-session tool-call ring buffer + GET /api/v1/agent_log
+                        (TT #328 Wave 12).  Populated at ToolRegistry.execute
+                        chokepoint so all callers (WS conversations, REST tool
+                        execute, dashboard) feed the same log.
     synthesize.py     — TTS synthesis + STT transcription + OTA routes
     completions.py    — Direct LLM completion (stateless)
     system.py         — System metrics + backend listing
@@ -633,7 +638,11 @@ dragon_voice/         — Voice pipeline package (port 3502)
   tools/              — Tool-calling infrastructure (~15 tools)
     __init__.py       — Exports ToolRegistry, Tool
     base.py           — Tool abstract base class
-    registry.py       — ToolRegistry: register, parse XML markers, execute
+    registry.py       — ToolRegistry: register, parse XML markers, execute.
+                        TT #328 Wave 12: execute() also feeds the agent_log
+                        ring buffer for the /api/v1/agent_log feed.  Single
+                        canonical instrumentation site so REST + WS + dashboard
+                        callers all surface in the same activity log.
     web_search.py     — SearXNG-backed web search (falls back to DuckDuckGo)
     memory_tools.py   — StoreFactTool + RecallFactsTool + ForgetFactTool (G9 confirm-gated)
     datetime_tool.py  — Current date/time tool

@@ -471,9 +471,13 @@ See `schema.sql` — **11 tables**: 6 foundation (devices, sessions, messages, n
 - Paginate through old sessions via REST API
 - Dashboard shows live conversation via WebSocket events
 
-## API-First Architecture (53 REST endpoints + 1 WebSocket)
+## API-First Architecture (54 REST endpoints + 1 WebSocket)
 
-_Counted from code: `for f in dragon_voice/api/*.py dragon_voice/notes/api.py; do grep -c 'app.router.add_' "$f"; done | paste -sd+ | bc` → 53 (was 52 before TT #328 Wave 12 added `/api/v1/agent_log`; was 47 before Phase 5 ε1b added the 5 scheduler endpoints).  Drifted from "46" to "53" — see wave-14 H23 + TT #328 Wave 12._
+_Counted from code via per-file grep:
+`for f in dragon_voice/api/*.py dragon_voice/notes/api.py; do grep -c 'app.router.add_' "$f"; done` → 54 total
+(53 was the count before #178 added `/api/video/inject` for the Phase 3B downlink debug injector;
+52 before TT #328 Wave 12 added `/api/v1/agent_log`; 47 before Phase 5 ε1b added the 5 scheduler
+endpoints).  Drifted from "46" to "54" — see wave-14 H23 + TT #328 Wave 12 + #178._
 
 Dragon is an API-first server. Every capability is accessible via REST so any hardware client can use it.
 
@@ -576,10 +580,12 @@ Refactor note (umbrella #65, closed 2026-04-24): the 2,747-LOC monolithic
 `server.py` was decomposed into four sibling packages — `middleware/`
 (request-filter concerns), `handlers/` (diagnostic + status + config
 endpoints), `lifecycle/` (boot/shutdown/monitors), and the slimmed
-`server.py` itself (now 1,803 LOC — holds the `VoiceServer` class +
-`create_app` wiring + the big WS-voice-handler family).  The extracted
-modules take deps explicitly (server handle or specific args), so each
-can be unit-tested without instantiating the full server.
+`server.py` itself (was 1,803 LOC right after the decomposition; has
+since regrown to ~2,720 LOC as Phase 1-3 UX-gap fixes + the multi-
+model router + Wave 12 agent_log instrumentation accreted to the
+core WS handler family).  The extracted modules take deps explicitly
+(server handle or specific args), so each can be unit-tested without
+instantiating the full server.
 
 ```
 schema.sql            — Database schema (11 tables: 6 foundation + 3 memory + 2 scheduler)
@@ -589,7 +595,9 @@ dragon_voice/         — Voice pipeline package (port 3502)
   __main__.py         — Entry point: python3 -m dragon_voice
   server.py           — VoiceServer class + create_app wiring + WS-voice handler family
                         (register / text / user_media / disconnect / audio + event hooks).
-                        1,803 LOC after #65 decomposition.
+                        ~2,720 LOC (was 1,803 right after #65 decomposition; regrown as
+                        Phase 1-3 UX-gap fixes + multi-model router accreted to the
+                        WS-voice handler family).
   pipeline.py         — STT→LLM→TTS orchestration with VAD + dictation + post-processing
   conversation.py     — Multi-turn ConversationEngine with tool-calling + memory-augmented context
   sessions.py         — SessionManager (create/resume/pause/end lifecycle)
@@ -671,6 +679,13 @@ dragon_voice/         — Voice pipeline package (port 3502)
     store.py          — MediaStore: disk-backed media file storage, 24h auto-cleanup, 500MB max
     pipeline.py       — MediaPipeline: detects code/tables/image URLs in LLM output, renders JPEG via Pygments/Pillow
     url_signer.py     — MediaUrlSigner: HMAC-signed + time-bounded /api/media/{id} URLs (W14-H04)
+  scheduler/          — Phase 5 async push: in-process scheduler + sqlite-backed
+                        notification store.  See docs/RFC-scheduler.md.
+    manager.py        — SchedulerManager (RUNAWAY_CAP_PER_DEVICE guards) + REST glue
+    models.py         — Notification dataclass
+    parser.py         — `parse_when` natural-language time parser
+    store.py          — InMemoryNotificationStore + SqliteNotificationStore
+                        (boot replay + offline queue + snooze; ε2 PR #132)
   surfaces/           — Tab5 widget-surface abstraction (widget_live/card/list/chart/media/prompt)
   mcp/                — Model Context Protocol client + bridge
 tests/                — Test suite (69 test_*.py files; **556 tests collected** when

@@ -89,11 +89,32 @@ class ToolRegistry:
         if not tool:
             return {"error": f"Tool '{name}' not found"}
 
+        # Wave 12 — record on the cross-session agent log here so
+        # the feed captures every invocation: WS conversations,
+        # direct REST `/api/v1/tools/.../execute`, and dashboard
+        # triggers all funnel through this method.  Wrapped in
+        # try/except so an instrumentation failure never breaks a
+        # live tool call.
+        try:
+            from dragon_voice.api.agent_log import (
+                record_call as _agent_log_call,
+            )
+            _agent_log_call(name, args)
+        except Exception:  # noqa: BLE001
+            logger.debug("agent_log record_call suppressed", exc_info=True)
+
         t0 = time.monotonic()
         try:
             result = await tool.execute(args)
             execution_ms = (time.monotonic() - t0) * 1000
             logger.info("Tool %s executed in %.0fms", name, execution_ms)
+            try:
+                from dragon_voice.api.agent_log import (
+                    record_result as _agent_log_result,
+                )
+                _agent_log_result(name, result, round(execution_ms))
+            except Exception:  # noqa: BLE001
+                logger.debug("agent_log record_result suppressed", exc_info=True)
             return {
                 "tool": name,
                 "result": result,
@@ -101,6 +122,13 @@ class ToolRegistry:
             }
         except Exception as e:
             logger.exception("Tool %s failed", name)
+            try:
+                from dragon_voice.api.agent_log import (
+                    record_result as _agent_log_result,
+                )
+                _agent_log_result(name, {"error": str(e)}, None)
+            except Exception:  # noqa: BLE001
+                logger.debug("agent_log record_result(err) suppressed", exc_info=True)
             return {"tool": name, "error": str(e)}
 
     def parse_tool_calls(self, text: str) -> list[dict]:

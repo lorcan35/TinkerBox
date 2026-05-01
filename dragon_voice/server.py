@@ -1214,6 +1214,11 @@ class VoiceServer:
                     })
                 except Exception:
                     logger.debug("tool_calls_this_turn pre-register suppressed", exc_info=True)
+                # Wave 12 — agent_log recording happens at the
+                # ToolRegistry.execute chokepoint (tools/registry.py)
+                # so it captures every invocation regardless of
+                # caller (WS, REST /tools/{name}/execute, dashboard).
+                # No need to record here.
                 if not ws.closed:
                     # β-arch (issue #123): pair-emit — legacy
                     # `tool_call` for unmodified Tab5 + new
@@ -1269,6 +1274,8 @@ class VoiceServer:
                         tracker.append(result)
                 except Exception:
                     logger.debug("tool_calls_this_turn merge suppressed", exc_info=True)
+                # Wave 12 — agent_log close happens at the
+                # ToolRegistry.execute chokepoint, not here.
                 # v4·D Phase 4c: auto-emit widget_list for web_search results
                 # so the Tab5 home live-slot surfaces the top hits without
                 # the LLM having to orchestrate a widget call itself.

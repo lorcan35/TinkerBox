@@ -13,6 +13,7 @@ from dragon_voice.api.messages import MessageRoutes
 from dragon_voice.api.devices import DeviceRoutes
 from dragon_voice.api.config_routes import ConfigRoutes
 from dragon_voice.api.events import EventRoutes
+from dragon_voice.api.agent_log import AgentLogRoutes
 from dragon_voice.api.media_routes import MediaRoutes
 from dragon_voice.api.synthesize import SynthesizeRoutes
 from dragon_voice.api.completions import CompletionRoutes
@@ -52,6 +53,10 @@ def setup_all_routes(
     DeviceRoutes(db).register(app)
     ConfigRoutes(db).register(app)
     EventRoutes(db).register(app)
+    # Wave 12 — cross-session tool-call activity feed
+    # (populated via dragon_voice.api.agent_log.record_call/result
+    # from the WS voice handler's existing _on_tool_call hooks).
+    AgentLogRoutes().register(app)
 
     # Media endpoints (TTS synthesis, STT transcription, OTA)
     if voice_config:

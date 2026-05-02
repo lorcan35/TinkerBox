@@ -1,267 +1,135 @@
-# SOLID audit — TinkerBox + TinkerTab
+# TinkerBox SOLID Audit — refreshed 2026-05-02
 
-**Status:** open · 42 findings · 3 Critical · 9 High · 19 Medium · 11 Low
-**Tracking:** [TinkerBox#169](https://github.com/lorcan35/TinkerBox/issues/169)
-**Method:** parallel research agents read both codebases (TinkerBox: ~38 Python modules, ~17 KLOC; TinkerTab: ~50 C modules in `main/`, ~25 KLOC) scoring against SRP / OCP / LSP / ISP / DIP with file:line evidence.  Date: 2026-04-26.
+## TL;DR
 
-This is a **map**, not a plan.  Following CLAUDE.md "one concern per PR" and "extract before decompose," each finding becomes either a single PR or a small bundle.  Sequencing is in [§Sequencing](#sequencing) at the bottom.
+The server has **regressed on SRP** since the #65 decomposition: `server.py` has grown from 1,803 LOC (post-split) to 2,719 LOC as WS-voice handlers (text/config/media/disconnect) accreted. The multi-model router (#183–#188, April 2026) is a clean abstraction win, but it **masks a deeper LSP debt** on the 6 existing backends — they declare capabilities via heuristics + the router now depends on declarations being correct, so adding a backend requires auditing all 6 capability detectors. Tool parsing and execution are still tangled (S17 unresolved). Biggest single fix: extract `WsDispatcher` + per-command handler classes from `server.py` before the handlers regrow.
 
 ---
 
-## How to read this doc
+## Status of prior findings (from 2026-04-26 audit)
 
-- IDs `S1…S25` are TinkerBox (server, Python).
-- IDs `T1…T17` are TinkerTab (firmware, C).
-- Severity is about *future-pain delta* — Critical means "this is going to bite hard the next time we touch it"; Low means "would be nice; not bleeding."
-- Effort: S = single PR (≤ 1 day), M = bundle of 2-3 (~3-5 days), L = sprint.
-- Risk: low/medium/high — risk of regression, weighted by recovery cost (firmware `high` is harder to recover from than server `high`).
-
----
-
-## Critical findings
-
-### S1: VoiceServer is still a god-object after #65 split  (TinkerBox · SRP · L · medium)
-**File:** [`dragon_voice/server.py:62-2536`](../dragon_voice/server.py#L62) — 54 instance attrs, ~25 methods.
-**What:** The #65 decomposition extracted middleware/handlers/lifecycle bodies, but the *class* still owns: WS upgrade auth, ngrok keepalive, dashboard reverse-proxy, full WS dispatch (register/text/media/config/cancel), P13 device-eviction, surface registration, scheduler offline-queue replay, per-turn tool-call tracking, hallucination wrapping, TTS resampling, vision multimodal, TC bypass, OpenRouter receipts, hot-swap of `ConversationEngine._llm` private attr, plus 8 thin adapters that just forward to the extracted modules.
-**Concrete pain:**
-- `_handle_text` + `_handle_text_body` is **454 LOC** ([1513-1967](../dragon_voice/server.py#L1513)).
-- `_handle_config_update` is **382 LOC** ([1969-2351](../dragon_voice/server.py#L1969)) and the same logic at [`handlers/config_api.py:34-118`](../dragon_voice/handlers/config_api.py#L34) has **already drifted** (HTTP path doesn't touch `_conversation._llm`, WS path does).
-- Two distinct keepalive tasks (`_ws_keepalive` at 580-639 vs `_ws_keepalive_during_inference` at 371-461).
-**Refactor:** Extract `WsDispatcher` + per-command handler classes (`TextHandler`, `MediaHandler`, `ConfigHandler`, `RegisterHandler`).  `VoiceServer` becomes ~300 LOC of "wire collaborators + run app."
-
-### S2: VoicePipeline owns 5 rotating responsibilities  (TinkerBox · SRP · L · medium)
-**File:** [`dragon_voice/pipeline.py:140-1672`](../dragon_voice/pipeline.py#L140) — 44 instance attrs vs the 7 the docstring implies.
-**What:** Audio buffering+VAD, STT/LLM/TTS orchestration, dictation+post-process, backend pool membership+sig computation, cancellation surface, fallback STT/TTS pre-warm+cache, hot-swap, media-pipeline routing.
-**Concrete pain:**
-- `cancel()` ([494-535](../dragon_voice/pipeline.py#L494)) touches 7 distinct kinds of state; each new "kind of in-flight work" forces parity changes here AND in `swap_backends` AND in `shutdown` AND in `_handle_disconnect`.  The recent B5/B6 audit work explicitly called the cancellation surface "tangled."
-- Pool-identity helpers `_stt_sig`/`_tts_sig`/`_llm_sig` ([101-137](../dragon_voice/pipeline.py#L101)) live here only because there's no `BackendPool` class.
-**Refactor:** Three siblings — `AudioIngestor`, `TurnRunner`, `BackendOrchestrator`.  `VoicePipeline` becomes a 100-LOC composition root.  Bridge: extract pool ownership to a server-side `BackendPool` class first.
-
-### T1: voice.c is 8 modules masquerading as one  (TinkerTab · SRP · L · high)
-**File:** [`main/voice.c`](https://github.com/lorcan35/TinkerTab/blob/main/main/voice.c) — 3,224 LOC, 50+ static globals.
-**What:** Owns transport+reconnect+backoff+auth, mic capture task, TTS playback ring + drain task, JSON dispatch for ~30 message types, dictation FSM + auto-stop VAD, three-tier mode plumbing + budget enforcement, widget_store ingestion (5 widget types), chat-store ingestion (media/card/audio/system), link-health probe + zombie-WiFi escalation + controlled reboot, ngrok fallback.
-**Concrete pain:**
-- `handle_text_message` is one **826-LOC** function dispatching 28 message types (voice.c:700-1526).
-- `voice_lan_probe_task` (voice.c:2316) is a 100+ line zombie-WiFi watchdog that calls `esp_restart()` — has nothing to do with voice but lives here because it shares static globals.
-- Budget enforcement + auto-downgrade live inside the `receipt` handler (voice.c:1054-1093) — pure policy embedded in JSON parser.
-**Refactor:** Carve along ownership lines: `voice_ws.c` (transport), `voice_dispatch.c` (JSON router), `voice_audio.c` (playback), `voice_mic.c` (capture+dictation), `voice_health.c` (probe+escalation), `voice_budget.c` (cap downgrade), `voice.c` residual façade.  6 atomic PRs.  **Risk high** — voice is the device's product; regressions = mic doesn't work.
+| Old finding | Status | Notes |
+|-------------|--------|-------|
+| **S1** VoiceServer god-object post-#65 | REGRESSED | Server.py grew from 1,803 to 2,719 LOC; the #74/#76/#77 WS-voice handler family + #92 agent_log instrumentation + #75 tool-tracking + multimodal media detection all accreted to the same dispatch loop. TurnGate is now at 5/9 SurfaceManager methods + used by scheduler + pipeline + server (S7 extraction still pending). |
+| **S2** VoicePipeline owns 5+ responsibilities | STILL-OPEN | 1,721 LOC still. Cancel surface touches 7 distinct state kinds. Pool-identity helpers live here due to no `BackendPool` class. Pools now exist (W15-C01) but scattered across pipeline + server + router (no unified class). |
+| **S3** STT/TTS/LLM backends feature-detect via `hasattr` | PARTIALLY-RESOLVED | Router (#183–#188) now declares `capabilities: frozenset[Modality]` per backend. BUT: 9 live `hasattr` calls still in pipeline.py (set_session_key, get_last_usage, trim_history, kill_active_procs, clear_history, total_calls). Backends do NOT enforce a uniform contract — optional features are optional. Router depends on capability declarations being correct, but declarations themselves are heuristic-based (ollama substring scan, openrouter static dict, etc.). Adding a 7th backend requires auditing all 6 capability detectors + the router rules. |
+| **S4** Server reaches into ConvEngine._llm private | STILL-OPEN | 6 sites in server.py still directly access `self._conversation._llm` (lines 1384, 1386, 1651, 1652, 2373, 2374). No public `swap_llm()` method — HTTP config path (#65 handlers/config_api.py) still drifts from WS path. |
+| **S5** `swap_backends` policy duplicated 4x | PARTIALLY-RESOLVED | Pipeline.swap_backends is the source of truth now (W15-C01). Server.py config_update uses it (line 2322). handlers/config_api.py still has its own swap logic (lines 80–99) that predates the W15-C01 unified path — will drift. |
+| **S6** Tool registration open in intent, closed in practice | STILL-OPEN | startup.py has 5 edit sites for a new tool. Priority list hardcoded at tools/registry.py:366 (added in #79). No topology sort; self-registration not implemented. |
+| **S7** SchedulerManager ↔ SurfaceManager coupling via TurnGate | STILL-OPEN | TurnGate (mark_turn_start/mark_turn_end + deferred_emits queue) is 50/213 LOC in SurfaceManager, has 4+ callers (scheduler + pipeline + server text path + server cancel handler). Still embedded in SurfaceManager; still not extracted. |
+| **S8** _format_compact/_format_full violate OCP | STILL-OPEN | 439 LOC in tools/registry.py, hardcoded priority list + XML/FC format. Pre-router this was "nice to fix"; post-#183 router, the formatter needs to be fed the `ModelSpec.capabilities` so router can tell the LLM what format variants it understands. Currently one-way: tools/registry broadcasts one format regardless of consumer. |
+| **S9** LLMConfig god-config (mode-shaped fields per backend) | STILL-OPEN | Single LLMConfig carries ollama_*/openrouter_*/lmstudio_*/tinkerclaw_*/dual_* fields. Router added `fleet: list[ModelSpec]` but didn't deprecate the single-backend fields — both paths coexist, confusing the config shape. |
+| **S10** LLMBackend.generate_stream_with_messages default pretends-to-format | PARTIALLY-RESOLVED | Ollama now overrides with full OpenAI->Ollama multimodal translation (#186). But lmstudio still uses the base default-impl which silently degrades `/chat/completions` to single-prompt formatting. |
+| **S11** API *Routes classes uniform but duplicate constructor injection | STILL-OPEN | 11 `*Routes` classes, all `__init__(db, session_mgr, message_store, ...)`. No instance state. Plain functions would be cleaner; aligns with "no speculative abstractions" rule. |
+| **S12** STT/TTS backends import `inference_executor` from pipeline.py — DIP inversion | STILL-OPEN | 4 sites still do `from dragon_voice.pipeline import inference_executor`. This is a shared thread pool; should live in a top-level `dragon_voice/runtime/executors.py`. Blocks STT/TTS import path from pulling in db + llm registry + memory (15s test startup cost). |
+| **S13** Hallucination-cleaning regexes scattered across 5 modules | STILL-OPEN | `_HALLUCINATION_STOPS`, `_TOOL_MARKUP_RE`, `looks_like_useful_text` (twice — server.py:1706 + dual.py:55). dual.py has explicit TODO referencing #79 which has landed but the extraction hasn't. These helpers are now also used by tools/response_wrap.py (#79). |
+| **S14** ConversationEngine ctor takes 5 concrete deps, half-DIP | STILL-OPEN | No protocols. Duplication: `is_local = backend in ("ollama", ...)` at lines 267, 285. Router-era would benefit from `LLMBackend.kind: Literal["local","cloud","gateway"]`. |
+| **S15** _handle_text_body + _process_utterance duplicate empty-reply guard | PARTIALLY-RESOLVED | #79 (tools/response_wrap.py) extracted `synthesize_wrap()` + `looks_like_useful_text()` as common helpers. But the guard is still re-implemented in server.py:1720–1740 (TC text path), server.py WS-voice path (for dictation), and likely in pipeline.py vision path. Not unified. |
+| **S16** Receipt emission coded thrice with subtle drift | STILL-OPEN | Voice path, text path, TC bypass path still hand-build receipts. Field-set drift continues to cause dashboard billing mismatches (per-turn view). No ReceiptEmitter class. |
+| **S17** tools/registry.py mixes registry + parser + formatter | STILL-OPEN | 439 LOC. Parser now has error-surfacing (γ2-M1, tools/registry.py:155). But extraction hasn't happened. Tools/response_wrap.py is new (from #79) but doesn't consolidate the helpers. |
+| **S18** lifecycle/startup.run_startup mutates ~20 attrs on server | STILL-OPEN | Free function reaches into 20+ attrs by name. Startup-define-time mutations are still silent; rename `_session_mgr` and startup still runs. No `ServerComponents` dataclass. |
+| **S19** Database is monolithic (40+ methods, no domain split) | STILL-OPEN | 844 LOC. Every test touching DB imports all of db.py (~15 s including aiosqlite + sqlite-vec). No domain repos (DeviceRepo, SessionRepo, MessageRepo, etc.). |
+| **S20** Mode-aware logic ("voice_mode 0/1/2/3") scattered across 6+ sites | STILL-OPEN | Each mode is a tuple of (stt_backend, tts_backend, llm_backend_resolver, system_prompt, max_tokens, timeout_s, fallback_to). Mode logic hardcoded in server.py:2147–2189 (config_update handler) + pipeline.py + router.py. No `VoiceMode` dataclass + `ModeRegistry`. Adding voice_mode 4 = 6 lockstep edits. |
 
 ---
 
-## High findings
+## New findings, ranked by severity
 
-### S3: STT/TTS/LLM backends violate LSP — feature-detect with `hasattr`  (TinkerBox · LSP+ISP · M · low)
-Backends differ by side-effect.  Callers reach via `hasattr` ≥ 14 sites in pipeline+server.  Adding a new backend silently misses receipts/trim/session-key.
-**Fix:** Capability `Protocol` mixins (`SupportsUsage`, `SupportsHistoryTrim`, `SupportsSessionKey`, `SupportsKill`).  `isinstance` instead of `hasattr` → type-checker catches regressions.  Universal hooks (`get_last_usage`) get no-op base defaults so callsites become unconditional.
-**Verifiable bug today:** dual + tinkerclaw users get receipts with `model="llm"` instead of the real backend name because `get_last_usage` is missing.
+### F1 [P0] — Router enables backend capability mismatch (LSP violation chain)
+**Principle:** LSP, OCP
+**Where:** dragon_voice/llm/router.py:choose() + base.py:capabilities + all 6 backend implementations (ollama_llm.py, openrouter_llm.py, lmstudio_llm.py, npu_genie.py, tinkerclaw_llm.py, dual.py)
+**Smell:** Router (#183–#188) declares `ModelSpec.capabilities: frozenset[Modality]` and routes based on subset checks (router.py:choose() at ~line 200). But capability declarations are heuristic-based (ollama: model_id substring scan for `minicpm-v`, `llava`, `moondream`, etc.; openrouter: static `_OPENROUTER_CAPS` registry). When a new backend is added (e.g., a 7th LLM backend), the router rules in TIER_FOR_MODE don't change, BUT all 6 existing backends' capability declarations must be audited. Adding lmstudio, the only way to know its vision+video capability is to scan source code (no registration). If capabilities drift (e.g., a new Ollama model released that's vision-capable but not in the substring list), the router silently gates it. Openrouter caps are manually synced (last sync 2026-04-27 per CLAUDE.md); out-of-date by definition.
+**Consequence:** Silent capability gaps. A router-fed multimodal turn might pick a text-only model when a vision-capable one is available. A new backend might be added with incorrect capability declarations, failing on real-world usage. The router's correctness depends on 6 independent heuristics staying synchronized.
+**Suggested fix:** (1-PR bundle, 1 day) Create `dragon_voice/llm/capability_registry.py` that centralizes all capability detectors. Each backend registers a `declare_capabilities(model_id, backend_name) -> frozenset[Modality]` function instead of embedding the logic inline. Router calls this at spec-parsing time, not model-load time. Ollamacaps function does the substring scan; openrouter function looks up the static dict; lmstudio function returns the same set for all models (text-only for now). When adding a new backend, CapabilityRegistry must be updated explicitly — a central audit point.
 
-### S4: Server reaches into `ConversationEngine._llm` + `_llm_config` private state  (TinkerBox · encapsulation+DIP · S · low)
-[`server.py:1562-1563, 2249, 2260, 2268`](../dragon_voice/server.py#L2249).  The HTTP `/api/config` swap path doesn't do the conversation-engine swap, so HTTP updates pipeline but leaves text/REST chat on the old LLM.
-**Fix:** Add `ConversationEngine.swap_llm(new_config, *, pool)`; both swap callsites use it.  Eliminates the drift between WS and HTTP paths.
+### F2 [P0] — WS-voice handler family regrew; SRP violated
+**Principle:** SRP
+**Where:** dragon_voice/server.py:1602–2500+ (main dispatch loop + _handle_text + _handle_text_body + _handle_config_update + _handle_user_media + _handle_disconnect + _handle_cancel + media detection + tool tracking + receipt emission)
+**Smell:** Post-#65 decomposition, the 2,400-LOC WS handler family was supposed to be extracted but instead accreted. _handle_text_body (lines 1642–1967, 326 LOC) + _handle_config_update (lines 2074–2361, 288 LOC) handle: WS keepalive during inference (TinkerClaw path + voice path + vision path), empty-reply guard synthesis, tool-call tracking per-turn (for wrap fallback), media detection + rendering, receipt emission, LLM swap race conditions (TC bypass uses ConvEngine._llm not pipeline._llm), TTS audio resampling, vision multimodal content, and pipeline drain-on-cancel. The dispatch loop (lines 870–1000) threads through all 5 handler invocations with shared conn_state dict — changes to one path require updating all 5.
+**Consequence:** (1) Testing handlers in isolation requires mocking the entire VoiceServer. (2) Adding a new WS command type requires editing the dispatch loop + understanding 5 existing handlers' state-threading patterns. (3) Tool-tracking, empty-reply, receipt emission are re-implemented differently in text path vs voice path vs TC bypass path — bugs in one don't get caught in another.
+**Suggested fix:** (3-PR bundle, 2 days) Extract `WsDispatcher` class holding the command routing table. Per-command handler classes (`TextHandler(db, conv_engine, message_store, tool_registry, media_pipeline)`, `ConfigHandler`, `MediaHandler`, etc.). Dispatch becomes `await handler.handle(ws, conn_state, cmd)`. Immediate side effect: handlers become testable in isolation. Longer term: tool-tracking + receipt + media detection become centralized (see S15/S16).
 
-### S5: `swap_backends` policy is duplicated 4 times  (TinkerBox · OCP+DRY · M · medium)
-Same algorithm in `pipeline.swap_backends`, `pipeline.initialize`, `server.py:2243-2272` (ConvEngine LLM swap), and `handlers/config_api.py:80-99` (HTTP path that *misses* the ConvEngine swap).
-**Fix:** Extract `class BackendPool` with `acquire(kind, key, factory) -> (backend, was_new)`.  Eliminates `_pooled_*` flags (pool tracks ownership).
+### F3 [P1] — Server directly accesses ConversationEngine._llm; encapsulation broken
+**Principle:** Encapsulation, DIP
+**Where:** dragon_voice/server.py:1384, 1386, 1651, 1652, 2324–2326, 2373–2405 (6 sites directly access `self._conversation._llm` or `pipeline._llm`)
+**Smell:** TinkerClaw text bypass (lines 1651–1740) directly calls `llm.generate_stream_with_messages()` by fetching `self._conversation._llm`. Config swap (lines 2373–2405) directly assigns `self._conversation._llm = new_llm`. Fleet summary display (lines 1384–1386) checks `isinstance(self._conversation._llm, CapabilityAwareRouter)`. These bypass ConversationEngine's public interface — no method to swap LLM or query the current backend. HTTP config swap path (handlers/config_api.py:80–99) has its own logic that doesn't call ConversationEngine. Result: WS config_update updates both paths; HTTP config_update updates only pipeline, leaving ConversationEngine on the old backend.
+**Consequence:** WS text turns use a different LLM than REST /api/sessions/{id}/chat turns after a mode swap. Session context stored with one backend's tokens is answered by another backend in a later turn.
+**Suggested fix:** (1 PR, <1 day) Add `ConversationEngine.swap_llm(new_config, *, pool) -> None` method. Both WS path and HTTP path call it. Remove all direct `_llm` assignments from server.py.
 
-### S6: Tool registration is open in *intent*, closed in *practice*  (TinkerBox · OCP · M · low)
-[`lifecycle/startup.py:75-204`](../dragon_voice/lifecycle/startup.py#L75) — adding a new tool requires editing 5 places: tool file, ordinal-position registration in startup, CLAUDE.md, the hardcoded `priority_tools` list at [`tools/registry.py:366`](../dragon_voice/tools/registry.py#L366) for small-LLM compact format, and docs/historical/AUDIT-WAVE-14.md gauntlet.  Issue #134 was opened just to add ONE name to the priority list.
-**Fix:** Tool self-registration via discovery loop.  Tools declare `requires: list[str]`; `ToolBootstrap` topo-sorts.  Replace hardcoded priority list with `Tool.priority: int = 50` + filter by `priority >= 70`.
+### F4 [P1] — Tool parsing and execution are tangled; error handling incomplete
+**Principle:** SRP, OCP
+**Where:** dragon_voice/tools/registry.py:134–380 (parsing + execution + optional error surfacing)
+**Smell:** `parse_tool_calls()` (line 134) silently swallows JSON errors for backward compat. `parse_tool_calls_with_errors()` (line 155) surfaces them. Callers must choose which to use. Execution path (registry.py:86) calls `_agent_log_call()` (new in #92 Wave 12) but errors during `tool_args_invalid` are caught and logged locally, not fed to agent_log. Parser supports 3 dialects (legacy, standard, bracketed-name) inline with tolerance heuristics — a parser fix (e.g., improving brace-walk logic) forces re-running formatter tests. `tools/response_wrap.py` (from #79) synthesizes natural-language wraps for empty-reply cases but is only called from server.py text path, not from voice path or TC bypass. The three places that handle empty replies (server.py:1700–1740 TC path, server.py WS-voice path dictation, pipeline.py vision path) each have different wrap logic.
+**Consequence:** Tool parse errors are either silent (backward-compat path) or surfaced (error path) depending on which method the caller invokes. Adding a new tool XML dialect requires editing parser + formatter + tolerance heuristics in one file. Empty-reply handling diverges across three paths.
+**Suggested fix:** (2-PR bundle, 2 days) (1) Split tools/registry.py into registry.py (dict only) + parser.py (all 3 dialects, error surfacing, brace-walk) + formatter.py (compact + full + strategy for router-aware format). (2) Extract all empty-reply guards into a unified `ReplyFinalizer` class in `dragon_voice/text_utils.py` alongside hallucination-cleaning helpers (S13).
 
-### S7: SchedulerManager ↔ SurfaceManager coupling leaking through TurnGate  (TinkerBox · SRP+ISP · S · low)
-The TurnGate (5 of 9 SurfaceManager methods, ~80 of 213 LOC) is bolted onto SurfaceManager because both need `session_id` as a key, but it's a cross-cutting concurrency primitive about session-level back-pressure on out-of-band emits — *not* about Tab5 surface ownership.  Already has 4 callers (scheduler + pipeline voice path + server text path + server cancel handler) — more than the rest of SurfaceManager combined.  **Youngest coupling, easiest to clean before it grows.**
-**Fix:** Extract `class TurnGate` separately.  SurfaceManager embeds one; SchedulerManager + Pipeline + Server inject it directly.
+### F5 [P1] — Capabilities declared but not enforced; backends can silently lack features
+**Principle:** ISP, LSP
+**Where:** dragon_voice/llm/base.py:25–95 (LLMBackend ABC) + all 6 backends
+**Smell:** `LLMBackend` ABC declares `generate_stream()` and `async def generate_stream_with_messages()` (default impl). 9 live `hasattr` calls in pipeline.py + server.py check for optional features: `set_session_key`, `get_last_usage`, `trim_history`, `kill_active_procs`, `clear_history`, `total_calls`. New backends can omit these without type-checker catching it. `OpenRouterBackend.get_last_usage()` is called from pipeline.py:1198 unconditionally (after the hasattr check). TinkerClaw usage is checked but Dual backend doesn't declare it. Concrete bug: dual + tinkerclaw users get receipts with `model="llm"` instead of the real backend name because `get_last_usage` is missing (cited in prior audit as S3).
+**Consequence:** Backend authors don't know which optional features must be implemented. Callers must sprinkle `hasattr` checks everywhere. Adding a new feature (e.g., `get_context_size()`) requires auditing all backends + all call sites.
+**Suggested fix:** (1 PR, 1 day) Create capability Protocol mixins: `SupportsUsage`, `SupportsHistoryTrim`, `SupportsSessionKey`, `SupportsKill`. Make each optional-feature-dependent method check `isinstance(backend, SupportsUsage)` instead of `hasattr(backend, 'get_last_usage')`. Backends that don't implement a mixin get a type-checker error at ctor time. Callsites become unconditional (the backend was already checked at construction).
 
-### T2: handle_text_message dispatch is a 28-arm if/else  (TinkerTab · OCP · M · medium)
-[`voice.c:700-1526`](https://github.com/lorcan35/TinkerTab/blob/main/main/voice.c#L700) — five `widget_*` arms have ~217 LOC of near-duplication.
-**Fix:** `static const struct {const char *type; ws_msg_handler_t fn;} HANDLERS[]` table.  Factor `widget_from_cjson_common(root, &w)` helper.
+### F6 [P1] — pipeline.swap_backends duplication; HTTP config path still drifts
+**Principle:** DRY, OCP
+**Where:** dragon_voice/pipeline.py:1557 (source of truth) vs dragon_voice/handlers/config_api.py:80–99 (pre-#65 HTTP path)
+**Smell:** WS config_update handler (server.py:2322) calls `await pipeline.swap_backends(conn_config)` (W15-C01 unified). HTTP config path (handlers/config_api.py:80–99) still has its own swap logic checking `config.llm.backend != old_config.llm.backend` + manually calling `create_stt`, `create_tts`, `create_llm`. If a swap edge case is fixed in pipeline.swap_backends (e.g., a new `_pooled_stt` guard), the HTTP path doesn't benefit. When the API was refactored (#65), the HTTP path was supposed to be aligned; it still uses the old pattern.
+**Consequence:** WS and HTTP config_update follow different code paths. A regression in one doesn't appear in the other. New backends or swap scenarios are fixed in one path, leaving the other broken.
+**Suggested fix:** (0.5 PR, <1 day) Replace the HTTP config path (handlers/config_api.py:80–99) with a call to `pipeline.swap_backends()` if the pipeline exists, same as WS does. No duplication. Any future swap fix benefits both paths.
 
-### T3: debug_server.c handler dispatch is data-but-not-data  (TinkerTab · OCP · S · low)
-43 `httpd_register_uri_handler` calls; identical struct literal each.  `max_uri_handlers = 56` stays in sync by hand.  Handler impls separated from registration by 2,700 lines.
-**Fix:** `ENDPOINTS[]` table with `{uri, method, handler, no_auth}` co-located.  Compile-time count.
-
-### T4: 41 handlers each call `check_auth(req)` by hand  (TinkerTab · OCP+SRP · S · low)
-56 `check_auth` call sites.  CORS headers duplicated ~20 times, inconsistently.  Pair with T3 — endpoint table carries `no_auth` bool; dispatch wrapper handles auth + CORS centrally.
-
-### T5: voice.c calls back into the UI directly — DIP inverted  (TinkerTab · DIP · M · medium)
-[`voice.c:24-30`](https://github.com/lorcan35/TinkerTab/blob/main/main/voice.c#L24) includes `ui_voice/notes/chat/core/widget` headers; ~30 ui_*/chat_*/widget_* call-outs from voice.c.  voice.c (lower-level) knows about `ui_chat_push_message`, `widget_store_upsert`, etc.  Local `extern` declarations dodge circular includes — author knew the dependency was wrong way.
-**Why it matters now:** **The desktop SDL2 simulator (CLAUDE.md Phase 2 #1) is blocked on this.**  voice.c can't be exercised in a simulator without the entire LVGL UI tree.
-**Fix:** Define `voice_listener_t` interface in voice.h (`on_state`, `on_chat_text`, `on_chat_media`, `on_widget_upsert`, `on_toast`, `on_session_resume`, etc.); wire in `main.c`; voice.c stops including any ui_*/chat_*/widget header.
-
----
-
-## Medium findings
-
-### S8: `_format_compact` and `_format_full` violate OCP  (TinkerBox · OCP · S · low)
-Tool prompt formatting hardcodes priority list + example tool calls in [`tools/registry.py:355-411`](../dragon_voice/tools/registry.py#L355).  Adding native OpenAI FC support means rewriting both methods.
-**Fix:** Strategy pattern: `class ToolFormatter(Protocol)`, multiple impls (Legacy XML, Compact XML, OpenAI FC, Anthropic ToolUse).
-
-### S9: `LLMConfig` is a god-config (mode-shaped fields per backend)  (TinkerBox · SRP+ISP · M · medium)
-Single `LLMConfig` carries fields for every backend (ollama_*, openrouter_*, lmstudio_*, tinkerclaw_*, dual_*).  `_llm_sig` switches on backend name to know which model field is "the" model.  Adding a backend means widening the config + 4 introspection sites.
-**Fix:** Per-backend dataclass (`OllamaSettings`, `OpenRouterSettings`, etc.).  Each backend ctor takes its own settings type only.
-
-### S10: `LLMBackend.generate_stream_with_messages` default-impl pretends-to-format  (TinkerBox · LSP · S · low)
-Base flattens messages into "System: …\nUser: …\nAssistant:" text and delegates to `generate_stream`.  Plausible for completion-only backends; *silently degrades* `lmstudio_llm` (which actually has `/chat/completions` but never overrode).
-**Fix:** Make `generate_stream_with_messages` abstract too.  Provide opt-in `MessageFormattingMixin` for completion-only backends.
-
-### S11: API `*Routes` classes uniform but duplicate constructor-injection per route  (TinkerBox · ISP · S · low)
-11 `*Routes` classes, all `__init__(db, session_mgr, message_store, conversation=None)`.  `setup_all_routes` is 70 LOC of bespoke wiring with optional-feature guards.  No instance state — classes don't earn their keep.
-**Fix:** Convert to plain functions: `def register_sessions(app, *, db, session_mgr, message_store, conversation)`.  Aligns with "no speculative abstractions" rule.
-
-### S12: STT/TTS backends import `inference_executor` from `pipeline.py` — DIP inversion  (TinkerBox · DIP · S · low)
-4 sites do `from dragon_voice.pipeline import inference_executor` from "lower" layers.  Cold imports slow (transitively pulls db + llm registry + memory + numpy).
-**Fix:** Move `inference_executor` to `dragon_voice/runtime/executors.py`.
-
-### S13: Hallucination-cleaning regexes scattered across 5 modules  (TinkerBox · SRP+DRY · M · medium)
-`_HALLUCINATION_STOPS`, `_TOOL_MARKUP_RE`, `looks_like_useful_text` (twice — server *and* dual.py), `_COT_PREAMBLE_PATTERNS` all do "clean small-LLM output before user."  dual.py has explicit TODO referencing #79 which has landed but the extraction hasn't.
-**Fix:** New `dragon_voice/text_utils.py` owning all of `strip_tool_markup`, `looks_like_useful_text`, `truncate_at_hallucination`, `sanitize_chain_of_thought`.
-
-### S14: `ConversationEngine` ctor takes 5 concrete deps but stores only refs — half-DIP  (TinkerBox · DIP · S · low)
-No protocols.  Duplicated `is_local = backend in ("ollama", ...)` at [conversation.py:267, 285](../dragon_voice/conversation.py#L267).
-**Fix:** Narrow Protocols (`MessageContextSource`, `SessionTouchable`).  Add `LLMBackend.kind: Literal["local","cloud","gateway"]` so `is_local` becomes `llm.kind == "local"` — compile-time error if a new backend forgets.
-
-### S15: `_handle_text_body` and `_process_utterance` duplicate empty-reply guard  (TinkerBox · SRP+DRY · S · low)
-4 implementations of "if reply junk and any tool fired, synthesize wrap; else apology" (TC text + local text + vision + voice).
-**Fix:** `class ReplyFinalizer.finalize(reply_text, tool_calls, *, on_event) -> final_text`.
-
-### S16: Receipt emission coded thrice with subtle drift  (TinkerBox · SRP+DRY · S · low)
-Voice path, text path, TC bypass path all hand-build receipts; field-set drift between them.  Concrete user-visible: per-turn billing dashboard mismatches.
-**Fix:** `class ReceiptEmitter`.
-
-### S17: `tools/registry.py` mixes registry + parser + formatter  (TinkerBox · SRP · S · low)
-411 LOC: ~110 registry, ~200 parser (3 dialects with tolerance heuristics), ~70 formatter.  A parser bug-fix forces formatter test re-runs and vice versa.
-**Fix:** Split into `tools/registry.py` (dict only), `tools/parser.py`, `tools/formatter.py`.
-
-### S18: `lifecycle/startup.run_startup` mutates ~20 attributes on `server`  (TinkerBox · SRP · M · low)
-Free function reaches into 20+ attrs by name.  Renaming `_session_mgr` breaks startup silently — Python doesn't catch attribute mutations at startup-define time.
-**Fix:** `@dataclass class ServerComponents`; `run_startup(config) -> ServerComponents`; `VoiceServer.__init__(config, components)`.
-
-### S19: `Database` is monolithic (40+ methods, no domain split)  (TinkerBox · SRP+ISP · L · medium)
-One `Database` god-object owns devices/sessions/messages/notes/events/config/scheduler tables.  Every test touching any persistence imports all of db.py (~15s including aiosqlite + sqlite-vec).
-**Fix:** Domain repos (`DeviceRepo`, `SessionRepo`, `MessageRepo`, `EventRepo`, `ConfigRepo`, `NotesRepo`).  `Database` becomes connection-pool + schema migrator.
-
-### S20: Mode-aware logic ("voice_mode 0/1/2/3") scattered across 6+ sites  (TinkerBox · OCP · M · medium)
-Each "mode" is a tuple of (stt_backend, tts_backend, llm_backend_resolver, system_prompt, max_tokens, timeout_s, fallback_to) but lives nowhere as a tuple.  Adding voice_mode 4 = lockstep edits.
-**Fix:** `@dataclass class VoiceMode` + `ModeRegistry`.
-
-### T6: service_registry is half-applied — Layer 0 platform init bypasses it entirely  (TinkerTab · DIP · M · medium)
-Only 5 of ~20 subsystems flow through registry.  `service_dragon` is "nearly vestigial" (its own comment).  Boot is a 200-line god-function.
-**Fix:** Wrap remaining subsystems as services.
-
-### T7: `widget_t` is a tagged-union-without-being-one  (TinkerTab · ISP · M · medium)
-Every widget instance carries the union of all 6 type payloads — ~37 KB PSRAM cost across the 32-slot store on payloads only one type at a time uses.  Adding a 7th type requires editing 5 places.
-**Fix:** Actual tagged union + `widget_renderer_t` registry (function-pointer per type).
-
-### T8: chat trio leaks state — ui_chat.c holds streaming state that belongs elsewhere  (TinkerTab · SRP · M · medium)
-"Is the AI streaming?" tracked in two places (ui_chat.c + chat_msg_view).  ~70 LOC of reconciliation logic.  Concrete bug class: `closes #129` two-bubble bug was directly caused by this state distribution.
-**Fix:** chat_msg_store as single source of truth (`begin_stream/append/end_stream`); ui_chat subscribes.
-
-### T10: voice.c writers `strcat` into shared buffers without all readers taking the mutex  (TinkerTab · LSP-style contract · S · low)
-[`voice.h:78-87`](https://github.com/lorcan35/TinkerTab/blob/main/main/voice.h#L78) literally documents the race.  ui_chat.c:379 still uses the unsafe getter.  Reading mid-`strcat` returns garbage.
-**Fix:** Mark legacy getters `__attribute__((deprecated))`; migrate callsites to `_copy` variant; delete deprecated.
-
-### T11: `ui_home.c` (1,729 LOC) does both "home shell" and "widget renderer"  (TinkerTab · SRP · M · medium)
-Adding a new widget type means editing ui_home.  Pairs with T7.
-**Fix:** Extract `widget_render.{c,h}`; per-type rendering in `widget_render_live/list/chart/media/prompt.c`.
-
-### T17: 50+ static globals in voice.c are unstated coupling cost  (TinkerTab · encapsulation · S · low)
-**Prep step for T1.**  Group state into per-concern structs (`voice_ws_state_t`, `voice_audio_state_t`) before splitting.  Makes T1 mechanical instead of archaeological.
+### F7 [P1] — Tool capability declarations heuristic; out-of-date static dicts
+**Principle:** OCP, maintainability
+**Where:** dragon_voice/llm/openrouter_llm.py:_OPENROUTER_CAPS (static dict of 35 models as of 2026-04-27) + all 6 backends' substring/static declarations
+**Smell:** Openrouter backend has a manually-maintained `_OPENROUTER_CAPS` dict with 35 models as of April 27, 2026. If OpenRouter ships a new model (e.g., "openai/gpt-5.5" mentioned in CLAUDE.md), the capabilities aren't declared. Router would treat it as {TEXT, TOOL_CALLING} (default). A similar static `_PRICING_MILS_PER_M` registry exists (also 35 models, matched 1:1). Both are pre-computed at load time; out-of-sync with OpenRouter's live API. Ollama capability detection is model_id substring scan — if a new Llama-vision model is released with a name that doesn't match the hardcoded list, the router won't know it supports vision.
+**Consequence:** New models ship with wrong capability declarations. Router makes incorrect routing decisions. Users don't know why a model they added isn't being picked for a capability it supports.
+**Suggested fix:** (0.5 PR, <1 day) Ollama: query `/api/tags` at startup to auto-detect vision models (check internal `details.models` for capability tags if exposed). OpenRouter: make the static registry a cache that's validated against OpenRouter's live `/models` endpoint on startup. Warn if upstream-present models are missing from the cache. During the wave, assume the manual cache is ground truth; in a follow-up (Wave 16?), wire the live-fetch path.
 
 ---
 
-## Low findings
-
-### S21: `Tool` interface lacks args_schema validator — every tool re-validates ad-hoc  (TinkerBox · ISP · S · low)
-Tools declare `parameters_schema` but registry doesn't validate.  Malformed args land as raw exceptions in `tool_args_invalid` frames — exact thing C1/B7 audits called UX leak.
-**Fix:** ToolRegistry runs jsonschema validation against `parameters_schema` before `execute`.
-
-### S22: `Tab5Surface._safe_send` convention duplicated across emit sites  (TinkerBox · SRP · S · low)
-6 emit methods × ~25 LOC each.  7th widget type = 7th copy.
-**Fix:** Internal `_emit(widget_type, base_msg)` helper.
-
-### S23: `OpenRouterBackend` mixes legacy in-memory history + multi-turn + retry policy  (TinkerBox · SRP · S · low)
-Two histories living in one class.  Bug class: `pipeline._post_process_dictation` uses `generate_stream` (legacy path) for dictation summary — would mutate `self._conversation` shared with future legacy text turn (currently no other legacy callers, but trap waits).
-**Fix:** Drop legacy in-memory history.
-
-### S24: `lifecycle/shutdown.run_shutdown` mirrors startup's god-mutator shape  (TinkerBox · SRP · part of S18 · low)
-Folds into S18's `ServerComponents` extraction.
-
-### S25: `progress_emit.emit_progress_pair` good but call sites all hand-rebuild legacy dicts  (TinkerBox · DRY · S · low)
-**Fix:** Per-event-type helpers (`emit_tool_call`, `emit_tool_result`, `emit_dictation_summary`).
-
-### T9: mode_manager is dead code today  (TinkerTab · SRP · S · low)
-130 LOC for one mutex.  `voice_connect_async` is already idempotent.
-**Fix:** Inline — delete files, move `s_mutex` into voice.c.
-
-### T12: voice.c WS error class hidden through opaque logging  (TinkerTab · ISP · S · low)
-Pair with T5 — `listener.on_ws_error(error_class, detail)`.  Or expose `voice_health_t` with `auth_fail_count`, `handshake_fail_count`, `using_fallback`.
-
-### T13: widget upsert handlers in voice.c violate ISP via local `extern` declarations  (TinkerTab · ISP · S · low)
-6 identical local `extern` blocks ~25 LOC duplicated.  Promote out of function bodies.
-
-### T14: debug_server.c includes 12+ ui_*.h headers it doesn't always use  (TinkerTab · ISP · S · low)
-**Fix:** Extract `ui_navigation.h` ("show this screen by name").
-
-### T15: chat data path split across 5 files with overlapping responsibility  (TinkerTab · SRP · folded into T8 · low)
-
-### T16: `service_*.c` siblings don't honor a uniform contract  (TinkerTab · LSP · S · low)
-`audio_service_stop` mutes the speaker; `dragon_service_stop` is a no-op.  Document the start/stop contract; align.  Pair with T6.
+## Summary table
+| ID | Sev | Principle | Where | Title |
+|----|----|-----------|-------|-------|
+| F1 | P0 | LSP, OCP | llm/router.py + base.py + all 6 backends | Router enables backend capability mismatch via heuristic-based declarations |
+| F2 | P0 | SRP | server.py:1602–2500 | WS-voice handler family regrew post-#65; needs extraction to WsDispatcher |
+| F3 | P1 | Encapsulation, DIP | server.py:1384, 1651, 2324, 2373 | Direct access to ConversationEngine._llm; no public swap method |
+| F4 | P1 | SRP, OCP | tools/registry.py:134–380 | Parsing + execution + formatting tangled; error handling inconsistent |
+| F5 | P1 | ISP, LSP | llm/base.py + all backends | Optional features not enforced; 9 hasattr() calls scattered across call sites |
+| F6 | P1 | DRY, OCP | pipeline.py:1557 vs handlers/config_api.py:80 | HTTP config swap still drifts from unified WS path |
+| F7 | P1 | OCP, maintainability | openrouter_llm.py + ollama_llm.py + all backends | Capability declarations heuristic + out-of-date static dicts |
+| S1 | P0 | SRP | server.py | (REGRESSED) god-object post-#65, grew from 1.8K to 2.7K LOC |
+| S2 | P1 | SRP | pipeline.py:140 | (STILL-OPEN) 5+ responsibilities; cancel touches 7 state kinds |
+| S7 | P1 | SRP, ISP | surfaces/manager.py:92–162 | (STILL-OPEN) TurnGate coupled to SurfaceManager, 4+ callers |
+| S13 | P2 | SRP, DRY | server.py + dual.py + tools/response_wrap.py | (STILL-OPEN) Hallucination/empty-reply regexes scattered across 5 sites |
+| S16 | P2 | SRP, DRY | server.py (3 receipt paths) | (STILL-OPEN) Receipt emission hand-built 3x with field drift |
+| S18 | P1 | SRP | lifecycle/startup.py | (STILL-OPEN) run_startup mutates 20+ server attrs; no ServerComponents dataclass |
+| S19 | P2 | SRP, ISP | db.py:31 | (STILL-OPEN) Monolithic Database; no domain repos; every test imports all 844 LOC |
 
 ---
 
-## What both codebases do well (LEARNINGS-doc fodder)
+## Out-of-scope but worth noting
 
-### Server (TinkerBox)
-- **W1 — `NotificationStore` Protocol is textbook OCP.**  ([scheduler/store.py:34-100](../dragon_voice/scheduler/store.py#L34))  Let `InMemoryNotificationStore` ship in ε1a and `SqliteNotificationStore` slot in for ε2 with **zero changes** to `SchedulerManager`.  Model the rest of the codebase should converge on.
-- **W2 — Backend factory pattern (LLM/STT/TTS) uniform + lazy-imported.**  ImportError on optional deps doesn't take whole package down; adding a backend = one dict entry + new file.
-- **W3 — `error_event` + `Severity`/`Scope` taxonomy.**  Every UX-gap fix walks back to a *consistent* error envelope.  Painful to retrofit; getting it in early was a big win.
-- **W4 — Middleware decomposition into stateless functions.**  Right pattern — S1's recommendation is "do this for handlers too."
+1. **Router vs Dual redundancy (emerging pattern):** `dual.py` (226 LOC, predates router) is now subsumed by router's capability-aware selection. `dual` is still accepted as a backend choice but two backends doing the same job create maintenance debt. Recommendation: in a follow-up wave, deprecate `dual` with a 2-release warning; users can migrate to `router` + 2-model fleet.
 
-### Firmware (TinkerTab)
-- **W5 — `chat_msg_store` SRP is clean.**  Pure C ring with no LVGL/PSRAM/voice imports — narrow API.  Good model to copy.
-- **W6 — `task_worker` + `lv_async_call` discipline well-applied** in voice.c hot paths.  Cross-thread calls hop to the right task.  Hard to add later.
-- **W7 — `widget_store.c` is a model bounded-cache module.**  PSRAM allocation once at boot, no per-widget malloc, eviction observability hooks.  317 LOC, one concern.
-- **W8 — `service_registry` pattern shape is right.**  The problems are how few callers go through it (T6).
+2. **Mode logic scattered:** Voice_mode selection (0=local, 1=hybrid, 2=cloud, 3=tinkerclaw) is hardcoded in server.py:2147–2189 + pipeline.py mode-aware timeouts + router.py TIER_FOR_MODE. No `@dataclass VoiceMode` + registry. Each mode is a tuple of (stt_backend, tts_backend, llm_tier, system_prompt, max_tokens, timeout_s). Adding voice_mode 4 requires edits in 3+ files. (S20 from prior audit, still open.)
 
----
+3. **LLMConfig god-config shape:** Single config carries fields for all backends (ollama_*, openrouter_*, lmstudio_*, tinkerclaw_*, dual_*, router_*). Per-backend dataclass extraction (S9 from prior audit) + router's `fleet` field coexist, confusing the shape. The config schema now has two separate paths: single-backend (legacy) and router fleet (new). Both are valid; users can upgrade gradually, but the grammar is ambiguous.
 
-## Sequencing
+4. **Formatter needs router context:** tools/registry.py `_format_compact()` + `_format_full()` (lines 383–440) hardcode priority list + example tool calls. Post-#183 router, the LLM's capabilities determine what format dialects it can consume. A minimal-context model might only understand legacy XML; a modern FC-trained model might prefer standard dialect. Formatter should query the LLM's declared capabilities (via ModelSpec) and emit the best-matching format. Currently one-way broadcast.
 
-Recommended order (ROI / risk):
+5. **Test import cost:** Database import pulls in aiosqlite + sqlite-vec + schema migration logic. STT/TTS imports pull in inference_executor from pipeline, which transitively imports llm registry + memory service. Every unit test touching persistence or backends pays ~15 s startup. (S12/S19 from prior audit, still open — blocked on executor move + database domain split.)
 
-**Phase 1 — Lowest-risk highest-leverage (1-2 weeks)**
-1. **S7** TurnGate extraction — youngest coupling, easiest to clean before it grows.  ~1 PR.
-2. **T3 + T4** debug_server endpoint table + auth/CORS centralization — 1 bundled PR; unblocks dashboard work.
-3. **S4** `ConversationEngine.swap_llm` — closes WS↔HTTP drift.  ~1 PR.
-4. **S12** `inference_executor` move — kills 4 reverse-imports.  ~1 PR.
-5. **S25** + **S22** progress + surface emit helpers — small DRY wins.
+6. **API Routes as classes:** 11 `*Routes` classes (sessions.py, messages.py, devices.py, etc.) are constructor-injected bundles of functions. No instance state — should be plain functions + a setup_all_routes helper. (S11 from prior audit, still open.)
 
-**Phase 2 — Capability layer + protocol cleanup (2-3 weeks)**
-6. **S3** LLM/STT/TTS capability protocols — eliminates `hasattr` graveyard.  3 PRs (one per capability).
-7. **S5** `BackendPool` extraction — closes "swap policy x4" duplication.  ~1 PR.
-8. **S10** + **S14** narrow protocols + `LLMBackend.kind`.  Pair.
-9. **S13** `text_utils.py` extraction — kills 5-site regex scatter.  ~1 PR.
-10. **T17** voice.c statics → per-concern structs (prep for T1).
-
-**Phase 3 — God-class surgery (multi-sprint)**
-11. **S2** VoicePipeline split into `AudioIngestor` / `TurnRunner` / `BackendOrchestrator`.  3-4 PRs.
-12. **S1** VoiceServer split — `WsDispatcher` + per-command handler classes.  6+ PRs.
-13. **T1** voice.c carve into 6 modules.  6 atomic PRs, line-by-line moves first.
-
-**Phase 4 — Domain reshape (longest tail)**
-14. **S19** `Database` → domain repos.  Multi-PR; touches every persistence consumer.
-15. **S20** + **S9** mode + config reshape.  Schema migration required.
-16. **T7** + **T11** widget renderer registry.
-
-**Opportunistic cleanup (anytime)**
-- S6, S8, S11, S15, S16, S17, S18, S21, S23, S24
-- T9, T13, T14, T16
+7. **Speech output sample-rate tangles:** TTS backends emit different rates (Piper 22050 Hz, OpenRouter 24 kHz). Server.py:1971 unconditionally reads `pipeline._tts.sample_rate` to decide resampling. The resampler lives in server.py (tight coupling); new TTS backends must know to set this attr. Post-#65, this should live in a TTS base interface. (Minor, but a concrete example of LSP drift.)
 
 ---
 
-## How to use this doc
+## Recommendations for the next wave
 
-1. Each **Critical** + **High** finding gets a sub-issue filed under [#169](https://github.com/lorcan35/TinkerBox/issues/169) (TinkerTab findings cross-link to TinkerTab issues).
-2. Refactor PRs reference both the sub-issue and `closes` it; LEARNINGS gets an entry for non-obvious decisions.
-3. Update *this* file as findings ship (move from "open" to "closed", record actual PR # next to each).
+**Immediate (P0, blocks shipping):** F1 (capability registry centralization) + F2 (WS dispatcher extraction).
 
-This audit reflects the codebase as of 2026-04-26.  As individual findings ship, this doc gets stale fast; PRs that close a finding should bump the status line at the top.
+**Short-term (P1, blocks roadmap features):** F3 (ConversationEngine.swap_llm), F4 (tool parsing split), F5 (capability protocols), F6 (HTTP config dedup), F7 (capability declaration automation).
+
+**Long-term (P2, technical debt):** S1 (full server split, paired with F2), S2 (pipeline split into AudioIngestor/TurnRunner/BackendOrchestrator), S7 (TurnGate extraction), S13/S16 (text_utils consolidation).
+
+**Deprecation path:** dual.py + old `backend: "dual"` config → router-fleet alternative documented; 2-release warning before removal.

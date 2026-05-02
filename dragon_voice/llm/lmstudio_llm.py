@@ -135,6 +135,88 @@ class LMStudioBackend(LLMBackend):
                 {"role": "assistant", "content": "".join(full_response)}
             )
 
+    async def generate_stream_with_messages(
+        self, messages: list[dict]
+    ) -> AsyncIterator[str]:
+        """Stream tokens using a full OpenAI-format message list.
+
+        LSP-1 fix (audit 2026-05-03): without this override, LMStudioBackend
+        inherited `LLMBackend.generate_stream_with_messages` which formats
+        messages via `f"{role}: {content}"` and re-routes through
+        `generate_stream(prompt, system_prompt)`.  When the content of a
+        user message is a multimodal array (e.g. `[{"type": "image_url",
+        "image_url": {...}}, {"type": "text", "text": "what is this?"}]`),
+        the f-string materialises the literal Python repr —
+        `"User: [{'type': 'image_url', ...}]"` — and the model sees a
+        string description of the array instead of the actual image.  Net
+        effect: every router-driven vision turn that picked LM Studio
+        silently became text-only with garbled JSON-as-text, and the
+        request still came back with a confident wrong answer.
+
+        LM Studio's `/chat/completions` is OpenAI-compatible natively; it
+        already understands the multimodal content array shape.  This
+        override just hands `messages` straight through.
+
+        Used by ConversationEngine which manages its own DB-backed context.
+        Does NOT touch self._conversation — session isolation is handled
+        by the caller (matches the OpenRouter override at
+        openrouter_llm.py:321).
+        """
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=120, sock_read=60),
+                headers={"Content-Type": "application/json"},
+            )
+
+        payload = {
+            "model": self._model,
+            "messages": messages,
+            "stream": True,
+            "max_tokens": self._config.max_tokens,
+            "temperature": self._config.temperature,
+        }
+
+        async with self._lock:
+            try:
+                async with self._session.post(
+                    f"{self._base_url}/chat/completions",
+                    json=payload,
+                ) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        logger.error(
+                            "LM Studio error %d: %s", resp.status, error_text[:300]
+                        )
+                        yield f"[LM Studio error: {resp.status}]"
+                        return
+
+                    async for line in resp.content:
+                        line = line.decode("utf-8", errors="replace").strip()
+                        if not line or not line.startswith("data: "):
+                            continue
+
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+
+                        try:
+                            chunk = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+
+                        choices = chunk.get("choices", [])
+                        if not choices:
+                            continue
+
+                        delta = choices[0].get("delta", {})
+                        token = delta.get("content", "")
+                        if token:
+                            yield token
+
+            except aiohttp.ClientError as e:
+                logger.error("LM Studio request failed: %s", e)
+                yield f"[Connection error: {e}]"
+
     def clear_history(self) -> None:
         """Clear conversation history."""
         self._conversation.clear()

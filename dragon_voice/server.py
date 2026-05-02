@@ -1651,7 +1651,9 @@ class VoiceServer:
         if conn_cfg and conn_cfg.llm.backend == "tinkerclaw" and self._conversation and self._conversation._llm:
             llm = self._conversation._llm
             logger.info("_handle_text TinkerClaw bypass via ConvEngine LLM: %s", llm.name)
-            if hasattr(llm, 'set_session_key'):
+            # Wave 21b (#204): isinstance(SupportsSessionKey) over hasattr.
+            from dragon_voice.llm.base import SupportsSessionKey
+            if isinstance(llm, SupportsSessionKey):
                 llm.set_session_key(conn_state.get("session_id", ""))
 
             # Send a "thinking" indicator immediately to keep the WS alive.
@@ -2029,7 +2031,11 @@ class VoiceServer:
             try:
                 convo = conn_state.get("conversation") or self._conversation
                 cur_llm = getattr(convo, "_llm", None)
-                if cur_llm is not None and hasattr(cur_llm, "get_last_usage"):
+                # Wave 21b (#204): isinstance(SupportsUsage) over hasattr —
+                # closes the "model='llm'" silent fallback for backends like
+                # `dual` and `tinkerclaw` that lacked get_last_usage entirely.
+                from dragon_voice.llm.base import SupportsUsage
+                if cur_llm is not None and isinstance(cur_llm, SupportsUsage):
                     usage = cur_llm.get_last_usage()
                     if usage and usage.get("total_tokens"):
                         from dragon_voice.llm.openrouter_llm import price_for_model
@@ -2320,11 +2326,15 @@ class VoiceServer:
                     # swap_backends() now handles cancel internally
                     # and sets _swapping flag to drop audio during swap
                     await pipeline.swap_backends(conn_config)
-                    # Inject session key for TinkerClaw conversation continuity
-                    if llm_be == "tinkerclaw" and hasattr(pipeline, '_llm'):
-                        if hasattr(pipeline._llm, 'set_session_key'):
-                            pipeline._llm.set_session_key(
-                                conn_state.get("session_id", ""))
+                    # Inject session key for TinkerClaw conversation continuity.
+                    # Wave 21b (#204): isinstance(SupportsSessionKey) over hasattr.
+                    # `pipeline._llm` is a private attribute on Pipeline; the
+                    # getattr-with-None still guards the rare case where swap
+                    # leaves it unset.
+                    from dragon_voice.llm.base import SupportsSessionKey
+                    pipe_llm = getattr(pipeline, "_llm", None)
+                    if llm_be == "tinkerclaw" and isinstance(pipe_llm, SupportsSessionKey):
+                        pipe_llm.set_session_key(conn_state.get("session_id", ""))
                 except DragonError as de:
                     # Already a γ-arch structured error — emit verbatim.
                     logger.warning("Backend swap failed (DragonError): %s", de.message)

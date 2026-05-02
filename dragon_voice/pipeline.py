@@ -23,6 +23,12 @@ from dragon_voice.progress_emit import emit_progress_pair
 from dragon_voice.stt import create_stt, STTBackend
 from dragon_voice.tts import create_tts, TTSBackend
 from dragon_voice.llm import create_llm, LLMBackend
+from dragon_voice.llm.base import (
+    SupportsClearHistory,
+    SupportsHistoryTrim,
+    SupportsSessionKey,
+    SupportsUsage,
+)
 from dragon_voice.audio import resample_pcm16_async
 from dragon_voice.tools.response_wrap import looks_like_useful_text, synthesize_wrap
 
@@ -961,7 +967,8 @@ class VoicePipeline:
             if self._config.llm.backend == "tinkerclaw":
                 # TinkerClaw mode: bypass ConversationEngine entirely.
                 # Send only the latest user message — TinkerClaw owns context.
-                if hasattr(self._llm, 'set_session_key') and self._session_id:
+                # Wave 21b (#204): isinstance(SupportsSessionKey) over hasattr.
+                if isinstance(self._llm, SupportsSessionKey) and self._session_id:
                     self._llm.set_session_key(self._session_id)
                 llm_stream = self._llm.generate_stream_with_messages([
                     {"role": "user", "content": transcript}
@@ -1195,7 +1202,8 @@ class VoicePipeline:
             # free and don't need a receipt.  If the LLM exposes
             # get_last_usage() we compute cost from the pricing table.
             try:
-                if hasattr(self._llm, "get_last_usage"):
+                # Wave 21b (#204): isinstance(SupportsUsage) over hasattr.
+                if isinstance(self._llm, SupportsUsage):
                     usage = self._llm.get_last_usage()
                     if usage and usage.get("total_tokens"):
                         from dragon_voice.llm.openrouter_llm import price_for_model
@@ -1288,8 +1296,11 @@ class VoicePipeline:
                 except Exception as _e:
                     logger.debug("TTS receipt emit failed: %s", _e)
 
-            # Trim in-memory history on legacy path only
-            if not self._conversation_engine and hasattr(self._llm, "trim_history"):
+            # Trim in-memory history on legacy path only.
+            # Wave 21b (#204): isinstance(SupportsHistoryTrim) over hasattr.
+            if not self._conversation_engine and isinstance(
+                self._llm, SupportsHistoryTrim
+            ):
                 self._llm.trim_history(self._max_history)
 
         except asyncio.CancelledError:
@@ -1496,7 +1507,8 @@ class VoicePipeline:
 
     def clear_history(self) -> None:
         """Clear conversation history."""
-        if hasattr(self._llm, "clear_history"):
+        # Wave 21b (#204): isinstance(SupportsClearHistory) over hasattr.
+        if isinstance(self._llm, SupportsClearHistory):
             self._llm.clear_history()
         logger.info("Conversation history cleared")
 

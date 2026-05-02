@@ -1,8 +1,26 @@
-"""Abstract base class for LLM backends."""
+"""Abstract base class for LLM backends, plus optional-feature Protocol mixins.
+
+The `LLMBackend` ABC defines the *required* interface every backend must
+implement (initialize, generate_stream, shutdown, name, capabilities).
+
+Optional features that only some backends support — usage tracking,
+history trim/clear, session-key injection — are declared as
+`@runtime_checkable` Protocol mixins below (closes #204, Wave 21b).
+Callsites use `isinstance(backend, SupportsX)` instead of
+`hasattr(backend, "method_name")`, which gives the type checker
+visibility into what's optional and prevents the silent "this backend
+doesn't actually support that method" failure mode.
+
+The concrete backends don't need to inherit the Protocols — Python's
+structural Protocol matching means `isinstance(obj, SupportsUsage)`
+returns True iff `obj.get_last_usage` exists with a callable signature.
+The Protocols document *what* a method must do; the existence + name
+of the method is the runtime contract.
+"""
 
 from abc import ABC, abstractmethod
 from enum import StrEnum
-from typing import AsyncIterator
+from typing import AsyncIterator, Protocol, runtime_checkable
 
 
 class Modality(StrEnum):
@@ -106,9 +124,83 @@ class LLMBackend(ABC):
     def capabilities(self) -> frozenset[Modality]:
         """Modalities this backend can handle.
 
-        Default is text-only. Concrete backends should override based on
-        the configured model_id (e.g. ollama checks if `vision` is in the
-        model name; openrouter consults a static OR-model registry).
+        Default is text-only. Concrete backends override via
+        `dragon_voice.llm.capability_registry` (#200, Wave 21a).
         Used by the multi-model router (#183) to pick a backend per turn.
         """
         return frozenset({Modality.TEXT})
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Optional-feature Protocol mixins (#204, Wave 21b).
+#
+# Each Protocol below describes a method that *some* backends provide.
+# Callsites in pipeline.py / server.py check `isinstance(backend, SupportsX)`
+# instead of `hasattr(backend, "method_name")`.
+#
+# Why isinstance over hasattr:
+#   - mypy + IDEs can see what's optional and warn at the type level.
+#   - The Protocol's docstring documents the contract once, not at every
+#     callsite that copy-pasted "if backend has this method...".
+#   - A `dual` / wrapper backend that *forwards* an optional feature to
+#     its inner responder can cleanly implement the Protocol once.
+#
+# All Protocols are `@runtime_checkable` so isinstance() works without
+# explicit inheritance — the concrete backend just needs the method.
+# ─────────────────────────────────────────────────────────────────────
+
+
+@runtime_checkable
+class SupportsSessionKey(Protocol):
+    """Backends that own their own conversation context per-session.
+
+    The session key is an opaque string Dragon's MessageStore uses to
+    namespace per-conversation state; backends that maintain server-side
+    history (TinkerClaw gateway) need it to associate inbound requests
+    with the right ongoing thread.  Backends without this method maintain
+    history client-side or are stateless; the call is a no-op for them.
+    """
+
+    def set_session_key(self, key: str) -> None: ...
+
+
+@runtime_checkable
+class SupportsUsage(Protocol):
+    """Backends that report token usage + model id after each turn.
+
+    Returns a dict with at minimum: `model` (str), `prompt_tokens` (int),
+    `completion_tokens` (int), `total_tokens` (int).  Empty dict means
+    no usage was captured (yet) — the receipt code skips cost rendering.
+
+    Concrete bug this Protocol prevents (audit finding F5): without it,
+    `dual` and `tinkerclaw` backends fall through the hasattr check and
+    receipts emit `model="llm"` (the literal string from a fallback path)
+    instead of the actual upstream model id.
+    """
+
+    def get_last_usage(self) -> dict: ...
+
+
+@runtime_checkable
+class SupportsHistoryTrim(Protocol):
+    """Backends that maintain client-side conversation history.
+
+    Drops oldest turns when the in-memory list exceeds `max_turns`.
+    Backends that delegate context to MessageStore (the new path via
+    ConvEngine) don't need this — it's the legacy single-backend path
+    that maintains its own list.
+    """
+
+    def trim_history(self, max_turns: int = 10) -> None: ...
+
+
+@runtime_checkable
+class SupportsClearHistory(Protocol):
+    """Backends that maintain client-side conversation history.
+
+    Wipes the in-memory turn list — used by the "New Chat" UI flow when
+    Tab5 sends `{"type": "clear"}`.  Same caveat as SupportsHistoryTrim:
+    only the legacy single-backend path needs it.
+    """
+
+    def clear_history(self) -> None: ...

@@ -1379,14 +1379,12 @@ class VoiceServer:
             "response_mode": "match_input",
             "system_prompt": conn_config.llm.system_prompt,
         }
+        # Wave 22b (#202): use ConversationEngine.fleet_summary() instead
+        # of reaching into _conversation._llm with isinstance().
         if self._conversation:
-            from dragon_voice.llm.router import CapabilityAwareRouter
-            if isinstance(self._conversation._llm, CapabilityAwareRouter):
-                session_start_config["fleet_summary"] = (
-                    self._conversation._llm.summarize(
-                        conn_state.get("voice_mode", 0)
-                    )
-                )
+            summary = self._conversation.fleet_summary(conn_state.get("voice_mode", 0))
+            if summary is not None:
+                session_start_config["fleet_summary"] = summary
         if not await self._safe_send_json(ws, {
             "type": "session_start",
             "session_id": session_id,
@@ -2368,45 +2366,19 @@ class VoiceServer:
             # the router holds the entire fleet and just flips its tier
             # policy via set_voice_mode().  Saves the cost of recreating
             # sub-backends + losing their warm-loaded models.
+            # Wave 22b (#202): canonical swap via ConversationEngine.swap_llm —
+            # closes the WS / HTTP swap-path divergence (HTTP path uses
+            # pipeline.swap_backends; ConvEngine now has its own public swap
+            # that both can call going forward).
             if self._conversation:
-                from dragon_voice.llm.router import CapabilityAwareRouter
-                if isinstance(self._conversation._llm, CapabilityAwareRouter):
-                    self._conversation._llm.set_voice_mode(voice_mode)
-                    self._conversation._llm_config = conn_config.llm
-                    logger.info(
-                        "router: voice_mode set to %d (no backend swap)",
-                        voice_mode,
+                try:
+                    await self._conversation.swap_llm(
+                        conn_config.llm,
+                        pool=self._backend_pool,
+                        voice_mode=voice_mode,
                     )
-                else:
-                    try:
-                        from dragon_voice.llm import create_llm
-                        from dragon_voice.pipeline import _llm_sig
-                        new_key = _llm_sig(conn_config.llm)
-                        pooled = self._backend_pool.get(new_key)
-                        old_llm = self._conversation._llm
-                        if pooled is not None:
-                            new_llm = pooled
-                        else:
-                            new_llm = create_llm(conn_config.llm)
-                            await new_llm.initialize()
-                            self._backend_pool[new_key] = new_llm
-                        # Only shutdown the OLD one if nobody in the pool
-                        # references it (i.e. it wasn't pooled).
-                        if old_llm is not None and old_llm not in self._backend_pool.values():
-                            await old_llm.shutdown()
-                        self._conversation._llm = new_llm
-                        # 2026-04-23 (#58): also swap _llm_config so the
-                        # compact-vs-full tool prompt logic in
-                        # ConversationEngine._augment_context_with_tools picks the
-                        # right format for the active backend.  Without this,
-                        # cloud-mode agents stayed on the top-5 compact tool list
-                        # and never saw weather, stock_ticker, timesense_timer,
-                        # quick_poll, note, system_info, or unit_converter.
-                        self._conversation._llm_config = conn_config.llm
-                        logger.info("ConversationEngine LLM swapped to %s%s (backend=%s)",
-                                    new_llm.name, " (pooled)" if pooled else "", conn_config.llm.backend)
-                    except Exception as e:
-                        logger.exception("ConversationEngine LLM swap failed: %s", e)
+                except Exception as e:
+                    logger.exception("ConversationEngine LLM swap failed: %s", e)
 
             # Update displayed names
             self._stt_name = stt_be
@@ -2437,12 +2409,11 @@ class VoiceServer:
                     "voice_mode": voice_mode,
                     "cloud_mode": voice_mode >= 1,
                 }
+                # Wave 22b (#202): use ConversationEngine.fleet_summary().
                 if self._conversation:
-                    from dragon_voice.llm.router import CapabilityAwareRouter
-                    if isinstance(self._conversation._llm, CapabilityAwareRouter):
-                        config_payload["fleet_summary"] = (
-                            self._conversation._llm.summarize(voice_mode)
-                        )
+                    summary = self._conversation.fleet_summary(voice_mode)
+                    if summary is not None:
+                        config_payload["fleet_summary"] = summary
                 await ws.send_json({
                     "type": "config_update",
                     "config": config_payload,
@@ -2457,6 +2428,12 @@ class VoiceServer:
                 try:
                     vision_model = ""
                     per_frame_mils = 0
+                    # Wave 22b: this isinstance was previously sharing an
+                    # import with the swap path which moved into ConvEngine.
+                    # Local import keeps the vision-model lookup self-
+                    # contained until a future ConvEngine.choose_vision_model
+                    # follow-up subsumes it.
+                    from dragon_voice.llm.router import CapabilityAwareRouter
                     if (self._conversation
                             and isinstance(
                                 self._conversation._llm,

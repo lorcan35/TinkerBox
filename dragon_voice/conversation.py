@@ -171,6 +171,124 @@ class ConversationEngine:
         """Access the underlying LLM backend (for pipeline integration)."""
         return self._llm
 
+    async def swap_llm(
+        self,
+        new_config: LLMConfig,
+        *,
+        pool: dict[str, LLMBackend],
+        voice_mode: Optional[int] = None,
+    ) -> tuple[LLMBackend, bool]:
+        """Hot-swap the LLM backend with pool reuse (#202, Wave 22b).
+
+        Single canonical swap path used by both the WS `config_update`
+        handler and the HTTP `/api/v1/config` PUT handler.  Pre-Wave-22b
+        the WS path was 40 lines of inline `_conversation._llm = ...`
+        assignment that bypassed encapsulation; the HTTP path had its
+        own variant in `pipeline.swap_backends`.  Drift between the two
+        was a real source of "config_update worked from one but not
+        the other" bugs.
+
+        Behavior:
+          * If the active backend is a CapabilityAwareRouter, no swap
+            happens — `set_voice_mode(voice_mode)` is called (when
+            provided) and `_llm_config` is updated.  The fleet stays
+            warm.  Returns `(self._llm, False)` ("not pooled" since we
+            kept the same instance).
+          * Otherwise, look up `_llm_sig(new_config)` in `pool`.  If
+            present, reuse it.  If absent, `create_llm(new_config)` +
+            `initialize()` + insert into pool.  Shut down the old
+            backend iff nothing else in the pool references it.
+            Replace `self._llm`.  Update `self._llm_config` so the
+            tool-prompt selection in `_augment_context_with_tools`
+            picks the right format for the new backend.
+
+        Args:
+            new_config: The desired LLM config (one slice of VoiceConfig.llm).
+            pool: The shared backend instance pool — the caller (server.py)
+                  owns this dict; we mutate it.
+            voice_mode: Required for router mode; ignored for non-router.
+                        Pass the active voice_mode (0..4) so the router
+                        re-keys its tier filter.
+
+        Returns:
+            (new_llm_instance, was_pooled) for diagnostic logging.
+
+        Raises:
+            Whatever `create_llm` or `initialize` raises — the caller
+            is expected to wrap in try/except for graceful degrade.
+        """
+        # Lazy import to avoid pulling the router into module init.
+        from dragon_voice.llm.router import CapabilityAwareRouter
+
+        if isinstance(self._llm, CapabilityAwareRouter):
+            if voice_mode is not None:
+                self._llm.set_voice_mode(voice_mode)
+            self._llm_config = new_config
+            logger.info(
+                "router: voice_mode set to %s (no backend swap)",
+                voice_mode,
+            )
+            return self._llm, False
+
+        # Lazy imports — pipeline imports conversation, so importing
+        # pipeline at module top would cycle.
+        from dragon_voice.llm import create_llm
+        from dragon_voice.pipeline import _llm_sig
+
+        new_key = _llm_sig(new_config)
+        pooled = pool.get(new_key)
+        old_llm = self._llm
+
+        if pooled is not None:
+            new_llm = pooled
+            was_pooled = True
+        else:
+            new_llm = create_llm(new_config)
+            await new_llm.initialize()
+            pool[new_key] = new_llm
+            was_pooled = False
+
+        # Shut down the OLD backend only if nothing else in the pool
+        # holds a reference to it (i.e. it wasn't pooled or it was the
+        # last reference).  This preserves warm-loaded models across
+        # rapid mode toggles.
+        if old_llm is not None and old_llm is not new_llm and old_llm not in pool.values():
+            try:
+                await old_llm.shutdown()
+            except Exception as e:  # noqa: BLE001 — best-effort cleanup
+                logger.warning("Old LLM shutdown failed during swap: %s", e)
+
+        self._llm = new_llm
+        # 2026-04-23 (#58): also swap _llm_config so the compact-vs-full
+        # tool prompt logic in _augment_context_with_tools picks the right
+        # format for the active backend.
+        self._llm_config = new_config
+
+        logger.info(
+            "ConversationEngine LLM swapped to %s%s (backend=%s)",
+            new_llm.name,
+            " (pooled)" if was_pooled else "",
+            new_config.backend,
+        )
+        return new_llm, was_pooled
+
+    def fleet_summary(self, voice_mode: int) -> Optional[dict]:
+        """Per-modality fleet summary for protocol advertisement (#202, Wave 22b).
+
+        Returns the router's `summarize(voice_mode)` dict when the active
+        backend is a CapabilityAwareRouter; returns None otherwise.
+
+        Used by the WS `session_start` and `config_update` ACK paths to
+        advertise per-modality model selection to Tab5 — replaces 3
+        sites of direct `isinstance(self._conversation._llm, CapabilityAwareRouter)`
+        in `server.py`.
+        """
+        from dragon_voice.llm.router import CapabilityAwareRouter
+
+        if isinstance(self._llm, CapabilityAwareRouter):
+            return self._llm.summarize(voice_mode)
+        return None
+
     async def process_text(
         self,
         session_id: str,

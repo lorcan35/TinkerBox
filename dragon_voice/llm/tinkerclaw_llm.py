@@ -489,17 +489,13 @@ class TinkerClawBackend(LLMBackend):
 
     @property
     def capabilities(self) -> frozenset[Modality]:
-        """TinkerClaw gateway routes through whichever model is configured.
+        """TinkerClaw gateway: text + tools always; +VISION on multimodal upstreams.
 
-        The gateway itself is agentic — every model it serves goes
-        through its tool-execution layer. Vision is model-dependent.
+        Delegates to the centralized capability registry (#200, Wave 21).
         Declared mostly for completeness + diagnostic surfaces; the
         router doesn't pick TinkerClaw (voice_mode=3 short-circuits
         the router entirely).
         """
-        model_lc = (self._model or "").lower()
-        caps = {Modality.TEXT, Modality.TOOL_CALLING}
-        if any(prefix in model_lc for prefix in
-               ("minimax/", "anthropic/", "openai/gpt-4o", "google/gemini")):
-            caps.add(Modality.VISION)
-        return frozenset(caps)
+        from .capability_registry import detect
+
+        return detect("tinkerclaw", self._model or "")

@@ -351,13 +351,16 @@ class OpenRouterBackend(LLMBackend):
 
     @property
     def capabilities(self) -> frozenset[Modality]:
-        """Look up the configured OpenRouter model in the capability registry.
+        """Modalities for the configured OpenRouter model.
 
-        Used by the multi-model router (#183). Unknown models default to
-        text + tool_calling (a safe baseline for OR — every modern OR
-        model supports tools via the chat-completions API).
+        Delegates to the centralized capability registry (#200, Wave 21),
+        which routes through `_openrouter_capabilities()` below — keeping
+        the OR-specific static dict (`_OPENROUTER_CAPS`, ~35 entries) in
+        this file but accessed through the unified registry interface.
         """
-        return _openrouter_capabilities(self._model)
+        from .capability_registry import detect
+
+        return detect("openrouter", self._model)
 
 
 # ── Pricing table (Phase 3) ───────────────────────────────────────────

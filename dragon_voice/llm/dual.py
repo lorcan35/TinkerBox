@@ -150,6 +150,29 @@ class DualModelBackend(LLMBackend):
         """
         return self._responder.capabilities
 
+    # ── Optional-feature forwarders (Wave 21b, #204) ─────────────
+    # The responder owns the user-visible state; we delegate the four
+    # optional Protocols to it.  Each forwarder is a no-op if the
+    # responder doesn't implement the matching method — mirrors the
+    # callsite-level isinstance() guard in pipeline.py / server.py.
+
+    def get_last_usage(self) -> dict:
+        """Forward to responder if it tracks usage; else empty dict."""
+        method = getattr(self._responder, "get_last_usage", None)
+        return method() if callable(method) else {}
+
+    def trim_history(self, max_turns: int = 10) -> None:
+        """Forward to responder if it maintains client-side history."""
+        method = getattr(self._responder, "trim_history", None)
+        if callable(method):
+            method(max_turns)
+
+    def clear_history(self) -> None:
+        """Forward to responder if it maintains client-side history."""
+        method = getattr(self._responder, "clear_history", None)
+        if callable(method):
+            method()
+
     async def initialize(self) -> None:
         await self._picker.initialize()
         await self._responder.initialize()

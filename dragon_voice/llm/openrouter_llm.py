@@ -461,6 +461,44 @@ def price_for_model(model: str, prompt_tokens: int, completion_tokens: int) -> i
     return cost_in + cost_out
 
 
+# Per-frame token-count approximation for vision-capable models.  Different
+# vendors charge differently (gpt-4o tile-based ~480 tokens for a typical
+# detail tile, Sonnet ~1500, Gemini ~258 fixed) but 1500 is a reasonable
+# midpoint that matches what the prior inline switch in server.py was
+# implicitly assuming for sonnet/haiku/gemini; gpt-4o ends up ~3× over-
+# charged which is fine — over-counting is the safe direction since the
+# daily cap exists to STOP spending, not to track to-the-mil precision.
+_VISION_TOKENS_PER_FRAME_APPROX = 1500
+
+
+def vision_per_frame_mils(model: str) -> int:
+    """Estimate the per-frame mils cost of a vision turn for ``model``.
+
+    OCP-2 fix (audit 2026-05-03): the prior inline switch in
+    ``server.py:_handle_config_update`` hardcoded prices for
+    ``gpt-4o``/``sonnet``/``haiku``/``gemini`` and silently defaulted
+    Opus 4.x, Grok 4.x, Kimi, Qwen 3.6, GLM, MiMo etc. to **0 mils per
+    frame** — so every cloud-vision turn on those models was invisible
+    to the daily-cap budget enforcement.
+
+    This helper routes through :func:`price_for_model` with a fixed
+    1500-token-per-frame approximation so any model added to the
+    canonical ``_PRICING_MILS_PER_M`` registry automatically gets
+    real per-frame pricing without a parallel switch.
+
+    Local models (no ``/`` in the id) cost zero — they run on-device.
+    Unknown cloud models fall through to the ``_default`` pricing entry
+    in the registry, which is conservatively high — never zero.
+
+    Returns mils as an int so it serialises cleanly through WS JSON.
+    """
+    return price_for_model(
+        model,
+        prompt_tokens=_VISION_TOKENS_PER_FRAME_APPROX,
+        completion_tokens=0,
+    )
+
+
 # ── Capability registry (#183) ─────────────────────────────────────────
 # Per-model declared modalities for the multi-model router.  Each entry
 # is the set of caps OpenRouter exposes for that model.  Keep in sync

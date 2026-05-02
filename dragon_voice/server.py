@@ -2444,6 +2444,13 @@ class VoiceServer:
                     # contained until a future ConvEngine.choose_vision_model
                     # follow-up subsumes it.
                     from dragon_voice.llm.router import CapabilityAwareRouter
+                    # OCP-2 (audit 2026-05-03): single source of truth for
+                    # per-frame mils.  Kills the parallel switch on
+                    # gpt-4o/sonnet/haiku/gemini that silently defaulted
+                    # Opus 4.x, Grok 4.x, Kimi K2.6, Qwen 3.6, GLM, MiMo
+                    # to 0 mils — every cloud-vision turn on those models
+                    # was invisible to the daily-cap budget enforcement.
+                    from dragon_voice.llm.openrouter_llm import vision_per_frame_mils
                     if (self._conversation
                             and isinstance(
                                 self._conversation._llm,
@@ -2455,33 +2462,34 @@ class VoiceServer:
                         )
                         if spec:
                             vision_model = spec.model_id
-                            # Per-frame cost: cloud tier carries a known
-                            # rough rate; local tier is free.
-                            if spec.tier == "local":
-                                per_frame_mils = 0
-                            elif "gpt-4o" in spec.model_id:
-                                per_frame_mils = 1200
-                            elif "sonnet" in spec.model_id:
-                                per_frame_mils = 4500
-                            elif "haiku" in spec.model_id:
-                                per_frame_mils = 400
-                            elif "gemini" in spec.model_id:
-                                per_frame_mils = 200
+                            # Local-tier sub-backends are free regardless of
+                            # the canonical pricing table (which is OR-only);
+                            # short-circuit to avoid a `_default`-table
+                            # surprise on a local vision model id.
+                            per_frame_mils = (
+                                0 if spec.tier == "local"
+                                else vision_per_frame_mils(spec.model_id)
+                            )
                     else:
                         vm = conn_config.llm.openrouter_model.lower() \
                             if voice_mode == 2 else ""
                         om = conn_config.llm.ollama_model.lower() \
                             if voice_mode == 0 else ""
                         if voice_mode == 2:
-                            if "gpt-4o" in vm:
+                            # Vision-capability gate stays substring-based
+                            # for now (the router branch above is the
+                            # capability-aware path).  Pricing now goes
+                            # through the centralized helper so adding a
+                            # vendor to the substring list automatically
+                            # gets correct mils via _PRICING_MILS_PER_M.
+                            if any(hint in vm for hint in (
+                                    "gpt-4o", "sonnet", "haiku", "gemini",
+                                    "opus", "grok", "kimi", "qwen3.6", "glm",
+                                    "mimo")):
                                 vision_model = active_model
-                                per_frame_mils = 1200
-                            elif "sonnet" in vm:
-                                vision_model = active_model
-                                per_frame_mils = 4500
-                            elif "haiku" in vm:
-                                vision_model = active_model
-                                per_frame_mils = 400
+                                per_frame_mils = vision_per_frame_mils(
+                                    conn_config.llm.openrouter_model
+                                )
                         elif voice_mode == 0:
                             if "vision" in om or "llava" in om:
                                 vision_model = active_model

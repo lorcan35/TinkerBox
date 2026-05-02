@@ -157,29 +157,15 @@ class LMStudioBackend(LLMBackend):
 
     @property
     def capabilities(self) -> frozenset[Modality]:
-        """Detect modalities by inspecting the model id.
+        """Modalities for the configured LM Studio model.
 
-        LM Studio serves arbitrary GGUFs the user has loaded — there's
-        no canonical capability lookup. We use the same name-substring
-        heuristic as ollama for vision/multimodal families, since most
-        users name the model after the upstream HF repo it came from.
-        For tool-calling, LM Studio supports OpenAI-format tools across
-        the board on its `/chat/completions` endpoint, so we always
-        declare TOOL_CALLING (the actual model may or may not be
-        trained for it; the parser is tolerant).
+        Delegates to the centralized capability registry (#200, Wave 21).
+        See `dragon_voice/llm/capability_registry.py:detect_lmstudio` —
+        same vision-hint substring set as ollama, but always declares
+        TOOL_CALLING (the LM Studio server supports OpenAI-format tools
+        across the board regardless of whether the loaded GGUF was
+        trained for them).
         """
-        model_lc = self._model.lower()
-        caps = {Modality.TEXT, Modality.TOOL_CALLING}
+        from .capability_registry import detect
 
-        VISION_HINTS = ("llava", "bakllava", "minicpm-v", "minicpm-o",
-                        "moondream", "vision", "qwen2-vl", "qwen2.5-vl",
-                        "pixtral", "internvl")
-        if any(hint in model_lc for hint in VISION_HINTS):
-            caps.add(Modality.VISION)
-            caps.add(Modality.VIDEO)
-
-        if "minicpm-o" in model_lc:
-            caps.add(Modality.AUDIO_IN)
-            caps.add(Modality.AUDIO_OUT)
-
-        return frozenset(caps)
+        return detect("lmstudio", self._model)

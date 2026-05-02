@@ -199,6 +199,11 @@ class NPUGenieBackend(LLMBackend):
 
     @property
     def capabilities(self) -> frozenset[Modality]:
-        # QAIRT/Genie text-only. No vision/audio support today —
-        # multimodal would need a fresh QAIRT model + Genie pipeline.
-        return frozenset({Modality.TEXT})
+        """QAIRT / Genie is text-only (no vision/audio support today).
+
+        Delegates to the centralized capability registry (#200, Wave 21).
+        Multimodal would need a fresh QAIRT model + Genie pipeline.
+        """
+        from .capability_registry import detect
+
+        return detect("npu_genie", self._config_file or "")

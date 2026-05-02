@@ -5,13 +5,21 @@
   :func:`dragon_voice.config.config_to_dict`).
 * :func:`handle_set_config` — ``POST /config`` — hot-reloads the
   config file, applies a partial override from the request body,
-  validates, then swaps backends on every active voice pipeline.
+  validates, then swaps backends on every active voice pipeline AND
+  the shared :class:`ConversationEngine` (Wave 22b / DIP-2).
 
 Backend swaps acquire each connection's ``conn_lock`` first (A06) to
 prevent races with a concurrent WS ``config_update`` from the same
 device.  Two concurrent ``swap_backends`` calls would interleave
 shutdown/init of the same backend instance, producing use-after-free
 errors on the shared Ollama / OpenRouter session objects.
+
+After the per-pipeline swap, the conversation engine's ``_llm`` is
+also rotated through :meth:`ConversationEngine.swap_llm` so the
+HTTP path mirrors the WS ``config_update`` path landed in Wave 22b
+(PR #207).  Pre-fix the HTTP path swapped only the pipeline backend,
+leaving ``self._conversation._llm`` pointing at the *old* backend —
+all subsequent text turns rendered through the stale instance.
 """
 from __future__ import annotations
 
@@ -97,6 +105,27 @@ async def handle_set_config(request: web.Request, *, server: Any) -> web.Respons
                 except Exception as e:
                     logger.warning("Backend swap failed for %s: %s", ws_id, e)
                     swap_errors.append(str(e))
+
+        # DIP-2 (audit 2026-05-03): also swap the shared ConversationEngine's
+        # LLM backend.  Pre-fix the HTTP path only rotated per-pipeline
+        # backends; ConversationEngine kept its old `_llm` reference and
+        # every subsequent text turn rendered through the stale instance.
+        # Wave 22b (PR #207) extracted ConversationEngine.swap_llm as the
+        # canonical swap path used by both WS and HTTP handlers; this is
+        # the missing wiring on the HTTP side.  voice_mode=None because
+        # HTTP /api/config is a config-level swap (not per-connection
+        # tier change); the router branch uses None as "leave tier alone".
+        conv = getattr(server, "_conversation", None)
+        if conv is not None:
+            try:
+                await conv.swap_llm(
+                    new_config.llm,
+                    pool=server._backend_pool,
+                    voice_mode=None,
+                )
+            except Exception as e:  # noqa: BLE001 — best-effort, fall through
+                logger.warning("ConversationEngine LLM swap failed: %s", e)
+                swap_errors.append(f"conversation: {e}")
 
         pipelines_with_swap = sum(
             1 for c in server._active_connections.values() if c.get("pipeline")

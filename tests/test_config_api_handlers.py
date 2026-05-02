@@ -118,6 +118,96 @@ class SetConfigHandlerTests(unittest.TestCase):
         # swap_backends called exactly once on the pipeline-holding conn.
         pipeline.swap_backends.assert_awaited_once_with(cfg)
 
+    def test_happy_path_also_swaps_conversation_llm(self):
+        """DIP-2 (audit 2026-05-03): the HTTP swap path must rotate the
+        shared ConversationEngine's LLM, not just per-pipeline backends.
+
+        Pre-fix the WS config_update path called swap_llm but the HTTP
+        path didn't — leaving ConvEngine on the stale backend after
+        every POST /api/config.  This test pins the canonical wiring.
+        """
+        cfg = _make_stub_backends(stt="x_stt", tts="x_tts", llm="x_llm")
+        cfg.llm = MagicMock()  # the slice swap_llm receives
+        pipeline = MagicMock()
+        pipeline.swap_backends = AsyncMock()
+        conversation = MagicMock()
+        conversation.swap_llm = AsyncMock(return_value=(MagicMock(), True))
+        backend_pool: dict = {}
+
+        server = MagicMock()
+        server._config = MagicMock()
+        server._conversation = conversation
+        server._backend_pool = backend_pool
+        server._active_connections = {
+            "ws_a": {"pipeline": pipeline, "conn_lock": None},
+        }
+
+        req = _ReqWithJson(body={"llm": {"backend": "x_llm"}})
+
+        async def go():
+            with patch.object(cfg_mod, "load_config", return_value=cfg):
+                return await cfg_mod.handle_set_config(req, server=server)
+
+        resp = asyncio.run(go())
+        self.assertEqual(resp.status, 200)
+        # Both swap surfaces hit, in order: pipeline first, then ConvEngine.
+        pipeline.swap_backends.assert_awaited_once_with(cfg)
+        conversation.swap_llm.assert_awaited_once_with(
+            cfg.llm, pool=backend_pool, voice_mode=None,
+        )
+
+    def test_conversation_swap_failure_does_not_500(self):
+        """If swap_llm raises (e.g. backend init throws), the HTTP
+        handler keeps the per-pipeline swap result and returns 200 so
+        the caller still sees the partial-success state."""
+        cfg = _make_stub_backends(stt="x_stt", tts="x_tts", llm="x_llm")
+        cfg.llm = MagicMock()
+        pipeline = MagicMock()
+        pipeline.swap_backends = AsyncMock()
+        conversation = MagicMock()
+        conversation.swap_llm = AsyncMock(side_effect=RuntimeError("init blew up"))
+
+        server = MagicMock()
+        server._config = MagicMock()
+        server._conversation = conversation
+        server._backend_pool = {}
+        server._active_connections = {
+            "ws_a": {"pipeline": pipeline, "conn_lock": None},
+        }
+
+        req = _ReqWithJson(body={"llm": {"backend": "x_llm"}})
+
+        async def go():
+            with patch.object(cfg_mod, "load_config", return_value=cfg):
+                return await cfg_mod.handle_set_config(req, server=server)
+
+        resp = asyncio.run(go())
+        # Per-pipeline swap succeeded; conversation swap failure is a
+        # warning, not a 500 — caller can re-issue if it cares.
+        self.assertEqual(resp.status, 200)
+        pipeline.swap_backends.assert_awaited_once()
+        conversation.swap_llm.assert_awaited_once()
+
+    def test_no_conversation_attribute_does_not_500(self):
+        """During boot, server._conversation may not exist yet — the
+        handler should still succeed (skips the ConvEngine swap)."""
+        cfg = _make_stub_backends()
+        cfg.llm = MagicMock()
+        server = MagicMock(spec=["_active_connections", "_config", "_stt_name",
+                                 "_tts_name", "_llm_name", "_backend_pool"])
+        server._active_connections = {}
+        server._backend_pool = {}
+        # Note: no _conversation attribute set.
+
+        req = _ReqWithJson(body={"llm": {"backend": "new_llm"}})
+
+        async def go():
+            with patch.object(cfg_mod, "load_config", return_value=cfg):
+                return await cfg_mod.handle_set_config(req, server=server)
+
+        resp = asyncio.run(go())
+        self.assertEqual(resp.status, 200)
+
 
 class GetConfigHandlerTests(unittest.TestCase):
     def test_returns_redacted_config(self):

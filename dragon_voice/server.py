@@ -44,6 +44,7 @@ from dragon_voice.vision_turn import handle_vision_turn
 from dragon_voice.ws_voice_admission import check_ws_voice_admission
 from dragon_voice.ws_keepalive import run_ws_keepalive
 from dragon_voice.binary_frame_dispatch import dispatch_binary_frame
+from dragon_voice.cancel_handler import handle_cancel_command
 from dragon_voice.rich_media_emit import emit_rich_media_for_text_turn
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.surface_register import register_surface_and_replay_scheduler
@@ -751,65 +752,20 @@ class VoiceServer:
                             logger.info("Connection %s: conversation history cleared", ws_id)
 
                     elif cmd_type == "cancel":
-                        # Phase 1 (issue #91): cancel needs to reach in-flight
-                        # text/media handler tasks too, not just the voice
-                        # pipeline.  Today text/media are awaited inline above
-                        # which blocks the WS read loop — a cancel frame from
-                        # Tab5 sits in the TCP buffer until the inline await
-                        # returns, by which point the response has already
-                        # finished and Tab5 sees the cancelled tokens
-                        # materialise after the user gave up.
-                        pipeline = conn_state.get("pipeline")
-                        cancelled_what: list[str] = []
-                        handler_tasks = conn_state.setdefault("handler_tasks", {})
-                        for slot in ("text", "media", "config"):
-                            t = handler_tasks.get(slot)
-                            if t and not t.done():
-                                t.cancel()
-                                try:
-                                    await t
-                                except (asyncio.CancelledError, Exception):
-                                    # task may have raised mid-cancel; we
-                                    # logged it; don't propagate to the WS
-                                    # loop or the loop dies on us
-                                    pass
-                                handler_tasks[slot] = None
-                                cancelled_what.append(slot)
-                        # Always cancel the pipeline.  The text path calls
-                        # pipeline._tts.synthesize() directly (see _handle_text),
-                        # so a Piper subprocess can be alive even when no
-                        # handler-task slot was occupied or _processing is False.
-                        # pipeline.cancel() is idempotent.  (audit A1, #137)
-                        if pipeline:
-                            logger.info("Connection %s: cancel → pipeline.cancel", ws_id)
-                            await pipeline.cancel()
-                            cancelled_what.append("pipeline")
-                        # Audit B1 (#165): also drop any scheduler-fired
-                        # widgets that deferred during this turn — user
-                        # cancelled the turn, so any reminder that fired
-                        # during it should also disappear (a fresh fire
-                        # cycle will pop on the next turn-idle window if
-                        # the scheduler still wants to deliver it).
-                        sid = conn_state.get("session_id")
-                        if self._surface_mgr is not None and sid:
-                            dropped = self._surface_mgr.discard_deferred(sid)
-                            if dropped:
-                                logger.info(
-                                    "Connection %s: cancel → discarded %d deferred widget(s)",
-                                    ws_id, dropped,
-                                )
-                                cancelled_what.append(f"deferred:{dropped}")
-                        # Send ack so Tab5 has a positive signal that cancel
-                        # landed — matters because Tab5 transitions to READY
-                        # locally on cancel-send and may otherwise see late
-                        # `llm` tokens that were already in TCP flight.
-                        # Tab5-side fix at voice.c:752 covers the late-token
-                        # case directly; this ack is the protocol-clean half
-                        # of the same change.
-                        await self._safe_send_json(ws, {
-                            "type": "cancel_ack",
-                            "cancelled": cancelled_what,
-                        })
+                        # SOLID-audit follow-up: cancel chain extracted
+                        # to cancel_handler.handle_cancel_command.  That
+                        # module owns: in-flight handler-task cancel
+                        # (text/media/config slots), pipeline.cancel
+                        # (audit A1 / #137 — idempotent), deferred-widget
+                        # discard (audit B1 / #165), and the cancel_ack
+                        # emit with per-source breakdown.
+                        await handle_cancel_command(
+                            ws,
+                            ws_id=ws_id,
+                            conn_state=conn_state,
+                            surface_mgr=self._surface_mgr,
+                            safe_send_json=self._safe_send_json,
+                        )
 
                     elif cmd_type == "text":
                         # Phase 1 (issue #91): spawn as a task so the WS read

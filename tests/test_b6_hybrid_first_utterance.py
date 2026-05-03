@@ -40,7 +40,9 @@ def test_swap_into_cloud_stt_schedules_fallback_prewarm() -> None:
 
     p = VoicePipeline(cfg, on_audio=on_audio, on_event=on_event)
     # Sanity: no prewarm task before the swap.
-    assert getattr(p, "_fallback_prewarm_task", None) is None
+    # SOLID-audit follow-up: prewarm state extracted to
+    # FallbackSttCache (PR #256); inspect through the cache.
+    assert p._fallback_stt_cache._prewarm_task is None
 
     async def go():
         # Mock the create_stt + initialize so we don't actually load
@@ -69,7 +71,8 @@ def test_swap_into_cloud_stt_schedules_fallback_prewarm() -> None:
         # `from dragon_voice.stt import create_stt` resolves to.
         try:
             p._schedule_fallback_stt_prewarm()
-            task = getattr(p, "_fallback_prewarm_task", None)
+            # Inspection through the cache (PR #256 extract).
+            task = p._fallback_stt_cache._prewarm_task
             assert task is not None and not task.done(), "prewarm task should be spawned"
             await asyncio.wait_for(prewarm_invoked.wait(), timeout=1.0)
             # Task either done now or about to be — let it settle.
@@ -77,8 +80,8 @@ def test_swap_into_cloud_stt_schedules_fallback_prewarm() -> None:
                 await task
             except Exception:
                 pass
-            # _fallback_stt was populated by the task.
-            assert getattr(p, "_fallback_stt", None) is not None
+            # Fallback STT was populated by the task.
+            assert p._fallback_stt_cache._fallback_stt is not None
         finally:
             stt_mod.create_stt = original_create_stt  # type: ignore[assignment]
 
@@ -97,10 +100,11 @@ def test_prewarm_is_idempotent_when_fallback_already_present() -> None:
         return None
 
     p = VoicePipeline(cfg, on_audio=on_audio, on_event=on_event)
-    p._fallback_stt = object()  # already cached
+    # SOLID-audit follow-up: pre-populate via the cache (PR #256).
+    p._fallback_stt_cache._fallback_stt = object()  # already cached
 
     p._schedule_fallback_stt_prewarm()
-    assert getattr(p, "_fallback_prewarm_task", None) is None, (
+    assert p._fallback_stt_cache._prewarm_task is None, (
         "no task should spawn when fallback is already cached"
     )
 
@@ -135,10 +139,10 @@ def test_prewarm_skips_if_inflight_task_pending() -> None:
         stt_mod.create_stt = lambda cfg_: _SlowStt()  # type: ignore[assignment]
         try:
             p._schedule_fallback_stt_prewarm()
-            first = p._fallback_prewarm_task
+            first = p._fallback_stt_cache._prewarm_task
             await asyncio.sleep(0.05)
             p._schedule_fallback_stt_prewarm()
-            second = p._fallback_prewarm_task
+            second = p._fallback_stt_cache._prewarm_task
             assert first is second, "second call must reuse in-flight task"
             try:
                 await first

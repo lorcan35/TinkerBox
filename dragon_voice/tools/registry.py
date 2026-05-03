@@ -1,12 +1,14 @@
 """Tool registry: register + execute tools.
 
-Wave 23 SOLID-audit follow-up — parser extracted to
-`dragon_voice.tools.parser` (PR #249, audit SRP-5 first slice).
-This module now owns just the registry + execution + formatter
-responsibilities; the three-dialect XML/bracket parser lives
-next door and is invoked via thin forwarding methods on
-`ToolRegistry` for backward compat with the 16+ existing call
-sites.
+Wave 23 SOLID-audit follow-up (audit SRP-5):
+  * Parser extracted to `dragon_voice.tools.parser` (PR #249).
+  * Formatter extracted to `dragon_voice.tools.formatter`
+    (PR #250).
+
+This module now owns just the registry + execution
+responsibilities; the parser and formatter live next door and
+are invoked via thin forwarding methods on `ToolRegistry` for
+backward compat with the 16+ existing call sites.
 """
 
 import logging
@@ -25,6 +27,7 @@ from dragon_voice.tools.parser import (  # noqa: F401  (re-exports)
     parse_tool_calls as _parse_tool_calls,
     parse_tool_calls_with_errors as _parse_tool_calls_with_errors,
 )
+from dragon_voice.tools.formatter import format_for_llm as _format_for_llm
 
 logger = logging.getLogger(__name__)
 
@@ -136,71 +139,9 @@ class ToolRegistry:
     def format_for_llm(self, compact: bool = False) -> str:
         """Format tool descriptions for injection into LLM system prompt.
 
-        Args:
-            compact: If True, use minimal format for small local models
-                    (fewer tokens = faster generation, less confusion).
+        Forwards to ``formatter.format_for_llm`` with the
+        registered Tool instances.  Compact format is for small
+        local models (qwen3:1.7b etc — fewer tokens, priority
+        tools only); full format is for capable cloud models.
         """
-        if not self._tools:
-            return ""
-
-        if compact:
-            return self._format_compact()
-        return self._format_full()
-
-    def _format_compact(self) -> str:
-        """Minimal tool format for small models (qwen3:1.7b etc).
-
-        Uses fewer tokens and simpler structure to avoid confusing small models.
-        Only shows the most commonly used tools to reduce context bloat.
-        """
-        # Core tools that small models handle well.  Issue #134:
-        # `schedule_reminder` was missing — local LLM hallucinated
-        # "no such tool available" when the user asked for a reminder.
-        # Adding ~30 tokens to the system prompt is a worthwhile
-        # trade for unlocking a high-value capability.
-        priority_tools = [
-            "web_search", "datetime", "remember", "recall",
-            "calculator", "schedule_reminder",
-        ]
-        tools = [t for t in self._tools.values() if t.name in priority_tools]
-        if not tools:
-            tools = list(self._tools.values())[:4]
-
-        lines = ["\n[TOOLS]"]
-        lines.append("Format: <tool>NAME</tool><args>{JSON}</args>")
-        for tool in tools:
-            params = tool.parameters_schema.get("properties", {})
-            required = tool.parameters_schema.get("required", [])
-            req_keys = [k for k in params if k in required]
-            lines.append(f"- {tool.name}: {tool.description}")
-            if req_keys:
-                lines.append(f'  Example: <tool>{tool.name}</tool><args>{{"{req_keys[0]}": "..."}}</args>')
-        lines.append("Only use tools when needed. Most questions don't need tools.")
-        lines.append("[/TOOLS]")
-        return "\n".join(lines)
-
-    def _format_full(self) -> str:
-        """Full tool format for capable cloud models."""
-        lines = ["\n[TOOLS]"]
-        lines.append("You can use tools by outputting EXACTLY this format:")
-        lines.append('<tool>TOOLNAME</tool><args>{"key": "value"}</args>')
-        lines.append("")
-        lines.append("Available tools:")
-        for tool in self._tools.values():
-            params = tool.parameters_schema.get("properties", {})
-            lines.append(f"  {tool.name}: {tool.description}")
-            if params:
-                lines.append("    Args: {" + ", ".join(f'"{k}": {v.get("type","")}' for k,v in params.items()) + "}")
-
-        lines.append("")
-        lines.append("Examples:")
-        lines.append('  <tool>web_search</tool><args>{"query": "weather today"}</args>')
-        lines.append('  <tool>remember</tool><args>{"fact": "User likes pizza"}</args>')
-        lines.append('  <tool>recall</tool><args>{"query": "user preferences"}</args>')
-        lines.append('  <tool>calculator</tool><args>{"expression": "15% of 230"}</args>')
-        lines.append('  <tool>weather</tool><args>{"location": "Tokyo"}</args>')
-        lines.append("")
-        lines.append("IMPORTANT: Only use a tool when genuinely needed. Most questions don't need tools.")
-        lines.append("[/TOOLS]")
-
-        return "\n".join(lines)
+        return _format_for_llm(self._tools.values(), compact=compact)

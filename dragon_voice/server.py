@@ -56,6 +56,7 @@ from dragon_voice.stop_handler import handle_stop_command
 from dragon_voice.pipeline_init import build_and_initialize_pipeline
 from dragon_voice.widget_capabilities_init import init_widget_capabilities
 from dragon_voice.disconnect_handler import handle_disconnect as _disconnect_chain
+from dragon_voice.handler_task_spawn import spawn_handler_task
 from dragon_voice.rich_media_emit import emit_rich_media_for_text_turn
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.surface_register import register_surface_and_replay_scheduler
@@ -1068,75 +1069,17 @@ class VoiceServer:
     ) -> None:
         """Spawn a per-connection command handler as an asyncio task.
 
-        Phase 1 of the UX-gap remediation (issue #91, see docs/UX-GAPS.md).
-        The text/media/config handlers used to be awaited inline in the
-        WS read loop, blocking it from receiving cancel/ping/voice frames
-        for the full duration of the handler.  This helper detaches them
-        as tracked tasks in `conn_state["handler_tasks"][slot]` so the
-        cancel handler can selectively kill any of them, and so
-        `_handle_disconnect` can clean them up on WS close.
-
-        Args:
-            conn_state: per-connection state dict (lives across the WS handler).
-            slot: name of the task slot ("text", "media", "config").
-            coro_func: the handler coroutine function to invoke.
-            *args: positional args passed to the handler.
-            conn_lock: if provided, acquired inside the spawned task before
-                       calling the handler (preserves prior US-P10 serialization
-                       semantics with the voice path).
-            coalesce: if True, cancel any in-flight task in the same slot
-                      before spawning the new one (last-write-wins — matches
-                      user intent for config_update mode toggles).  If False
-                      (default) the new task simply waits for `prev` to
-                      finish before starting (matches Tab5's "+1 QUEUED"
-                      stash semantics for text input).
+        SOLID-audit follow-up: implementation extracted to
+        handler_task_spawn.spawn_handler_task.  That module owns:
+        the queue-vs-coalesce dispatch, conn_lock acquisition,
+        the cancel/exception isolation in the spawned task, and
+        the task naming.  Wrapper kept for backward compat with
+        existing call sites; could be inlined in a follow-up.
         """
-        handler_tasks = conn_state.setdefault("handler_tasks", {})
-        prev = handler_tasks.get(slot)
-        if prev and not prev.done():
-            if coalesce:
-                prev.cancel()
-                try:
-                    await prev
-                except (asyncio.CancelledError, Exception):
-                    # cancellation may surface as the underlying handler's
-                    # exception; suppressed because we're about to replace
-                    # it anyway.
-                    pass
-            else:
-                # Wait for the previous handler in this slot to finish before
-                # spawning the new one (preserves ordering for text turns).
-                try:
-                    await prev
-                except (asyncio.CancelledError, Exception):
-                    pass
-
-        async def _run() -> None:
-            try:
-                if conn_lock is not None:
-                    async with conn_lock:
-                        await coro_func(*args)
-                else:
-                    await coro_func(*args)
-            except asyncio.CancelledError:
-                # Cancelled mid-handler — let it propagate so the task
-                # transitions to CANCELLED state.  Resource cleanup is
-                # the handler's responsibility (we've already cancelled
-                # any pipeline TTS subprocess in the cancel cmd path).
-                raise
-            except Exception:
-                # Handler raised — already logged inside the handler's
-                # own try/except.  Don't propagate to the WS loop or
-                # the loop dies on us; the WS catch at the outer
-                # `async for msg in ws` is for transport-level errors,
-                # not handler-level ones.
-                logger.exception(
-                    "handler_tasks[%s] raised — task will exit",
-                    slot,
-                )
-
-        task = asyncio.create_task(_run(), name=f"ws_handler:{slot}")
-        handler_tasks[slot] = task
+        await spawn_handler_task(
+            conn_state, slot, coro_func, *args,
+            conn_lock=conn_lock, coalesce=coalesce,
+        )
 
     async def _handle_text(
         self, ws: web.WebSocketResponse, conn_state: dict, cmd: dict

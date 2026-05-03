@@ -21,6 +21,7 @@ import aiohttp
 from aiohttp import web, WSMsgType
 
 from dragon_voice.cap_downgrade import maybe_speak_cap_downgrade_alert
+from dragon_voice.codec_negotiation import maybe_swap_uplink_codec
 from dragon_voice.config_swap import select_backends_for_mode
 from dragon_voice.config_swap_guards import validate_config_swap_prereqs
 from dragon_voice.conn_state import ConnState
@@ -2143,18 +2144,16 @@ class VoiceServer:
         # send config_update with audio_uplink_codec to swap mid-session
         # (e.g. from a Settings toggle).  Apply via pipeline; reply with
         # the codec actually applied so a fallback (opus -> pcm because
-        # libopus missing) is observable on the client.
-        client_uplink_codec = cmd.get("audio_uplink_codec") or cmd.get("audio_codec")
-        if client_uplink_codec is not None:
-            pipeline = conn_state.get("pipeline")
-            if pipeline is not None:
-                applied = pipeline.set_uplink_codec(str(client_uplink_codec))
-                if not ws.closed:
-                    await self._safe_send_json(ws, {
-                        "type": "config_update",
-                        "audio_uplink_codec": applied,
-                        "reason": "codec_negotiation",
-                    })
+        # libopus missing) is observable on the client.  Extracted to
+        # codec_negotiation.maybe_swap_uplink_codec in the SOLID-audit
+        # follow-up (sister of vision_capability / cap_downgrade /
+        # config_swap_guards).
+        await maybe_swap_uplink_codec(
+            ws,
+            cmd=cmd,
+            conn_state=conn_state,
+            safe_send_json=self._safe_send_json,
+        )
 
         if voice_mode is not None:
             # OCP-1 (audit 2026-05-03): convert raw int → VoiceMode enum

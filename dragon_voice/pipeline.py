@@ -251,6 +251,14 @@ class VoicePipeline:
         self._segment_buffer = bytearray()
         self._dictation_segments: list[str] = []
 
+        # SOLID-audit follow-up: fallback STT lifecycle (pre-warm
+        # + lazy-load + shutdown) extracted to FallbackSttCache.
+        # Audit B6 (#154): cloud STT failures fall back to
+        # Moonshine; without pre-warm, the first failure pays
+        # the 1-3 s cold-load.
+        from dragon_voice.fallback_stt_cache import FallbackSttCache
+        self._fallback_stt_cache = FallbackSttCache()
+
     async def initialize(self) -> None:
         """Create and initialize all backends.
 
@@ -1435,55 +1443,24 @@ class VoicePipeline:
         """Borrow the pre-warmed fallback STT (or cold-load if absent),
         then transcribe `audio_data`.
 
-        Audit B6 (#154): keeps the fallback path single-line at the
-        callsite while preserving the v4·D P1 caching behaviour and
-        respecting the new `swap_backends` pre-warm.
+        SOLID-audit follow-up: lazy-load + transcribe extracted to
+        FallbackSttCache.transcribe.  This wrapper keeps the
+        existing call site unchanged.
         """
-        if not getattr(self, "_fallback_stt", None):
-            from dragon_voice.stt import create_stt
-            from dragon_voice.config import STTConfig
-            self._fallback_stt = create_stt(STTConfig(backend="moonshine"))
-            await self._fallback_stt.initialize()
-            logger.info("Pre-warmed fallback STT (moonshine) cached (lazy path)")
-        return await self._fallback_stt.transcribe(
-            audio_data, self._config.audio.input_sample_rate
+        return await self._fallback_stt_cache.transcribe(
+            audio_data, sample_rate=self._config.audio.input_sample_rate,
         )
 
     def _schedule_fallback_stt_prewarm(self) -> None:
-        """Spawn a background task that loads Moonshine into
-        `self._fallback_stt` so the first cloud-STT failure doesn't
+        """Spawn a background task that loads Moonshine into the
+        fallback cache so the first cloud-STT failure doesn't
         pay the 1-3 s cold-load.
 
-        Audit B6 (#154): called from `swap_backends` whenever the new
-        STT backend is `openrouter`.  Idempotent — if a fallback already
-        exists or a prewarm is already in flight, no-ops.
+        SOLID-audit follow-up: extracted to
+        FallbackSttCache.schedule_prewarm.  This wrapper keeps
+        the existing call site unchanged.
         """
-        if getattr(self, "_fallback_stt", None):
-            return
-        prev = getattr(self, "_fallback_prewarm_task", None)
-        if prev is not None and not prev.done():
-            return
-
-        async def _prewarm() -> None:
-            try:
-                from dragon_voice.stt import create_stt
-                from dragon_voice.config import STTConfig
-                stt = create_stt(STTConfig(backend="moonshine"))
-                await stt.initialize()
-                # Race guard: a real cloud-STT failure could have
-                # cold-loaded one in parallel.  Last writer wins; the
-                # loser is discarded.
-                if not getattr(self, "_fallback_stt", None):
-                    self._fallback_stt = stt
-                    logger.info("Pre-warmed fallback STT (moonshine) cached (background)")
-                else:
-                    await stt.shutdown()
-            except Exception as e:
-                logger.warning("B6 fallback-STT prewarm failed: %s", e)
-
-        self._fallback_prewarm_task = asyncio.create_task(
-            _prewarm(), name="b6_fallback_stt_prewarm"
-        )
+        self._fallback_stt_cache.schedule_prewarm()
 
     async def swap_backends(self, config: VoiceConfig) -> None:
         """Hot-swap backends based on new configuration.
@@ -1629,24 +1606,17 @@ class VoicePipeline:
             tasks.append(self._tts.shutdown())
         if self._llm and not self._pooled_llm:
             tasks.append(self._llm.shutdown())
-        # Audit B6 (#154): cancel any in-flight Moonshine pre-warm so
-        # shutdown doesn't have to wait for a 1-3 s model load just to
-        # immediately throw it away.
-        prewarm = getattr(self, "_fallback_prewarm_task", None)
-        if prewarm is not None and not prewarm.done():
-            prewarm.cancel()
-            try:
-                await prewarm
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._fallback_prewarm_task = None
-        # Pre-warmed fallback backends (from P1 STT/TTS cache fix).
-        fb_stt = getattr(self, "_fallback_stt", None)
+        # SOLID-audit follow-up: fallback STT prewarm + cached
+        # backend shutdown extracted to
+        # FallbackSttCache.shutdown — handles cancel + await of
+        # the prewarm task and the cached backend's shutdown.
+        await self._fallback_stt_cache.shutdown()
+        # Fallback TTS still inline (separate cache lifecycle —
+        # follow-up PR could symmetrise).
         fb_tts = getattr(self, "_fallback_tts", None)
-        if fb_stt: tasks.append(fb_stt.shutdown())
-        if fb_tts: tasks.append(fb_tts.shutdown())
+        if fb_tts:
+            tasks.append(fb_tts.shutdown())
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        self._fallback_stt = None
         self._fallback_tts = None
         logger.info("Voice pipeline shut down")

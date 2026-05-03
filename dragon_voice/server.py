@@ -32,6 +32,10 @@ from dragon_voice.config_swap_guards import validate_config_swap_prereqs
 from dragon_voice.config_update_ack import emit_config_update_ack
 from dragon_voice.conn_state import ConnState
 from dragon_voice.device_upsert import upsert_device_with_collision_guard
+from dragon_voice.session_handshake import (
+    emit_session_start,
+    replay_session_message_tail,
+)
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.media.store import MediaStore
 from dragon_voice.media.pipeline import MediaPipeline
@@ -1312,41 +1316,23 @@ class VoiceServer:
             conn_state["on_tool_result"] = _on_tool_result
             conn_state["on_tool_error"] = _on_tool_error
 
-        # Send session_start IMMEDIATELY — before slow pipeline init.
-        # Use _safe_send_json so a transient transport close (the Tab5
-        # register-before-receive-task-running race, refs #31 + TT #76)
-        # doesn't propagate an exception up to the WS handler and force
-        # a session pause. If the send drops, the client will reconnect
-        # shortly and we'll replay session_start on the next handshake.
-        # #183 PR 3: include `fleet_summary` so Tab5 firmware can
-        # advertise vision/video/audio caps dynamically without a
-        # hardcoded substring lookup.  Only present when the router is
-        # active; legacy single-backend deployments emit the same
-        # session_start as today.
-        session_start_config = {
-            "stt": conn_config.stt.backend,
-            "tts": conn_config.tts.backend,
-            "llm": conn_config.llm.backend,
-            "tts_sample_rate": conn_config.audio.input_sample_rate,
-            "response_mode": "match_input",
-            "system_prompt": conn_config.llm.system_prompt,
-        }
-        # Wave 22b (#202): use ConversationEngine.fleet_summary() instead
-        # of reaching into _conversation._llm with isinstance().
-        if self._conversation:
-            summary = self._conversation.fleet_summary(conn_state.get("voice_mode", 0))
-            if summary is not None:
-                session_start_config["fleet_summary"] = summary
-        if not await self._safe_send_json(ws, {
-            "type": "session_start",
-            "session_id": session_id,
-            "device_id": device_id,
-            "resumed": resumed,
-            "message_count": session.get("message_count", 0),
-            "config": session_start_config,
-        }):
-            logger.info("session_start send dropped on %s — client likely reconnecting", ws_id)
-            return
+        # SOLID-audit follow-up: session_start emit + session_messages
+        # replay extracted to session_handshake module.  Both run
+        # BEFORE the slow pipeline init so Tab5 sees the session
+        # confirmed even if Moonshine takes 2 s to load.
+        if not await emit_session_start(
+            ws,
+            session_id=session_id,
+            device_id=device_id,
+            resumed=resumed,
+            message_count=session.get("message_count", 0),
+            ws_id=ws_id,
+            conn_config=conn_config,
+            conversation=self._conversation,
+            voice_mode=conn_state.get("voice_mode", 0),
+            safe_send_json=self._safe_send_json,
+        ):
+            return  # transport drop — Tab5 will reconnect
 
         logger.info(
             "Device %s registered on session %s (resumed=%s, ws_id=%s)",
@@ -1355,42 +1341,14 @@ class VoiceServer:
 
         # Audit C8/K15 (2026-04-20): on resume, replay the tail of the
         # message history so Tab5 chat can rehydrate its local store.
-        # Previously session_start carried only message_count and Tab5
-        # had to fetch via REST (which it never did) -- so a reconnect
-        # lost the conversation from the user's view even though it was
-        # on disk. Cap at 20 messages (most recent) to keep the WS frame
-        # small; Tab5 can still fetch full history via
-        # /api/v1/sessions/{id}/messages.
-        if resumed and self._message_store is not None:
-            try:
-                msgs = await self._message_store.get_messages(
-                    session_id, limit=20, offset=0
-                )
-                # Return the LAST 20 (get_messages returns ascending, so
-                # slice the tail).
-                tail = msgs[-20:] if len(msgs) > 20 else msgs
-                items = []
-                for m in tail:
-                    role = m.get("role")
-                    content = m.get("content")
-                    if not role or not content:
-                        continue
-                    items.append({
-                        "role": role,
-                        "content": content,
-                        "timestamp": m.get("created_at"),
-                    })
-                if items and not await self._safe_send_json(ws, {
-                    "type": "session_messages",
-                    "session_id": session_id,
-                    "items": items,
-                }):
-                    logger.info("session_messages replay dropped on %s", ws_id)
-                else:
-                    logger.info("Replayed %d messages for session %s",
-                                len(items), session_id)
-            except Exception as e:
-                logger.warning("session_messages replay failed: %s", e)
+        if resumed:
+            await replay_session_message_tail(
+                ws,
+                session_id=session_id,
+                ws_id=ws_id,
+                message_store=self._message_store,
+                safe_send_json=self._safe_send_json,
+            )
 
         # Reset conn_config to local defaults before pipeline init.
         # Tab5 will immediately send config_update with its actual mode,

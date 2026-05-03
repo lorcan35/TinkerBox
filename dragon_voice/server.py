@@ -33,6 +33,9 @@ from dragon_voice.config_finalize import (
 from dragon_voice.config_swap import select_backends_for_mode
 from dragon_voice.config_swap_guards import validate_config_swap_prereqs
 from dragon_voice.config_update_ack import emit_config_update_ack
+from dragon_voice.config_update_rate_limit import (
+    check_config_update_rate_limit,
+)
 from dragon_voice.conn_state import ConnState
 from dragon_voice.device_upsert import upsert_device_with_collision_guard
 from dragon_voice.session_handshake import (
@@ -1322,29 +1325,21 @@ class VoiceServer:
         """
         ws_id = conn_state.get("ws_id", "?")
 
-        # v4·D audit P1: rate-limit config_update to 2/sec/conn.  A buggy
-        # skill or trigger-happy test harness could storm mode swaps that
-        # each do heavy backend init.
-        #
-        # Audit C1 (#137): pre-fix this was a silent `logger.debug` +
-        # `return` — Tab5's mode-toggle UI sat on its previous local
-        # state and the user assumed the swap landed.  Now we emit a
-        # γ-arch TRANSIENT/SESSION error so Tab5 (γ2-H8) can render a
-        # toast like "Slow down — give the swap a moment."  Defensive:
-        # only emit if the WS is still open.
-        _now_cfg = time.monotonic()
-        _last_cfg = conn_state.get("_last_config_update_ts", 0.0)
-        if _now_cfg - _last_cfg < 0.5:
-            logger.debug("config_update rate-limited on %s", ws_id)
-            if not ws.closed:
-                await self._safe_send_json(ws, error_event(
-                    code="config_update_rate_limited",
-                    message="Mode swap rate-limited — try again in a moment.",
-                    severity=Severity.TRANSIENT,
-                    scope=Scope.SESSION,
-                ))
+        # SOLID-audit follow-up: per-connection rate-limit gate
+        # extracted to
+        # config_update_rate_limit.check_config_update_rate_limit.
+        # That module owns: 0.5 s minimum interval enforcement,
+        # γ-arch TRANSIENT/SESSION emit on block (audit C1 / #137
+        # closure — pre-fix was silent debug log + return), and
+        # the per-connection timestamp stash.  Returns False on
+        # rate-limit; caller short-circuits.
+        if not await check_config_update_rate_limit(
+            ws,
+            conn_state=conn_state,
+            ws_id=ws_id,
+            safe_send_json=self._safe_send_json,
+        ):
             return
-        conn_state["_last_config_update_ts"] = _now_cfg
 
         # Three-tier voice mode: 0=local, 1=hybrid, 2=cloud, 3=tinkerclaw
         voice_mode = cmd.get("voice_mode")

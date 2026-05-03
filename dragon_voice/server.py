@@ -55,6 +55,7 @@ from dragon_voice.clear_handler import handle_clear_command
 from dragon_voice.stop_handler import handle_stop_command
 from dragon_voice.pipeline_init import build_and_initialize_pipeline
 from dragon_voice.widget_capabilities_init import init_widget_capabilities
+from dragon_voice.disconnect_handler import handle_disconnect as _disconnect_chain
 from dragon_voice.rich_media_emit import emit_rich_media_for_text_turn
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.surface_register import register_surface_and_replay_scheduler
@@ -1520,70 +1521,22 @@ class VoiceServer:
         )
 
     async def _handle_disconnect(self, conn_state: dict) -> None:
-        """Handle WebSocket disconnect: pause session, mark device offline."""
-        session_id = conn_state.get("session_id")
-        device_id = conn_state.get("device_id")
-        ws_id = conn_state.get("ws_id")
-        pipeline = conn_state.get("pipeline")
+        """Handle WebSocket disconnect: pause session, mark device offline.
 
-        # Wave 14 W14-C06: cancel any per-connection background tasks
-        # (e.g. cap_downgrade speak_system) before we shut down the pipeline
-        # they depend on. Without this, the orphan task holds the Piper
-        # subprocess + TTS lock past WS close.
-        bg_tasks = conn_state.get("bg_tasks") or set()
-        if bg_tasks:
-            for t in list(bg_tasks):
-                t.cancel()
-            await asyncio.gather(*bg_tasks, return_exceptions=True)
-
-        # Phase 1 (issue #91): cancel any in-flight per-command handler
-        # tasks (text/media/config).  These are spawned by
-        # `_spawn_handler_task` and tracked in
-        # `conn_state["handler_tasks"]`.  Without this, a slow text
-        # turn that's still streaming to the LLM when Tab5 disconnects
-        # would keep generating tokens (and writing assistant
-        # messages to the DB on the now-dead session) until naturally
-        # complete.
-        handler_tasks = conn_state.get("handler_tasks") or {}
-        live = [t for t in handler_tasks.values() if t and not t.done()]
-        if live:
-            for t in live:
-                t.cancel()
-            await asyncio.gather(*live, return_exceptions=True)
-
-        # v4·D Phase 4g: unregister the session's surface so skills that
-        # kept a reference to it start seeing dropped sends explicitly.
-        if session_id and self._surface_mgr is not None:
-            try:
-                await self._surface_mgr.unregister_session(session_id)
-            except Exception:
-                logger.debug("surface unregister failed")
-
-        try:
-            # Pause session (not end — it can be resumed)
-            if session_id and self._session_mgr:
-                await self._session_mgr.pause_session(session_id)
-
-            # Mark device offline ONLY if no other active connection for same device.
-            if device_id and self._db:
-                other_active = any(
-                    c.get("device_id") == device_id and c.get("registered")
-                    for cid, c in self._active_connections.items()
-                    if cid != ws_id
-                )
-                if not other_active:
-                    await self._db.set_device_online(device_id, False)
-                    await self._db.add_event(
-                        "device.disconnected", device_id=device_id,
-                        data={"session_id": session_id},
-                    )
-        except (RuntimeError, Exception) as e:
-            # Database may be closed during server shutdown — safe to ignore
-            logger.debug("_handle_disconnect db access failed (shutdown?): %s", e)
-
-        # Shut down pipeline
-        if pipeline:
-            await pipeline.shutdown()
+        SOLID-audit follow-up: full cleanup chain extracted to
+        disconnect_handler.handle_disconnect.  That module owns:
+        bg_task cancel (W14-C06), handler_task cancel (Phase 1
+        / #91), surface unregister (Phase 4g), session pause
+        (NOT end — resumable on reconnect), multi-tab-safe
+        device offline marking, and pipeline shutdown.
+        """
+        await _disconnect_chain(
+            conn_state,
+            active_connections=self._active_connections,
+            session_mgr=self._session_mgr,
+            db=self._db,
+            surface_mgr=self._surface_mgr,
+        )
 
 
 def run_server(config: VoiceConfig) -> None:

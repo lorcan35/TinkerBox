@@ -21,6 +21,7 @@ import aiohttp
 from aiohttp import web, WSMsgType
 
 from dragon_voice.cap_downgrade import maybe_speak_cap_downgrade_alert
+from dragon_voice.config_swap import select_backends_for_mode
 from dragon_voice.conn_state import ConnState
 from dragon_voice.media.store import MediaStore
 from dragon_voice.media.pipeline import MediaPipeline
@@ -2168,48 +2169,15 @@ class VoiceServer:
                 )
                 vmode = VoiceMode.LOCAL
 
-            # STT+TTS: local for LOCAL, cloud for HYBRID/CLOUD/TINKERCLAW
-            if vmode.is_local():
-                stt_be, tts_be = "moonshine", "piper"
-            elif vmode.is_tinkerclaw():
-                # TinkerClaw mode: default local STT/TTS
-                # "cloud" suffix in llm_model → use OpenRouter STT/TTS
-                if llm_model and "cloud" in llm_model.lower():
-                    stt_be, tts_be = "openrouter", "openrouter"
-                else:
-                    stt_be, tts_be = "moonshine", "piper"
-            else:
-                stt_be, tts_be = "openrouter", "openrouter"
-
-            # LLM backend selection
-            if vmode.is_tinkerclaw():
-                # TinkerClaw mode — gateway handles everything
-                llm_be = "tinkerclaw"
-                if llm_model:
-                    conn_config.llm.tinkerclaw_model = llm_model
-            elif vmode.is_cloud():
-                llm_be = "openrouter"
-                if llm_model:
-                    conn_config.llm.openrouter_model = llm_model
-            else:
-                llm_be = conn_config.llm.local_backend or "ollama"
-                if llm_model and llm_be == "ollama" and "/" not in llm_model:
-                    conn_config.llm.ollama_model = llm_model
-                    logger.info("Local model switched to: %s", llm_model)
-
-            # Apply mode-aware system prompt and max_tokens.
-            # TINKERCLAW: skip — TinkerClaw owns personality + token budget.
-            if vmode.is_tinkerclaw():
-                pass  # TinkerClaw manages its own prompts and limits
-            elif vmode.is_local():
-                conn_config.llm.system_prompt = SYSTEM_PROMPT_LOCAL
-                conn_config.llm.max_tokens = MAX_TOKENS_LOCAL
-            elif vmode.is_hybrid():
-                conn_config.llm.system_prompt = SYSTEM_PROMPT_HYBRID
-                conn_config.llm.max_tokens = MAX_TOKENS_HYBRID
-            else:
-                conn_config.llm.system_prompt = SYSTEM_PROMPT_CLOUD
-                conn_config.llm.max_tokens = MAX_TOKENS_CLOUD
+            # SOLID-audit follow-up: backend selection extracted to
+            # config_swap.select_backends_for_mode().  The function
+            # owns the (vmode, llm_model) → (stt, tts, llm) mapping AND
+            # the matching mutation of conn_config.llm (model id +
+            # mode-aware system_prompt + max_tokens).  Behaviour is
+            # bit-for-bit identical to the prior inline chain;
+            # tests/test_config_swap.py pins all 12 branches.
+            sel = select_backends_for_mode(vmode, conn_config, llm_model=llm_model)
+            stt_be, tts_be, llm_be = sel.stt_backend, sel.tts_backend, sel.llm_backend
 
             logger.info("Connection %s: voice_mode=%d (%s) → stt=%s tts=%s llm=%s model=%s tokens=%d",
                         ws_id, int(vmode), vmode.name, stt_be, tts_be, llm_be,

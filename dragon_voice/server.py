@@ -20,6 +20,7 @@ from typing import AsyncIterator, Optional
 import aiohttp
 from aiohttp import web, WSMsgType
 
+from dragon_voice.backend_swap import swap_pipeline_and_conversation_backends
 from dragon_voice.cap_downgrade import maybe_speak_cap_downgrade_alert
 from dragon_voice.codec_negotiation import maybe_swap_uplink_codec
 from dragon_voice.config_swap import select_backends_for_mode
@@ -2238,82 +2239,28 @@ class VoiceServer:
                 conn_config.tts.openrouter_api_key = conn_config.llm.openrouter_api_key
                 conn_config.tts.openrouter_url = conn_config.llm.openrouter_url
 
-            # Hot-swap backends on pipeline AND conversation engine.
+            # SOLID-audit follow-up: pipeline swap + ConvEngine swap
+            # extracted to backend_swap.swap_pipeline_and_conversation_backends.
             # Phase 1 (issue #91): conn_lock acquisition was previously here in
             # the inline body; now handled by `_spawn_handler_task` on the
             # outer task wrapper.  Same US-P01 serialization with stop/text
             # handlers is preserved.
-            pipeline = conn_state.get("pipeline")
-            if pipeline:
-                try:
-                    # swap_backends() now handles cancel internally
-                    # and sets _swapping flag to drop audio during swap
-                    await pipeline.swap_backends(conn_config)
-                    # Inject session key for TinkerClaw conversation continuity.
-                    # Wave 21b (#204): isinstance(SupportsSessionKey) over hasattr.
-                    # `pipeline._llm` is a private attribute on Pipeline; the
-                    # getattr-with-None still guards the rare case where swap
-                    # leaves it unset.
-                    from dragon_voice.llm.base import SupportsSessionKey
-                    pipe_llm = getattr(pipeline, "_llm", None)
-                    if llm_be == "tinkerclaw" and isinstance(pipe_llm, SupportsSessionKey):
-                        pipe_llm.set_session_key(conn_state.get("session_id", ""))
-                except DragonError as de:
-                    # Already a γ-arch structured error — emit verbatim.
-                    logger.warning("Backend swap failed (DragonError): %s", de.message)
-                    await self._safe_send_json(ws, de.to_event())
-                    await self._safe_send_json(ws, {
-                        "type": "config_update",
-                        "voice_mode": 0,
-                    })
-                    return
-                except Exception:
-                    # A4 (audit, #137): the prior code did
-                    # `f"Backend swap failed: {e}"` which leaked raw
-                    # Python exception text (e.g. the multi-line
-                    # OpenRouter / TC ValueError) into Tab5's voice
-                    # caption.  Send a γ-arch error event with a
-                    # user-friendly message instead; the full trace is
-                    # still in the logs via logger.exception below.
-                    logger.exception(
-                        "Backend swap failed for %s",
-                        conn_state.get("ws_id", "?"),
-                    )
-                    await self._safe_send_json(ws, error_event(
-                        code="backend_swap_failed",
-                        message="Couldn't switch backends — reverted to local",
-                        severity=Severity.FATAL,
-                        scope=Scope.LLM,
-                    ))
-                    await self._safe_send_json(ws, {
-                        "type": "config_update",
-                        "voice_mode": 0,
-                    })
-                    return
-
-            # Also swap ConversationEngine LLM (used by _handle_text).
-            # W15-C01: prefer the pooled instance so we don't re-load Ollama /
-            # re-open the aiohttp session on every config_update.  Only the
-            # pipeline owns the shutdown of a pooled backend.
             #
-            # #183 PR 3: when the active backend is the capability-aware
-            # router, voice_mode changes don't require a backend swap —
-            # the router holds the entire fleet and just flips its tier
-            # policy via set_voice_mode().  Saves the cost of recreating
-            # sub-backends + losing their warm-loaded models.
-            # Wave 22b (#202): canonical swap via ConversationEngine.swap_llm —
-            # closes the WS / HTTP swap-path divergence (HTTP path uses
-            # pipeline.swap_backends; ConvEngine now has its own public swap
-            # that both can call going forward).
-            if self._conversation:
-                try:
-                    await self._conversation.swap_llm(
-                        conn_config.llm,
-                        pool=self._backend_pool,
-                        voice_mode=voice_mode,
-                    )
-                except Exception as e:
-                    logger.exception("ConversationEngine LLM swap failed: %s", e)
+            # Returns False on pipeline.swap_backends failure (γ-arch
+            # error_event + revert frames already sent); short-circuit out.
+            # Returns True even if the ConvEngine swap fails (logged but
+            # silent — pipeline swap is the user-visible path).
+            if not await swap_pipeline_and_conversation_backends(
+                ws,
+                conn_state=conn_state,
+                conn_config=conn_config,
+                llm_be=llm_be,
+                voice_mode=int(vmode),
+                conversation=self._conversation,
+                backend_pool=self._backend_pool,
+                safe_send_json=self._safe_send_json,
+            ):
+                return
 
             # Update displayed names
             self._stt_name = stt_be

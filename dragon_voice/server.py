@@ -20,6 +20,7 @@ from typing import AsyncIterator, Optional
 import aiohttp
 from aiohttp import web, WSMsgType
 
+from dragon_voice.conn_state import ConnState
 from dragon_voice.media.store import MediaStore
 from dragon_voice.media.pipeline import MediaPipeline
 from dragon_voice.config import (
@@ -76,7 +77,7 @@ class VoiceServer:
         self._session_count = 0
 
         # Active WebSocket sessions: ws_id -> {pipeline, session_id, device_id}
-        self._active_connections: dict[str, dict] = {}
+        self._active_connections: dict[str, ConnState] = {}
         self._max_connections = 10
         self._purge_task: Optional[asyncio.Task] = None
         self._memory_monitor_task: Optional[asyncio.Task] = None
@@ -647,24 +648,22 @@ class VoiceServer:
 
         _keepalive_task = asyncio.create_task(_ws_keepalive())
 
-        # Connection state — populated after register
-        conn_state: dict = {
-            "ws_id": ws_id,
-            "ws": ws,                # #177: route handlers (video_inject) need the live WS
-            "pipeline": None,
-            "session_id": None,
-            "device_id": None,
-            "registered": False,
-            "mode": "ask",  # "ask" or "dictate"
-            "config": conn_config,  # per-connection config (deep copy of server default)
-            "conn_lock": conn_lock,  # A06: stored so HTTP config handler can serialize
-            "_on_audio": None,   # stored for pipeline re-init (A04)
-            "_on_event": None,
-            # Wave 14 W14-C06: per-connection background tasks (e.g.
-            # cap_downgrade speak_system, out-of-band TTS) tracked here so
-            # _handle_disconnect can cancel them before closing the pipeline.
-            "bg_tasks": set(),
-        }
+        # Connection state — populated after register.
+        #
+        # SOLID-audit follow-up (2026-05-03): converted from untyped
+        # dict literal to typed ConnState dataclass.  All field
+        # defaults that were previously inlined here now live on the
+        # dataclass (pipeline=None, registered=False, mode="ask",
+        # bg_tasks via default_factory=set, ...).  Existing
+        # `state.get("key")` / `state["key"] = ...` patterns continue
+        # to work via the dict-protocol shim on ConnState — no
+        # downstream caller needs to change in this PR.
+        conn_state: ConnState = ConnState(
+            ws_id=ws_id,
+            ws=ws,                # #177: route handlers (video_inject) need the live WS
+            conn_lock=conn_lock,  # A06: stored so HTTP config handler can serialize
+            config=conn_config,   # per-connection config (deep copy of server default)
+        )
         self._active_connections[ws_id] = conn_state
 
         # Callbacks for the pipeline.  v4·D audit P0 fix: route through

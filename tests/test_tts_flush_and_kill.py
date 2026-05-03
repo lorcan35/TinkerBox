@@ -180,12 +180,18 @@ def test_kill_active_procs_called_on_local_tts_timeout() -> None:
 
 def test_kill_active_procs_called_on_openrouter_then_fallback_succeeds() -> None:
     """OpenRouter TTS times out → kill_active_procs called → falls back
-    to a fresh Piper instance which succeeds."""
+    to a fresh Piper instance which succeeds.
+
+    SOLID-audit follow-up: fallback Piper now lives in the
+    FallbackTtsCache (PR #257); pre-cache the backend on
+    `p._fallback_tts_cache._fallback_tts` to skip the lazy-load path.
+    """
     primary = _StallTTS()
     fallback = _OkTTS()
     p = _make_pipeline_with_tts(primary)
     p._config.tts.backend = "openrouter"
-    p._fallback_tts = fallback  # pre-cached so we skip the create_tts call
+    # PR #257: pre-cache the backend inside the cache instance.
+    p._fallback_tts_cache._fallback_tts = fallback
     # Should NOT raise — fallback succeeded
     asyncio.run(p._synthesize_and_send("hello world"))
     assert primary.killed == 1, "primary TTS killed on timeout"
@@ -196,12 +202,17 @@ def test_kill_active_procs_called_on_openrouter_then_fallback_succeeds() -> None
 def test_fallback_piper_also_killed_on_second_timeout() -> None:
     """OpenRouter times out → kill primary → fallback Piper also times
     out → kill fallback → exception swallowed by outer except.
-    Pre-fix the second fallback timeout silently leaked the zombie."""
+    Pre-fix the second fallback timeout silently leaked the zombie.
+
+    SOLID-audit follow-up: fallback Piper now lives in the
+    FallbackTtsCache (PR #257) and the kill_active_procs invariant
+    is pinned by tests/test_fallback_tts_cache.py too.
+    """
     primary = _StallTTS()
     fallback = _StallTTS()  # also stalls
     p = _make_pipeline_with_tts(primary)
     p._config.tts.backend = "openrouter"
-    p._fallback_tts = fallback
+    p._fallback_tts_cache._fallback_tts = fallback
     asyncio.run(p._synthesize_and_send("hello world"))
     assert primary.killed == 1
     assert fallback.killed == 1, (

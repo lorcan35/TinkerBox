@@ -28,9 +28,22 @@ def test_voice_path_uses_mode_aware_tts_timeout() -> None:
 
 
 def test_fallback_piper_timeout_is_90s() -> None:
+    """Audit C3 (#137): fallback Piper budget is 90 s.
+
+    SOLID-audit follow-up: the fallback Piper synth was extracted
+    to FallbackTtsCache (PR #257) which exposes the budget via
+    its `_DEFAULT_FALLBACK_TIMEOUT_S` module constant.  The
+    pipeline call site passes `timeout_s=90.0` explicitly so a
+    future refactor that drifts the value loudly fails this test.
+    """
+    # 1) Constant pin — the cache module owns the canonical 90 s.
+    from dragon_voice.fallback_tts_cache import _DEFAULT_FALLBACK_TIMEOUT_S
+    assert _DEFAULT_FALLBACK_TIMEOUT_S == 90.0, (
+        "C3 expects fallback Piper default timeout=90"
+    )
+
+    # 2) Call-site pin — pipeline.py invokes with explicit 90.0.
     src = inspect.getsource(VoicePipeline._synthesize_and_send)
-    # The fallback path was a hardcoded 30 s; bumped to 90 s to match
-    # the new mode-aware budget for the primary local path.
-    assert "self._fallback_tts.synthesize(text), timeout=90" in src, (
-        "C3 expects fallback Piper timeout=90 (was 30)"
+    assert "timeout_s=90.0" in src, (
+        "C3 expects fallback Piper call site to pass timeout_s=90.0"
     )

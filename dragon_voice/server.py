@@ -38,6 +38,7 @@ from dragon_voice.session_handshake import (
 )
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.surface_register import register_surface_and_replay_scheduler
+from dragon_voice.tool_event_emitter import ToolEventEmitter
 from dragon_voice.media.store import MediaStore
 from dragon_voice.media.pipeline import MediaPipeline
 from dragon_voice.vision_capability import emit_vision_capability
@@ -1116,182 +1117,31 @@ class VoiceServer:
             safe_send_json=self._safe_send_json,
         )
 
-        # Store tool event callbacks per-connection (NOT on shared conversation engine)
+        # SOLID-audit follow-up: tool-event callbacks (the three
+        # async closures `_on_tool_call`, `_on_tool_result`,
+        # `_on_tool_error`) extracted to ToolEventEmitter — a small
+        # stateful class that captures the per-connection state
+        # (ws, conn_state, session_id, safe_send_json, emit_legacy)
+        # at construction and exposes the three callbacks as methods.
+        # Pre-extract this was ~176 LOC of inline closures with all
+        # the β-arch pair-emit + tracker bookkeeping + web_search
+        # auto-widget logic intertwined; now it's 19 unit tests
+        # pinning every branch.
         if self._tool_registry:
-            # β-arch (issue #123): adapter so emit_progress_pair (which
-            # takes an OnEvent: Callable[[dict], Awaitable[None]]) can
-            # use the existing _safe_send_json swallow.  Returning
-            # True/False from the helper is harmless — the pair helper
-            # awaits but discards the return.
-            async def _emit_via_ws(ev: dict) -> None:
-                await self._safe_send_json(ws, ev)
-
-            # Read the bus transition flag once at registration time —
-            # not hot-reloaded.
-            _emit_legacy = bool(getattr(
-                conn_state.get("config"),
-                "progress_bus_emit_legacy",
-                True,
-            ))
-
-            async def _on_tool_call(call):
-                # #75 phase 1b: pre-register the call + args in the
-                # per-turn tracker so `_on_tool_result` can merge the
-                # result into the same record.  The wrap synthesiser
-                # reads both sides (e.g. `remember` needs the `fact`
-                # from args to write "Got it — {fact}.").
-                try:
-                    conn_state.setdefault("tool_calls_this_turn", []).append({
-                        "tool": call.get("tool"),
-                        "args": call.get("args") or {},
-                    })
-                except Exception:
-                    logger.debug("tool_calls_this_turn pre-register suppressed", exc_info=True)
-                # Wave 12 — agent_log recording happens at the
-                # ToolRegistry.execute chokepoint (tools/registry.py)
-                # so it captures every invocation regardless of
-                # caller (WS, REST /tools/{name}/execute, dashboard).
-                # No need to record here.
-                if not ws.closed:
-                    # β-arch (issue #123): pair-emit — legacy
-                    # `tool_call` for unmodified Tab5 + new
-                    # progress.tool.start with the same payload nested.
-                    await emit_progress_pair(
-                        _emit_via_ws,
-                        legacy={
-                            "type": "tool_call",
-                            "tool": call["tool"],
-                            "args": call["args"],
-                        },
-                        phase=Phase.TOOL,
-                        stage=Stage.START,
-                        payload={"tool": call["tool"], "args": call["args"]},
-                        emit_legacy=_emit_legacy,
-                    )
-
-            async def _on_tool_result(result):
-                if ws.closed:
-                    return
-                # β-arch (issue #123): pair-emit — legacy
-                # `tool_result` (with all result fields spread at top
-                # level) + new progress.tool.done with the same fields
-                # nested in payload for the unified bus.
-                await emit_progress_pair(
-                    _emit_via_ws,
-                    legacy={"type": "tool_result", **result},
-                    phase=Phase.TOOL,
-                    stage=Stage.DONE,
-                    payload={
-                        "tool": result.get("tool"),
-                        "result": result.get("result"),
-                        "execution_ms": result.get("execution_ms"),
-                    },
-                    emit_legacy=_emit_legacy,
-                )
-                # #75 phase 1b: merge result into the most-recent
-                # pre-registered call for this tool name (fills the
-                # FIRST pending slot so same-tool-twice-in-one-turn
-                # still maps 1:1).  If no pre-register exists (some
-                # code paths emit tool_result only), append the bare
-                # result so the wrap still has something to describe.
-                try:
-                    tracker = conn_state.setdefault("tool_calls_this_turn", [])
-                    merged = False
-                    for rec in tracker:
-                        if rec.get("tool") == result.get("tool") and "result" not in rec:
-                            rec["result"] = result.get("result")
-                            rec["execution_ms"] = result.get("execution_ms")
-                            merged = True
-                            break
-                    if not merged:
-                        tracker.append(result)
-                except Exception:
-                    logger.debug("tool_calls_this_turn merge suppressed", exc_info=True)
-                # Wave 12 — agent_log close happens at the
-                # ToolRegistry.execute chokepoint, not here.
-                # v4·D Phase 4c: auto-emit widget_list for web_search results
-                # so the Tab5 home live-slot surfaces the top hits without
-                # the LLM having to orchestrate a widget call itself.
-                try:
-                    if result.get("tool") == "web_search":
-                        payload = result.get("result") or {}
-                        hits = payload.get("results") or []
-                        query = payload.get("query", "")
-                        items = []
-                        for r in hits[:5]:
-                            t = str(r.get("title") or r.get("snippet") or "")[:79]
-                            if not t:
-                                continue
-                            items.append({"text": t, "value": ""})
-                        if items:
-                            await ws.send_json({
-                                "type": "widget_list",
-                                "skill_id": "web_search",
-                                "card_id": f"ws_{session_id[:8]}",
-                                "title": (query[:60] or "Web results"),
-                                "tone": "info",
-                                "priority": 70,
-                                "items": items,
-                            })
-                except Exception:
-                    logger.debug("widget_list auto-emit failed", exc_info=True)
-
-            async def _on_tool_error(err: dict):
-                """γ2-M1 (issue #104): emit a structured tool error
-                frame when the parser swallows malformed JSON args.
-
-                Pre-fix the failure was a silent `logger.warning` —
-                the LLM continued without firing the tool and the
-                user saw an empty/generic reply with zero signal that
-                anything was attempted.  Now we surface a TRANSIENT
-                error in the TOOL scope so Tab5 (γ2-H8) can render a
-                non-blocking toast.
-
-                Audit B4 (#137): the err dict's `code` and `message`
-                fields are honoured so ConvEngine can signal e.g.
-                `tool_call_limit_reached` distinct from the original
-                `tool_args_invalid` parse failure.  Default codes
-                preserve back-compat with callers that pre-date B4.
-
-                The raw args are deliberately NOT included in the
-                user-facing message — they may contain prompt-injection
-                content from the LLM and Tab5's caption isn't a safe
-                place to render arbitrary text.  Server log already
-                carries the full failure for ops debugging.
-                """
-                if ws.closed:
-                    return
-                tool_name = err.get("name") or "(unknown)"
-                code = err.get("code") or "tool_args_invalid"
-                message = err.get("message") or (
-                    f"Tool '{tool_name}' had invalid arguments — skipped."
-                )
-                # β-arch (issue #123): pair-emit — legacy γ1 error
-                # frame (already structured per #102) + new
-                # progress.tool.error frame for the unified bus.
-                # Both carry the same code/message/severity/scope
-                # so γ2-H8 routing applies regardless of which
-                # frame Tab5 reads.
-                await emit_progress_pair(
-                    _emit_via_ws,
-                    legacy=error_event(
-                        code=code,
-                        message=message,
-                        severity=Severity.TRANSIENT,
-                        scope=Scope.TOOL,
-                    ),
-                    phase=Phase.TOOL,
-                    stage=Stage.ERROR,
-                    code=code,
-                    message=message,
-                    severity=Severity.TRANSIENT,
-                    scope=Scope.TOOL,
-                    emit_legacy=_emit_legacy,
-                )
-
-            conn_state["on_tool_call"] = _on_tool_call
-            conn_state["on_tool_result"] = _on_tool_result
-            conn_state["on_tool_error"] = _on_tool_error
+            tool_emitter = ToolEventEmitter(
+                ws=ws,
+                conn_state=conn_state,
+                session_id=session_id,
+                safe_send_json=self._safe_send_json,
+                emit_legacy=bool(getattr(
+                    conn_state.get("config"),
+                    "progress_bus_emit_legacy",
+                    True,
+                )),
+            )
+            conn_state["on_tool_call"] = tool_emitter.on_tool_call
+            conn_state["on_tool_result"] = tool_emitter.on_tool_result
+            conn_state["on_tool_error"] = tool_emitter.on_tool_error
 
         # SOLID-audit follow-up: session_start emit + session_messages
         # replay extracted to session_handshake module.  Both run

@@ -25,6 +25,7 @@ from dragon_voice.cap_downgrade import maybe_speak_cap_downgrade_alert
 from dragon_voice.codec_negotiation import maybe_swap_uplink_codec
 from dragon_voice.config_swap import select_backends_for_mode
 from dragon_voice.config_swap_guards import validate_config_swap_prereqs
+from dragon_voice.config_update_ack import emit_config_update_ack
 from dragon_voice.conn_state import ConnState
 from dragon_voice.media.store import MediaStore
 from dragon_voice.media.pipeline import MediaPipeline
@@ -2267,58 +2268,34 @@ class VoiceServer:
             self._tts_name = tts_be
             self._llm_name = llm_be
 
-            # Confirm to Tab5
-            if not ws.closed:
-                # Report actual model for any mode
-                if vmode.is_cloud():
-                    active_model = conn_config.llm.openrouter_model
-                elif llm_be == "tinkerclaw":
-                    active_model = conn_config.llm.tinkerclaw_model
-                elif llm_be == "ollama":
-                    active_model = conn_config.llm.ollama_model
-                else:
-                    active_model = ""
-                # #183 PR 3: when the router is active, advertise the
-                # full per-modality fleet summary so Tab5 firmware can
-                # light up vision/video/audio capability chips
-                # dynamically.  Existing single-backend advertisements
-                # below are unchanged for backward-compat with current
-                # firmware that only reads `vision_capability`.
-                config_payload = {
-                    "stt": stt_be, "tts": tts_be,
-                    "llm": llm_be,
-                    "llm_model": active_model,
-                    "voice_mode": int(vmode),
-                    # cloud_mode is the legacy binary toggle; True for any
-                    # mode that touches cloud (Hybrid/Cloud/TC).  Onboard
-                    # is Tab5-side-only and never reaches Dragon.
-                    "cloud_mode": int(vmode) >= 1,
-                }
-                # Wave 22b (#202): use ConversationEngine.fleet_summary().
-                if self._conversation:
-                    summary = self._conversation.fleet_summary(int(vmode))
-                    if summary is not None:
-                        config_payload["fleet_summary"] = summary
-                await ws.send_json({
-                    "type": "config_update",
-                    "config": config_payload,
-                })
+            # SOLID-audit follow-up: ACK build + active_model
+            # resolution + fleet_summary inclusion all extracted to
+            # config_update_ack.emit_config_update_ack.  Returns the
+            # resolved active_model string so the vision_capability
+            # emit downstream can reuse it for the substring-fallback
+            # display name.
+            active_model = await emit_config_update_ack(
+                ws,
+                vmode=vmode,
+                conn_config=conn_config,
+                backends=sel,
+                conversation=self._conversation,
+                safe_send_json=self._safe_send_json,
+            )
 
-                # v4·D Phase 4b vision capability advertisement.  Tab5's
-                # camera screen renders a "VISION · <model> READY" chip based
-                # on this.  Extracted to vision_capability.emit_vision_capability
-                # in the SOLID-audit follow-up — the inline 80-LOC block was
-                # tangled with the config_update ACK + cap_downgrade speak;
-                # three sub-responsibilities that change for different
-                # reasons (router fleet shape vs Tab5 chip rendering vs cap
-                # policy) and shouldn't share a method body.
-                await emit_vision_capability(
-                    ws,
-                    conversation=self._conversation,
-                    vmode=vmode,
-                    conn_config=conn_config,
-                    active_model=active_model,
-                )
+            # v4·D Phase 4b vision capability advertisement.  Tab5's
+            # camera screen renders a "VISION · <model> READY" chip based
+            # on this.  Both this and the ACK builder above check
+            # ws.closed internally, so they're safe to call
+            # unconditionally — the ws.closed guard that used to wrap
+            # both is gone post-extract.
+            await emit_vision_capability(
+                ws,
+                conversation=self._conversation,
+                vmode=vmode,
+                conn_config=conn_config,
+                active_model=active_model,
+            )
 
             # v4·D Gauntlet G7-F: speak a short alert when the Tab5
             # auto-downgrades because the daily cap was hit.

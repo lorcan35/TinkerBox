@@ -316,7 +316,11 @@ class Database:
         from dragon_voice.db_messages import delete_messages as _impl
         return await _impl(self.conn, session_id)
 
-    # ── Notes ──────────────────────────────────────────────────────────
+    # ── Notes / Events / Config ────────────────────────────────────────
+    # SOLID-audit follow-up (PR #263): notes, events, and
+    # config-store CRUD extracted to db_notes, db_events,
+    # db_config.  Closes audit SRP-7.  Methods below are thin
+    # forwarders so existing call sites keep working.
 
     async def add_note(
         self,
@@ -331,48 +335,26 @@ class Database:
         word_count: int = 0,
         embedding: Optional[bytes] = None,
     ) -> dict:
-        """Insert a note. Returns the note row as dict."""
-        now = time.time()
-        await self.conn.execute(
-            """
-            INSERT INTO notes (id, session_id, title, transcript, summary, tags,
-                               source, duration_s, word_count, embedding, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (note_id, session_id, title, transcript, summary,
-             json.dumps(tags or []), source, duration_s, word_count,
-             embedding, now, now),
+        from dragon_voice.db_notes import add_note as _impl
+        return await _impl(
+            self.conn, note_id=note_id, session_id=session_id,
+            title=title, transcript=transcript, summary=summary,
+            tags=tags, source=source, duration_s=duration_s,
+            word_count=word_count, embedding=embedding,
         )
-        await self.conn.commit()
-
-        cursor = await self.conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,))
-        row = await cursor.fetchone()
-        return dict(row) if row else {}
 
     async def get_note(self, note_id: str) -> Optional[dict]:
-        """Fetch a note by ID."""
-        cursor = await self.conn.execute("SELECT * FROM notes WHERE id = ?", (note_id,))
-        row = await cursor.fetchone()
-        return dict(row) if row else None
+        from dragon_voice.db_notes import get_note as _impl
+        return await _impl(self.conn, note_id)
 
     async def list_notes(
-        self, session_id: Optional[str] = None, limit: int = 50, offset: int = 0
+        self, session_id: Optional[str] = None,
+        limit: int = 50, offset: int = 0,
     ) -> list[dict]:
-        """List notes, optionally filtered by session."""
-        if session_id:
-            cursor = await self.conn.execute(
-                "SELECT * FROM notes WHERE session_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                (session_id, limit, offset),
-            )
-        else:
-            cursor = await self.conn.execute(
-                "SELECT * FROM notes ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                (limit, offset),
-            )
-        rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
-
-    # ── Events ─────────────────────────────────────────────────────────
+        from dragon_voice.db_notes import list_notes as _impl
+        return await _impl(
+            self.conn, session_id=session_id, limit=limit, offset=offset,
+        )
 
     async def add_event(
         self,
@@ -381,17 +363,11 @@ class Database:
         device_id: Optional[str] = None,
         data: Optional[dict] = None,
     ) -> int:
-        """Insert a system event. Returns the auto-incremented event ID."""
-        now = time.time()
-        cursor = await self.conn.execute(
-            """
-            INSERT INTO events (type, session_id, device_id, data, created_at)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (event_type, session_id, device_id, json.dumps(data or {}), now),
+        from dragon_voice.db_events import add_event as _impl
+        return await _impl(
+            self.conn, event_type,
+            session_id=session_id, device_id=device_id, data=data,
         )
-        await self.conn.commit()
-        return cursor.lastrowid
 
     async def get_events(
         self,
@@ -401,96 +377,46 @@ class Database:
         since_id: int = 0,
         limit: int = 100,
     ) -> list[dict]:
-        """Get events with optional filters. Supports polling via since_id."""
-        conditions = ["id > ?"]
-        params: list[Any] = [since_id]
-
-        if event_type:
-            conditions.append("type = ?")
-            params.append(event_type)
-        if session_id:
-            conditions.append("session_id = ?")
-            params.append(session_id)
-        if device_id:
-            conditions.append("device_id = ?")
-            params.append(device_id)
-
-        where = f"WHERE {' AND '.join(conditions)}"
-        cursor = await self.conn.execute(
-            f"SELECT * FROM events {where} ORDER BY id ASC LIMIT ?",
-            (*params, limit),
+        from dragon_voice.db_events import get_events as _impl
+        return await _impl(
+            self.conn,
+            event_type=event_type, session_id=session_id,
+            device_id=device_id, since_id=since_id, limit=limit,
         )
-        rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
-
-    # ── Config Store ───────────────────────────────────────────────────
 
     async def get_config(
-        self,
-        key: str,
-        scope: str = "global",
-        scope_id: Optional[str] = None,
+        self, key: str,
+        scope: str = "global", scope_id: Optional[str] = None,
     ) -> Optional[str]:
-        """Get a config value. Returns JSON-encoded string or None."""
-        cursor = await self.conn.execute(
-            "SELECT value FROM config WHERE key = ? AND scope = ? AND scope_id IS ?",
-            (key, scope, scope_id),
-        )
-        row = await cursor.fetchone()
-        return row["value"] if row else None
+        from dragon_voice.db_config import get_config as _impl
+        return await _impl(self.conn, key, scope=scope, scope_id=scope_id)
 
     async def set_config(
-        self,
-        key: str,
-        value: str,
-        scope: str = "global",
-        scope_id: Optional[str] = None,
+        self, key: str, value: str,
+        scope: str = "global", scope_id: Optional[str] = None,
     ) -> None:
-        """Set a config value (upsert). Value should be JSON-encoded."""
-        now = time.time()
-        await self.conn.execute(
-            """
-            INSERT INTO config (key, value, scope, scope_id, updated_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(key, scope, scope_id) DO UPDATE SET
-                value = excluded.value,
-                updated_at = excluded.updated_at
-            """,
-            (key, value, scope, scope_id, now),
-        )
-        await self.conn.commit()
+        from dragon_voice.db_config import set_config as _impl
+        await _impl(self.conn, key, value, scope=scope, scope_id=scope_id)
 
-    async def get_resolved_config(self, key: str, device_id: Optional[str] = None,
-                                   session_id: Optional[str] = None) -> Optional[str]:
-        """Get config with scope resolution: session > device > global."""
-        # Try session scope first
-        if session_id:
-            val = await self.get_config(key, "session", session_id)
-            if val is not None:
-                return val
-        # Then device scope
-        if device_id:
-            val = await self.get_config(key, "device", device_id)
-            if val is not None:
-                return val
-        # Fall back to global
-        return await self.get_config(key, "global")
-
-    async def list_config(self, scope: str = "global", scope_id: Optional[str] = None) -> dict[str, str]:
-        """List all config entries for a given scope."""
-        cursor = await self.conn.execute(
-            "SELECT key, value FROM config WHERE scope = ? AND scope_id IS ?",
-            (scope, scope_id),
+    async def get_resolved_config(
+        self, key: str,
+        device_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> Optional[str]:
+        from dragon_voice.db_config import get_resolved_config as _impl
+        return await _impl(
+            self.conn, key, device_id=device_id, session_id=session_id,
         )
-        rows = await cursor.fetchall()
-        return {row["key"]: row["value"] for row in rows}
 
-    async def delete_config(self, key: str, scope: str = "global",
-                            scope_id: Optional[str] = None) -> bool:
-        """Delete a config key. Returns True if a row was deleted."""
-        cursor = await self.conn.execute(
-            "DELETE FROM config WHERE key = ? AND scope = ? AND scope_id IS ?",
-            (key, scope, scope_id),
-        )
-        await self.conn.commit()
-        return cursor.rowcount > 0
+    async def list_config(
+        self, scope: str = "global", scope_id: Optional[str] = None,
+    ) -> dict[str, str]:
+        from dragon_voice.db_config import list_config as _impl
+        return await _impl(self.conn, scope=scope, scope_id=scope_id)
+
+    async def delete_config(
+        self, key: str,
+        scope: str = "global", scope_id: Optional[str] = None,
+    ) -> bool:
+        from dragon_voice.db_config import delete_config as _impl
+        return await _impl(self.conn, key, scope=scope, scope_id=scope_id)

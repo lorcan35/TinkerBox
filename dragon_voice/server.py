@@ -39,6 +39,7 @@ from dragon_voice.session_handshake import (
 from dragon_voice.empty_response_wrap import maybe_synthesize_empty_response_wrap
 from dragon_voice.text_path_tts import synthesize_and_stream_text_response
 from dragon_voice.tinkerclaw_text_path import handle_tinkerclaw_text_path
+from dragon_voice.local_text_stream import stream_local_text_with_tool_filter
 from dragon_voice.rich_media_emit import emit_rich_media_for_text_turn
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.surface_register import register_surface_and_replay_scheduler
@@ -1413,70 +1414,24 @@ class VoiceServer:
             return
 
         try:
-            # Stream LLM response via conversation engine.
-            #
-            # Wave 10 audit #78 fix: buffer tokens client-side before
-            # forwarding so a stray `<tool>...</tool><args>...</args>`
-            # block emitted mid-stream by qwen3:1.7b (or any small model
-            # with a shaky tool-call grammar) never reaches the chat
-            # bubble. conversation.py already strips markup on the
-            # final-yield fallthrough path, but the happy path yields
-            # one token at a time — a raw `<tool>` tag can land in Tab5
-            # before the LLM finishes emitting the closing `</tool>`.
-            #
-            # Strategy: hold tokens in a rolling buffer. When the buffer
-            # contains a complete `<tool>...</args>` block, strip it
-            # before flushing. Emit the remaining prefix on every tick
-            # so streaming latency stays low for normal text.
-            full_response = []
-            pending = ""  # tokens not yet safe to forward
-            import re as _re
-            _TOOL_RE_LOCAL = _re.compile(
-                r"<tool>[\s\S]*?</tool>\s*<args>[\s\S]*?</args>\s*>?",
-                _re.IGNORECASE,
+            # SOLID-audit follow-up: local-path token streaming +
+            # mid-stream tool-marker stripping extracted to
+            # local_text_stream.stream_local_text_with_tool_filter.
+            # That module owns: rolling buffer, complete-block
+            # strip, partial-marker hold-back, end-of-stream
+            # final-strip, and the #75 Phase 1a
+            # WS-keepalive-during-inference wrap.  Returns
+            # (full_response, response_text) so downstream stages
+            # (rich-media gate, empty-response wrap, TTS) get the
+            # same shape they had pre-extract.
+            full_response, response_text = await stream_local_text_with_tool_filter(
+                ws,
+                conversation=self._conversation,
+                session_id=session_id,
+                content=content,
+                conn_state=conn_state,
+                ws_keepalive=self._ws_keepalive_during_inference,
             )
-            # #75 phase 1a: same PING-during-inference protection used
-            # on the TC + vision paths above.  Local Ollama + ConversationEngine
-            # text turns on 4 B-class models routinely exceed 60 s, which
-            # trips Tab5's PONG-watch (~30 s) without this helper and
-            # triggers the P13 eviction race.
-            async with self._ws_keepalive_during_inference(ws, label="local_text"):
-                async for token in self._conversation.process_text_stream(
-                    session_id=session_id,
-                    text=content,
-                    input_mode="text",
-                    on_tool_call=conn_state.get("on_tool_call"),
-                    on_tool_result=conn_state.get("on_tool_result"),
-                    on_tool_error=conn_state.get("on_tool_error"),
-                ):
-                    full_response.append(token)
-                    pending += token
-                    # Strip any complete tool blocks sitting in the pending
-                    # buffer. Substitute in-place so remaining prose still
-                    # flushes below.
-                    stripped = _TOOL_RE_LOCAL.sub("", pending)
-                    if stripped != pending:
-                        pending = stripped
-                    # Hold back the tail if it looks like a partial tool
-                    # marker so we don't flush `<tool>dat` to the client and
-                    # then have to retract it.
-                    hold_at = -1
-                    for marker in ("<tool>", "<tool", "</tool", "<args", "</args"):
-                        idx = pending.rfind(marker)
-                        if idx >= 0 and idx > hold_at:
-                            hold_at = idx
-                    if hold_at >= 0:
-                        flush, pending = pending[:hold_at], pending[hold_at:]
-                    else:
-                        flush, pending = pending, ""
-                    if flush and not ws.closed:
-                        await ws.send_json({"type": "llm", "text": flush})
-                # End-of-stream: flush whatever remains, stripped one more time.
-                pending = _TOOL_RE_LOCAL.sub("", pending)
-                if pending and not ws.closed:
-                    await ws.send_json({"type": "llm", "text": pending})
-
-            response_text = _TOOL_RE_LOCAL.sub("", "".join(full_response))
 
             # SOLID-audit follow-up: same empty-response guard as
             # the TC path above, but with fallback_when_no_tools=None

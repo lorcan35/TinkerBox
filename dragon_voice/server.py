@@ -40,6 +40,7 @@ from dragon_voice.empty_response_wrap import maybe_synthesize_empty_response_wra
 from dragon_voice.text_path_tts import synthesize_and_stream_text_response
 from dragon_voice.tinkerclaw_text_path import handle_tinkerclaw_text_path
 from dragon_voice.local_text_stream import stream_local_text_with_tool_filter
+from dragon_voice.vision_turn import handle_vision_turn
 from dragon_voice.rich_media_emit import emit_rich_media_for_text_turn
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.surface_register import register_surface_and_replay_scheduler
@@ -1715,104 +1716,23 @@ class VoiceServer:
         memory injection, tool-calling, and (most importantly) the
         multimodal user message is persisted so subsequent text turns can
         still see the image (cross-modal continuity).
+
+        SOLID-audit follow-up: vision-turn body extracted to
+        vision_turn.handle_vision_turn.  That module owns: media-id
+        lookup, capability-driven vision check, per-turn tool
+        tracker reset, ConvEngine streaming with the keepalive
+        wrap, the #75 Phase 1b empty-reply wrap, and the always-
+        llm_done invariant.
         """
-        media_id = cmd.get("media_id", "")
-        text = cmd.get("text", "What's in this image?")
-        session_id = conn_state.get("session_id", "")
-
-        image_path = await self._media_store.get_path(media_id)
-        if not image_path:
-            if not ws.closed:
-                await ws.send_json(error_event(
-                    code="media_not_found",
-                    message="Image not found — please retake the photo.",
-                    severity=Severity.TRANSIENT, scope=Scope.MEDIA,
-                ))
-            return
-
-        # #183 PR 3: capability-driven vision check.  Replaces the old
-        # substring check on the model name.  Works uniformly for all
-        # backend types — single-backend setups query the active model's
-        # declared caps; router setups query the union of caps available
-        # in the current tier.
-        from dragon_voice.llm.base import Modality
-        conv = conn_state.get("conversation") or self._conversation
-        llm_backend = getattr(conv, "_llm", None) if conv else None
-        if not llm_backend:
-            if not ws.closed:
-                await ws.send_json(error_event(
-                    code="no_llm_available",
-                    message="No language model is configured.  Check Settings.",
-                    severity=Severity.FATAL, scope=Scope.LLM,
-                ))
-            return
-        if Modality.VISION not in llm_backend.capabilities:
-            if not ws.closed:
-                await ws.send_json(error_event(
-                    code="vision_unsupported",
-                    message="Image analysis needs a vision-capable model.",
-                    severity=Severity.FATAL, scope=Scope.LLM,
-                ))
-            return
-
-        # #75 phase 1b: reset per-turn tool tracker on this path too.
-        conn_state["tool_calls_this_turn"] = []
-
-        # #183 PR 3: route through ConversationEngine.process_text_stream
-        # with media_id set — ConvEngine persists the multimodal user
-        # message via MessageStore (encoded with the multimodal marker)
-        # and on context build hydrates it back to an OpenAI image_url
-        # content array.  Tools, memory, and cross-modal continuity all
-        # work the same as text turns.
-        full_response = []
-        try:
-            async with self._ws_keepalive_during_inference(ws, label="vision"):
-                async for token in conv.process_text_stream(
-                    session_id=session_id,
-                    text=text,
-                    input_mode="vision",
-                    media_id=media_id,
-                ):
-                    full_response.append(token)
-                    if not ws.closed:
-                        await ws.send_json({"type": "llm", "text": token})
-        except Exception as e:
-            logger.error("user_media LLM failed: %s", e)
-            if not ws.closed:
-                # Phase 3 γ1: was raw `str(e)` — leaked Python exception
-                # text (e.g. "list index out of range") into Tab5's voice
-                # caption.  Now a stable, user-friendly message keyed by
-                # `vision_failed`; cause kept in the server log only.
-                await ws.send_json(error_event(
-                    code="vision_failed",
-                    message="Image analysis failed — please try again.",
-                    severity=Severity.TRANSIENT,
-                    scope=Scope.LLM,
-                ))
-            return
-
-        # #75 phase 1b: vision path gets the same empty-reply guard as
-        # the text paths.  Multimodal models can fire a tool (e.g.
-        # `note` to save a snapshot caption) and stop without text.
-        if not looks_like_useful_text("".join(full_response)):
-            tool_calls = conn_state.get("tool_calls_this_turn") or []
-            if tool_calls:
-                wrap = synthesize_wrap(tool_calls)
-                logger.info(
-                    "#75 phase 1b: vision path emitted near-empty text with "
-                    "%d tool fire(s) — sending template wrap (%d chars)",
-                    len(tool_calls), len(wrap),
-                )
-                if not ws.closed:
-                    await ws.send_json({"type": "llm", "text": wrap})
-                full_response.append(wrap)
-
-        if not ws.closed:
-            await ws.send_json({"type": "llm_done", "llm_ms": 0})
-
-        # ConversationEngine already persisted the assistant response
-        # via process_text_stream (look for `add_message(role="assistant"
-        # ...)` in conversation.py).  No second persist needed here.
+        await handle_vision_turn(
+            ws,
+            cmd=cmd,
+            conn_state=conn_state,
+            conversation=self._conversation,
+            media_store=self._media_store,
+            ws_keepalive=self._ws_keepalive_during_inference,
+            safe_send_json=self._safe_send_json,
+        )
 
     async def _handle_disconnect(self, conn_state: dict) -> None:
         """Handle WebSocket disconnect: pause session, mark device offline."""

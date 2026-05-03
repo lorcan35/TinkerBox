@@ -46,6 +46,7 @@ from dragon_voice.ws_keepalive import run_ws_keepalive
 from dragon_voice.binary_frame_dispatch import dispatch_binary_frame
 from dragon_voice.cancel_handler import handle_cancel_command
 from dragon_voice.clear_handler import handle_clear_command
+from dragon_voice.stop_handler import handle_stop_command
 from dragon_voice.rich_media_emit import emit_rich_media_for_text_turn
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.surface_register import register_surface_and_replay_scheduler
@@ -690,33 +691,23 @@ class VoiceServer:
                                 await pipeline.process_segment()
 
                     elif cmd_type == "stop":
-                        pipeline = conn_state.get("pipeline")
-                        if pipeline:
-                            mode = conn_state.get("mode", "ask")
-                            buf_size = len(pipeline._audio_buffer) + len(pipeline._segment_buffer)
-                            logger.info("Connection %s: stop (mode=%s, buffer=%d bytes)", ws_id, mode, buf_size)
-                            async with conn_lock:  # US-P10: serialize with text
-                                if mode == "dictate":
-                                    transcript = await pipeline.finish_dictation()
-                                    # Auto-save dictation to Dragon notes DB
-                                    if transcript and len(transcript.strip()) > 10 and self._notes_svc:
-                                        try:
-                                            note = await self._notes_svc.create_from_text(
-                                                transcript.strip(), title=""
-                                            )
-                                            logger.info("Auto-created note %s from dictation (%d chars)",
-                                                        note.id, len(transcript))
-                                            if not ws.closed:
-                                                await ws.send_json({
-                                                    "type": "note_created",
-                                                    "note_id": note.id,
-                                                    "title": note.title,
-                                                    "transcript": transcript[:200],
-                                                })
-                                        except Exception as e:
-                                            logger.error("Failed to auto-create dictation note: %s", e)
-                                else:
-                                    await pipeline.start_processing()
+                        # SOLID-audit follow-up: stop chain extracted
+                        # to stop_handler.handle_stop_command.  That
+                        # module owns: pipeline.finish_dictation OR
+                        # start_processing dispatch by mode, the
+                        # >10-char dictation auto-note gate, the
+                        # create_from_text failure swallow, the
+                        # 200-char transcript truncation in the
+                        # note_created frame, and the conn_lock
+                        # serialise (US-P10) with concurrent text
+                        # cmd handlers.
+                        await handle_stop_command(
+                            ws,
+                            ws_id=ws_id,
+                            conn_state=conn_state,
+                            conn_lock=conn_lock,
+                            notes_svc=self._notes_svc,
+                        )
 
                     elif cmd_type == "clear":
                         # SOLID-audit follow-up: clear chain extracted

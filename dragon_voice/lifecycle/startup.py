@@ -69,63 +69,14 @@ async def run_startup(server: Any, app: web.Application) -> None:
     # Message store
     server._message_store = MessageStore(server._db)
 
-    # Memory service (agentic: facts + documents + RAG) + core tools
-    server._memory_service = None
-    server._tool_registry = None
-    try:
-        from dragon_voice.memory import MemoryService
-        from dragon_voice.tools import ToolRegistry
-        from dragon_voice.tools.web_search import WebSearchTool
-        from dragon_voice.tools.datetime_tool import DateTimeTool
-
-        server._memory_service = MemoryService(
-            server._db,
-            ollama_url=server._config.llm.ollama_url,
-            # δ3 / D-docs (issue #118): wire the configured ingest cap.
-            max_document_bytes=server._config.memory.max_document_bytes,
-        )
-        await server._memory_service.initialize()
-
-        server._tool_registry = ToolRegistry()
-        server._tool_registry.register(WebSearchTool(
-            searxng_url=getattr(server._config.tools, "searxng_url", "")
-        ))
-        server._tool_registry.register(DateTimeTool())
-
-        # Memory tools need memory_service
-        from dragon_voice.tools.memory_tools import (
-            ForgetFactTool, RecallFactsTool, StoreFactTool,
-        )
-        server._tool_registry.register(StoreFactTool(server._memory_service))
-        server._tool_registry.register(RecallFactsTool(server._memory_service))
-        # v4·D Gauntlet G9: two-step confirm-gated forget_fact tool.
-        server._tool_registry.register(ForgetFactTool(server._memory_service))
-
-        # Tier 1 tools.  Audit D8/K7 dedup (2026-04-20): TimerTool is
-        # no longer registered here — TimesenseTool (registered below
-        # after SurfaceManager init) covers "set a timer" AND emits
-        # widget_live progress.  Keeping both caused the LLM to pick
-        # TimerTool on short phrases, making the widget reference flow
-        # unreachable.  TimerTool class file is retained for REST-only
-        # callers; it's just not wired into the agentic loop.
-        from dragon_voice.tools.calculator_tool import CalculatorTool
-        from dragon_voice.tools.stock_ticker_tool import StockTickerTool
-        from dragon_voice.tools.system_tool import SystemInfoTool
-        from dragon_voice.tools.unit_converter_tool import UnitConverterTool
-        from dragon_voice.tools.weather_tool import WeatherTool
-
-        server._tool_registry.register(WeatherTool())
-        server._tool_registry.register(CalculatorTool())
-        server._tool_registry.register(UnitConverterTool())
-        server._tool_registry.register(SystemInfoTool())
-        server._tool_registry.register(StockTickerTool())
-
-        logger.info(
-            "Agentic modules initialized (tools: %d, memory: ok)",
-            len(server._tool_registry.list_tools()),
-        )
-    except Exception as e:
-        logger.warning("Agentic modules not available: %s", e)
+    # SOLID-audit follow-up: agentic init (MemoryService +
+    # ToolRegistry + 8 tier-1 tools) extracted to
+    # lifecycle/agentic_init.py.  Mutates _memory_service and
+    # _tool_registry in place; whole chain wrapped in try/except
+    # so a missing optional dep (no Ollama for embeddings) logs
+    # at WARNING but doesn't block boot.
+    from dragon_voice.lifecycle.agentic_init import init_agentic_modules
+    await init_agentic_modules(server)
 
     # v4·D Phase 4g stability fix (audit P0 #1): SurfaceManager so Tab5
     # widget_action events have somewhere to land.

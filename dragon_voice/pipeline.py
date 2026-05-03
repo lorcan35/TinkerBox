@@ -1491,66 +1491,93 @@ class VoicePipeline:
             old_config = self._config
             self._config = config
 
-            # W15-C01: pool-aware swap — prefer reusing existing pooled
-            # backend for the NEW signature; only tear down the old one
-            # if it wasn't pooled.
-            pool = self._backend_pool
-            tasks = []
+            # W15-C01: pool-aware swap — prefer reusing existing
+            # pooled backend for the NEW signature; only tear
+            # down the old one if it wasn't pooled.
+            #
+            # SOLID-audit follow-up: the three near-identical
+            # STT/TTS/LLM swap blocks dedupped to
+            # pool_aware_swap.swap_one_backend (PR #258).
+            from dragon_voice.pool_aware_swap import swap_one_backend
 
-            # STT
-            if (
+            pool = self._backend_pool
+            init_tasks = []
+
+            stt_changed = (
                 config.stt.backend != old_config.stt.backend
                 or config.stt.model != old_config.stt.model
-            ):
-                logger.info("Swapping STT: %s -> %s", old_config.stt.backend, config.stt.backend)
-                if self._stt and not self._pooled_stt:
-                    await self._stt.shutdown()
-                new_key = _stt_sig(config.stt)
-                if pool is not None and new_key in pool:
-                    self._stt = pool[new_key]
-                    self._pooled_stt = True
-                else:
-                    self._stt = create_stt(config.stt)
-                    self._pooled_stt = False
-                    tasks.append((self._stt, new_key, "stt"))
+            )
+            if stt_changed:
+                logger.info(
+                    "Swapping STT: %s -> %s",
+                    old_config.stt.backend, config.stt.backend,
+                )
+            stt_result = await swap_one_backend(
+                kind="stt",
+                config_changed=stt_changed,
+                old_instance=self._stt,
+                old_is_pooled=self._pooled_stt,
+                new_signature=_stt_sig(config.stt),
+                new_factory=lambda: create_stt(config.stt),
+                pool=pool,
+            )
+            self._stt = stt_result.new_instance
+            self._pooled_stt = stt_result.is_pooled
+            if stt_result.init_task is not None:
+                init_tasks.append(stt_result.init_task)
 
-            # TTS
-            if config.tts.backend != old_config.tts.backend:
-                logger.info("Swapping TTS: %s -> %s", old_config.tts.backend, config.tts.backend)
-                if self._tts and not self._pooled_tts:
-                    await self._tts.shutdown()
-                new_key = _tts_sig(config.tts)
-                if pool is not None and new_key in pool:
-                    self._tts = pool[new_key]
-                    self._pooled_tts = True
-                else:
-                    self._tts = create_tts(config.tts)
-                    self._pooled_tts = False
-                    tasks.append((self._tts, new_key, "tts"))
+            tts_changed = config.tts.backend != old_config.tts.backend
+            if tts_changed:
+                logger.info(
+                    "Swapping TTS: %s -> %s",
+                    old_config.tts.backend, config.tts.backend,
+                )
+            tts_result = await swap_one_backend(
+                kind="tts",
+                config_changed=tts_changed,
+                old_instance=self._tts,
+                old_is_pooled=self._pooled_tts,
+                new_signature=_tts_sig(config.tts),
+                new_factory=lambda: create_tts(config.tts),
+                pool=pool,
+            )
+            self._tts = tts_result.new_instance
+            self._pooled_tts = tts_result.is_pooled
+            if tts_result.init_task is not None:
+                init_tasks.append(tts_result.init_task)
 
-            # LLM
-            if (
+            llm_changed = (
                 config.llm.backend != old_config.llm.backend
                 or config.llm.ollama_model != old_config.llm.ollama_model
-            ):
-                logger.info("Swapping LLM: %s -> %s", old_config.llm.backend, config.llm.backend)
-                if self._llm and not self._pooled_llm:
-                    await self._llm.shutdown()
-                new_key = _llm_sig(config.llm)
-                if pool is not None and new_key in pool:
-                    self._llm = pool[new_key]
-                    self._pooled_llm = True
-                else:
-                    self._llm = create_llm(config.llm)
-                    self._pooled_llm = False
-                    tasks.append((self._llm, new_key, "llm"))
+            )
+            if llm_changed:
+                logger.info(
+                    "Swapping LLM: %s -> %s",
+                    old_config.llm.backend, config.llm.backend,
+                )
+            llm_result = await swap_one_backend(
+                kind="llm",
+                config_changed=llm_changed,
+                old_instance=self._llm,
+                old_is_pooled=self._pooled_llm,
+                new_signature=_llm_sig(config.llm),
+                new_factory=lambda: create_llm(config.llm),
+                pool=pool,
+            )
+            self._llm = llm_result.new_instance
+            self._pooled_llm = llm_result.is_pooled
+            if llm_result.init_task is not None:
+                init_tasks.append(llm_result.init_task)
 
-            if tasks:
-                await asyncio.gather(*(t[0].initialize() for t in tasks))
-                # Register freshly-created backends in the pool.
+            if init_tasks:
+                await asyncio.gather(*(t.instance.initialize() for t in init_tasks))
+                # Register freshly-created backends in the pool
+                # AFTER successful initialize so a failed init
+                # doesn't leave a half-constructed backend in
+                # the pool.
                 if pool is not None:
-                    for backend, key, _kind in tasks:
-                        pool[key] = backend
+                    for t in init_tasks:
+                        pool[t.key] = t.instance
                 logger.info("Backend swap complete")
 
             # Audit B6 (#154): when swapping INTO a cloud STT mode,

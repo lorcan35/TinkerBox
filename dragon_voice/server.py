@@ -36,6 +36,7 @@ from dragon_voice.session_handshake import (
     emit_session_start,
     replay_session_message_tail,
 )
+from dragon_voice.rich_media_emit import emit_rich_media_for_text_turn
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.surface_register import register_surface_and_replay_scheduler
 from dragon_voice.tool_event_emitter import ToolEventEmitter
@@ -1522,35 +1523,18 @@ class VoiceServer:
                 except Exception:
                     logger.debug("TC receipt emit failed", exc_info=True)
 
-            # Rich media detection for TinkerClaw responses too.
-            # Audit D4 (#137): emit a progress signal BEFORE rendering
-            # if there's renderable content, so Tab5 doesn't perceive
-            # the 1-3 s code-block render as a stalled reply.
-            if full_response and self._media_pipeline:
-                if not ws.closed and self._media_pipeline.has_renderable_content(response_text):
-                    await self._safe_send_json(ws, {
-                        "type": "media_rendering",
-                        "stage": "start",
-                    })
-                try:
-                    media_events = await self._media_pipeline.process_response(
-                        response_text, session_id
-                    )
-                    # Audit D6 (TC path): send text_update BEFORE media events
-                    # so Tab5's last-bubble targeting still points at the
-                    # text bubble when the clear arrives.
-                    if media_events:
-                        logger.info("Sent %d media events for TinkerClaw response", len(media_events))
-                        cleaned = self._media_pipeline.strip_rendered_content(response_text, media_events)
-                        logger.info("Text stripped: %d→%d chars", len(response_text), len(cleaned))
-                        if not ws.closed:
-                            await ws.send_json({"type": "text_update", "text": cleaned})
-                            logger.info("Sent text_update (D6 TC) with %d chars", len(cleaned))
-                    for event in media_events:
-                        if not ws.closed:
-                            await ws.send_json(event)
-                except Exception as e:
-                    logger.warning("TinkerClaw media detection failed: %s", e)
+            # SOLID-audit follow-up: rich media detection extracted to
+            # rich_media_emit.emit_rich_media_for_text_turn (dedup with
+            # the local-path branch below).
+            if full_response:
+                await emit_rich_media_for_text_turn(
+                    ws,
+                    response_text=response_text,
+                    media_pipeline=self._media_pipeline,
+                    session_id=session_id,
+                    safe_send_json=self._safe_send_json,
+                    log_label="tc",
+                )
 
             return
 
@@ -1643,42 +1627,20 @@ class VoiceServer:
             if not ws.closed:
                 await ws.send_json({"type": "llm_done", "llm_ms": 0})
 
-            # Rich media detection — scan response for image/chart/map references.
-            # Audit D6: send text_update BEFORE media events. Tab5's
-            # ui_chat_update_last_message targets the *last* chat bubble. If
-            # we send media first, the image becomes "last" and the empty-
-            # string text_update removes the wrong row. text_update first
-            # clears the streamed markdown bubble; media events then append
-            # the rendered JPEG below.
+            # SOLID-audit follow-up: rich media detection extracted to
+            # rich_media_emit.emit_rich_media_for_text_turn (dedup with
+            # the TC bypass branch above).  Audit D6 ordering invariant
+            # (text_update BEFORE media events) is preserved + pinned
+            # by tests/test_rich_media_emit.py.
             if full_response:
-                # Audit D4 (#137): emit progress before render so Tab5
-                # doesn't perceive the 1-3 s code-block render as a
-                # stalled reply.
-                if not ws.closed and self._media_pipeline.has_renderable_content(response_text):
-                    await self._safe_send_json(ws, {
-                        "type": "media_rendering",
-                        "stage": "start",
-                    })
-                try:
-                    media_events = await self._media_pipeline.process_response(
-                        response_text, session_id
-                    )
-                    logger.info("MediaPipeline: %d event(s) for response len=%d",
-                                len(media_events), len(response_text))
-                    if media_events:
-                        cleaned = self._media_pipeline.strip_rendered_content(
-                            response_text, media_events
-                        )
-                        logger.info("strip_rendered_content: %d->%d chars",
-                                    len(response_text), len(cleaned))
-                        if not ws.closed:
-                            await ws.send_json({"type": "text_update", "text": cleaned})
-                            logger.info("Sent text_update (D6) with %d chars", len(cleaned))
-                    for event in media_events:
-                        if not ws.closed:
-                            await ws.send_json(event)
-                except Exception as e:
-                    logger.warning("Media detection failed: %s", e)
+                await emit_rich_media_for_text_turn(
+                    ws,
+                    response_text=response_text,
+                    media_pipeline=self._media_pipeline,
+                    session_id=session_id,
+                    safe_send_json=self._safe_send_json,
+                    log_label="local",
+                )
 
             # Synthesize TTS for the text response (only if response_mode != match_input)
             # match_input = text in, text out. always_speak = always TTS.

@@ -847,23 +847,17 @@ class VoicePipeline:
             logger.info("STT (%.0fms): %s", stt_ms, transcript)
             await self._on_event({"type": "stt", "text": transcript, "stt_ms": round(stt_ms)})
 
-            # Audit F4 (2026-04-20): emit STT receipt so Tab5's per-turn
-            # transparency + budget tracker can see which STT backend ran
-            # and how long it took.  Cost_mils=0 for local Moonshine;
-            # OpenRouter STT cost would need per-audio-second pricing
-            # which the STT class doesn't currently expose — stub at 0
-            # and let the cloud-STT path surface its own charge later.
-            try:
-                _stt_backend = self._config.stt.backend or "stt"
-                await self._on_event({
-                    "type": "receipt",
-                    "stage": "stt",
-                    "model": _stt_backend,
-                    "stt_ms": round(stt_ms),
-                    "cost_mils": 0,
-                })
-            except Exception as _e:
-                logger.debug("STT receipt emit failed: %s", _e)
+            # SOLID-audit follow-up (PR #266 / SRP-10): STT
+            # receipt emit extracted to
+            # voice_path_receipt.emit_voice_path_stt_receipt.
+            from dragon_voice.voice_path_receipt import (
+                emit_voice_path_stt_receipt,
+            )
+            await emit_voice_path_stt_receipt(
+                self._on_event,
+                stt_backend=self._config.stt.backend,
+                stt_ms=stt_ms,
+            )
 
             if self._cancelled:
                 return
@@ -1106,60 +1100,16 @@ class VoicePipeline:
             logger.info("LLM (%.0fms): %s", llm_ms, full_response[:80])
             await self._on_event({"type": "llm_done", "llm_ms": round(llm_ms)})
 
-            # Phase 3 per-turn receipt. Only emit when the LLM is the
-            # OpenRouter backend (it's the only backend where we can
-            # charge real money); local (ollama, npu_genie) turns are
-            # free and don't need a receipt.  If the LLM exposes
-            # get_last_usage() we compute cost from the pricing table.
-            try:
-                # Wave 21b (#204): isinstance(SupportsUsage) over hasattr.
-                if isinstance(self._llm, SupportsUsage):
-                    usage = self._llm.get_last_usage()
-                    if usage and usage.get("total_tokens"):
-                        from dragon_voice.llm.openrouter_llm import price_for_model
-                        cost_mils = price_for_model(
-                            usage["model"],
-                            usage.get("prompt_tokens", 0),
-                            usage.get("completion_tokens", 0),
-                        )
-                        await self._on_event({
-                            "type": "receipt",
-                            "stage": "llm",
-                            "model": usage["model"],
-                            "prompt_tokens":     usage.get("prompt_tokens", 0),
-                            "completion_tokens": usage.get("completion_tokens", 0),
-                            "total_tokens":      usage.get("total_tokens", 0),
-                            "cost_mils":         cost_mils,
-                            "llm_ms":            round(llm_ms),
-                            # v4·D Gauntlet G2: surface retries so the chat
-                            # bubble can stamp a "retried" chip instead of
-                            # silently presenting a possibly-degraded reply.
-                            "retried":           bool(usage.get("retried", False)),
-                            "retry_reason":      usage.get("retry_reason", ""),
-                        })
-            except Exception as e:
-                # Never let receipt emission break the turn.  v4·D audit
-                # P0 fix: emit a MINIMAL receipt even when the usage-
-                # based path failed so the Tab5 chat bubble still gets a
-                # stamp and the day-budget accumulator still increments
-                # by 0 (harmless but consistent).
-                logger.warning("Receipt emit failed: %s -- emitting fallback", e)
-                try:
-                    fallback_model = getattr(self._llm, "name", "") or "llm"
-                    await self._on_event({
-                        "type": "receipt",
-                        "stage": "llm",
-                        "model": fallback_model,
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "total_tokens": 0,
-                        "cost_mils": 0,
-                        "llm_ms": round(llm_ms) if isinstance(llm_ms, (int, float)) else 0,
-                        "retried": False,
-                        "retry_reason": "receipt-fallback: " + type(e).__name__,
-                    })
-                except Exception:
-                    logger.debug("fallback receipt also failed", exc_info=True)
+            # SOLID-audit follow-up (PR #266 / SRP-10): LLM
+            # receipt emit (Phase 3 per-turn + v4·D audit P0
+            # fallback) extracted to
+            # voice_path_receipt.emit_voice_path_llm_receipt.
+            from dragon_voice.voice_path_receipt import (
+                emit_voice_path_llm_receipt,
+            )
+            await emit_voice_path_llm_receipt(
+                self._on_event, llm=self._llm, llm_ms=llm_ms,
+            )
 
             # Rich media detection on full response.
             # Audit D4 (#137): emit progress before render — voice path
@@ -1189,22 +1139,17 @@ class VoicePipeline:
                 })
                 self._tts_started = False
 
-            # Audit F5 (2026-04-20): emit TTS receipt so per-turn chat
-            # bubbles can stamp the speech backend + time.  cost_mils=0
-            # for local Piper; OpenRouter TTS cost left at 0 (same
-            # rationale as the STT receipt).
-            if self._tts_total_ms > 0:
-                try:
-                    _tts_backend = self._config.tts.backend or "tts"
-                    await self._on_event({
-                        "type": "receipt",
-                        "stage": "tts",
-                        "model": _tts_backend,
-                        "tts_ms": round(self._tts_total_ms),
-                        "cost_mils": 0,
-                    })
-                except Exception as _e:
-                    logger.debug("TTS receipt emit failed: %s", _e)
+            # SOLID-audit follow-up (PR #266 / SRP-10): TTS
+            # receipt emit extracted to
+            # voice_path_receipt.emit_voice_path_tts_receipt.
+            from dragon_voice.voice_path_receipt import (
+                emit_voice_path_tts_receipt,
+            )
+            await emit_voice_path_tts_receipt(
+                self._on_event,
+                tts_backend=self._config.tts.backend,
+                tts_total_ms=self._tts_total_ms,
+            )
 
             # Trim in-memory history on legacy path only.
             # Wave 21b (#204): isinstance(SupportsHistoryTrim) over hasattr.

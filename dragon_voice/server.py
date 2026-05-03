@@ -52,6 +52,7 @@ from dragon_voice.middleware import (
 )
 from dragon_voice.pipeline import VoicePipeline
 from dragon_voice.sessions import SessionManager
+from dragon_voice.voice_modes import VoiceMode
 from dragon_voice.audio import resample_pcm16_async
 from dragon_voice.tools.response_wrap import looks_like_useful_text, synthesize_wrap
 
@@ -2149,10 +2150,23 @@ class VoiceServer:
                     })
 
         if voice_mode is not None:
-            # STT+TTS: local for mode 0, cloud for mode 1+2+3
-            if voice_mode == 0:
+            # OCP-1 (audit 2026-05-03): convert raw int → VoiceMode enum
+            # at the boundary so all branches below use semantic
+            # predicates instead of magic-number comparisons.  Invalid
+            # values fall through to LOCAL semantically so a malformed
+            # WS frame can never wedge the server in an unknown state.
+            vmode = VoiceMode.from_int(voice_mode)
+            if vmode is None:
+                logger.warning(
+                    "config_update: unknown voice_mode=%s — treating as LOCAL",
+                    voice_mode,
+                )
+                vmode = VoiceMode.LOCAL
+
+            # STT+TTS: local for LOCAL, cloud for HYBRID/CLOUD/TINKERCLAW
+            if vmode.is_local():
                 stt_be, tts_be = "moonshine", "piper"
-            elif voice_mode == 3:
+            elif vmode.is_tinkerclaw():
                 # TinkerClaw mode: default local STT/TTS
                 # "cloud" suffix in llm_model → use OpenRouter STT/TTS
                 if llm_model and "cloud" in llm_model.lower():
@@ -2163,12 +2177,12 @@ class VoiceServer:
                 stt_be, tts_be = "openrouter", "openrouter"
 
             # LLM backend selection
-            if voice_mode == 3:
+            if vmode.is_tinkerclaw():
                 # TinkerClaw mode — gateway handles everything
                 llm_be = "tinkerclaw"
                 if llm_model:
                     conn_config.llm.tinkerclaw_model = llm_model
-            elif voice_mode == 2:
+            elif vmode.is_cloud():
                 llm_be = "openrouter"
                 if llm_model:
                     conn_config.llm.openrouter_model = llm_model
@@ -2178,27 +2192,27 @@ class VoiceServer:
                     conn_config.llm.ollama_model = llm_model
                     logger.info("Local model switched to: %s", llm_model)
 
-            # Apply mode-aware system prompt and max_tokens
-            # Mode 3 (TinkerClaw): skip — TinkerClaw owns personality
-            if voice_mode == 3:
+            # Apply mode-aware system prompt and max_tokens.
+            # TINKERCLAW: skip — TinkerClaw owns personality + token budget.
+            if vmode.is_tinkerclaw():
                 pass  # TinkerClaw manages its own prompts and limits
-            elif voice_mode == 0:
+            elif vmode.is_local():
                 conn_config.llm.system_prompt = SYSTEM_PROMPT_LOCAL
                 conn_config.llm.max_tokens = MAX_TOKENS_LOCAL
-            elif voice_mode == 1:
+            elif vmode.is_hybrid():
                 conn_config.llm.system_prompt = SYSTEM_PROMPT_HYBRID
                 conn_config.llm.max_tokens = MAX_TOKENS_HYBRID
             else:
                 conn_config.llm.system_prompt = SYSTEM_PROMPT_CLOUD
                 conn_config.llm.max_tokens = MAX_TOKENS_CLOUD
 
-            logger.info("Connection %s: voice_mode=%d → stt=%s tts=%s llm=%s model=%s tokens=%d",
-                        ws_id, voice_mode, stt_be, tts_be, llm_be,
-                        conn_config.llm.openrouter_model if voice_mode == 2 else "(local)",
+            logger.info("Connection %s: voice_mode=%d (%s) → stt=%s tts=%s llm=%s model=%s tokens=%d",
+                        ws_id, int(vmode), vmode.name, stt_be, tts_be, llm_be,
+                        conn_config.llm.openrouter_model if vmode.is_cloud() else "(local)",
                         conn_config.llm.max_tokens)
 
-            # Validate TinkerClaw gateway is reachable before switching to mode 3
-            if voice_mode == 3:
+            # Validate TinkerClaw gateway is reachable before switching to TC mode
+            if vmode.is_tinkerclaw():
                 try:
                     tc_url = (conn_config.llm.tinkerclaw_url or "http://localhost:18789").rstrip("/")
                     async with aiohttp.ClientSession(
@@ -2237,7 +2251,7 @@ class VoiceServer:
             # `config_update.error` raw-string that didn't tell the user
             # what happened next.  Migrated to the same γ-arch error_event
             # + revert pattern as B7 (TC token check) for consistency.
-            if voice_mode in (1, 2) and not conn_config.llm.openrouter_api_key:
+            if vmode.needs_openrouter_key() and not conn_config.llm.openrouter_api_key:
                 logger.error("Cloud mode requested but no API key configured")
                 if not ws.closed:
                     await self._safe_send_json(ws, error_event(
@@ -2257,7 +2271,7 @@ class VoiceServer:
             # the A4 raw-exception path below.  Validate up-front like
             # the OpenRouter key check above so the user sees a clean
             # γ-arch error and a clean revert instead of a stack trace.
-            if voice_mode == 3 and not (conn_config.llm.tinkerclaw_token or "").strip():
+            if vmode.is_tinkerclaw() and not (conn_config.llm.tinkerclaw_token or "").strip():
                 logger.error("TC mode requested but tinkerclaw_token is blank")
                 if not ws.closed:
                     await self._safe_send_json(ws, error_event(
@@ -2281,7 +2295,7 @@ class VoiceServer:
             if sid and self._db:
                 # Resolve the best "active model" string to persist,
                 # matching the client-visible payload below.
-                if voice_mode == 2:
+                if vmode.is_cloud():
                     active_model_db = conn_config.llm.openrouter_model or ""
                 elif llm_be == "tinkerclaw":
                     active_model_db = conn_config.llm.tinkerclaw_model or ""
@@ -2293,7 +2307,7 @@ class VoiceServer:
                     await self._db.update_session(
                         sid,
                         system_prompt=conn_config.llm.system_prompt,
-                        voice_mode=int(voice_mode),
+                        voice_mode=int(vmode),
                         llm_model=active_model_db[:128],
                     )
                 except Exception:
@@ -2307,7 +2321,7 @@ class VoiceServer:
             conn_config.llm.backend = llm_be
 
             # Propagate API keys for cloud STT/TTS backends (modes 1-2, or mode 3 with cloud STT)
-            if voice_mode in (1, 2) or (voice_mode == 3 and stt_be == "openrouter"):
+            if vmode.needs_cloud_stt_tts() or (vmode.is_tinkerclaw() and stt_be == "openrouter"):
                 conn_config.stt.openrouter_api_key = conn_config.llm.openrouter_api_key
                 conn_config.stt.openrouter_url = conn_config.llm.openrouter_url
                 conn_config.tts.openrouter_api_key = conn_config.llm.openrouter_api_key
@@ -2398,7 +2412,7 @@ class VoiceServer:
             # Confirm to Tab5
             if not ws.closed:
                 # Report actual model for any mode
-                if voice_mode == 2:
+                if vmode.is_cloud():
                     active_model = conn_config.llm.openrouter_model
                 elif llm_be == "tinkerclaw":
                     active_model = conn_config.llm.tinkerclaw_model
@@ -2416,12 +2430,15 @@ class VoiceServer:
                     "stt": stt_be, "tts": tts_be,
                     "llm": llm_be,
                     "llm_model": active_model,
-                    "voice_mode": voice_mode,
-                    "cloud_mode": voice_mode >= 1,
+                    "voice_mode": int(vmode),
+                    # cloud_mode is the legacy binary toggle; True for any
+                    # mode that touches cloud (Hybrid/Cloud/TC).  Onboard
+                    # is Tab5-side-only and never reaches Dragon.
+                    "cloud_mode": int(vmode) >= 1,
                 }
                 # Wave 22b (#202): use ConversationEngine.fleet_summary().
                 if self._conversation:
-                    summary = self._conversation.fleet_summary(voice_mode)
+                    summary = self._conversation.fleet_summary(int(vmode))
                     if summary is not None:
                         config_payload["fleet_summary"] = summary
                 await ws.send_json({
@@ -2458,7 +2475,7 @@ class VoiceServer:
                             )):
                         from dragon_voice.llm.base import Modality
                         spec = self._conversation._llm.choose(
-                            {Modality.TEXT, Modality.VISION}, voice_mode,
+                            {Modality.TEXT, Modality.VISION}, int(vmode),
                         )
                         if spec:
                             vision_model = spec.model_id
@@ -2471,18 +2488,21 @@ class VoiceServer:
                                 else vision_per_frame_mils(spec.model_id)
                             )
                     else:
-                        vm = conn_config.llm.openrouter_model.lower() \
-                            if voice_mode == 2 else ""
+                        # Note: `or_model_lc` (was `vm`) renamed to avoid
+                        # shadowing the outer `vmode` VoiceMode added in
+                        # the OCP-1 audit fix.
+                        or_model_lc = conn_config.llm.openrouter_model.lower() \
+                            if vmode.is_cloud() else ""
                         om = conn_config.llm.ollama_model.lower() \
-                            if voice_mode == 0 else ""
-                        if voice_mode == 2:
+                            if vmode.is_local() else ""
+                        if vmode.is_cloud():
                             # Vision-capability gate stays substring-based
                             # for now (the router branch above is the
                             # capability-aware path).  Pricing now goes
                             # through the centralized helper so adding a
                             # vendor to the substring list automatically
                             # gets correct mils via _PRICING_MILS_PER_M.
-                            if any(hint in vm for hint in (
+                            if any(hint in or_model_lc for hint in (
                                     "gpt-4o", "sonnet", "haiku", "gemini",
                                     "opus", "grok", "kimi", "qwen3.6", "glm",
                                     "mimo")):
@@ -2490,7 +2510,7 @@ class VoiceServer:
                                 per_frame_mils = vision_per_frame_mils(
                                     conn_config.llm.openrouter_model
                                 )
-                        elif voice_mode == 0:
+                        elif vmode.is_local():
                             if "vision" in om or "llava" in om:
                                 vision_model = active_model
                                 per_frame_mils = 0

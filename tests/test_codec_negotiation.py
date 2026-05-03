@@ -178,3 +178,215 @@ async def test_ws_closed_skips_ack():
 
     pipeline.set_uplink_codec.assert_called_once_with("opus")
     send.assert_not_awaited()
+
+
+# ─── negotiate_uplink_codec_at_register (PR #241) ─────────────
+
+
+from dragon_voice.codec_negotiation import negotiate_uplink_codec_at_register
+
+
+class TestRegisterTimeCodecNego:
+    @pytest.mark.asyncio
+    async def test_opus_capable_client_gets_config_update(self):
+        """Tab5 advertises [pcm, opus] → Dragon picks opus, applies
+        on pipeline, sends config_update so Tab5 switches encoder."""
+        from unittest.mock import patch
+        ws = _make_ws()
+        pipeline = _make_pipeline_returning("opus")
+        send = _make_safe_send_json()
+
+        with patch(
+            "dragon_voice.audio_codec.negotiate_uplink",
+            return_value="opus",
+        ):
+            await negotiate_uplink_codec_at_register(
+                ws,
+                pipeline=pipeline,
+                capabilities={"audio_codec": ["pcm", "opus"]},
+                device_id="dev1",
+                safe_send_json=send,
+            )
+
+        pipeline.set_uplink_codec.assert_called_once_with("opus")
+        send.assert_awaited_once()
+        frame = send.await_args.args[1]
+        assert frame["type"] == "config_update"
+        assert frame["audio_uplink_codec"] == "opus"
+        assert frame["reason"] == "codec_negotiation"
+
+    @pytest.mark.asyncio
+    async def test_pcm_only_client_skips_config_update(self):
+        """Backward-compat: legacy clients without the capability
+        OR clients that only advertise PCM stay on PCM with no
+        config_update round-trip."""
+        from unittest.mock import patch
+        ws = _make_ws()
+        pipeline = _make_pipeline_returning("pcm")
+        send = _make_safe_send_json()
+
+        with patch(
+            "dragon_voice.audio_codec.negotiate_uplink",
+            return_value="pcm",
+        ):
+            await negotiate_uplink_codec_at_register(
+                ws,
+                pipeline=pipeline,
+                capabilities={"audio_codec": ["pcm"]},
+                device_id="dev2",
+                safe_send_json=send,
+            )
+
+        # set_uplink_codec still called (pipeline knows it's PCM)
+        pipeline.set_uplink_codec.assert_called_once_with("pcm")
+        # But no config_update — PCM is the default
+        send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_opus_request_falls_back_to_pcm_no_ack(self):
+        """Tab5 requests opus, Dragon's pipeline.set_uplink_codec
+        falls back to PCM (libopus missing on Dragon).  Result:
+        PCM applied + no config_update emit (since result == pcm)."""
+        from unittest.mock import patch
+        ws = _make_ws()
+        # Pipeline returns "pcm" even though "opus" requested
+        pipeline = _make_pipeline_returning("pcm")
+        send = _make_safe_send_json()
+
+        with patch(
+            "dragon_voice.audio_codec.negotiate_uplink",
+            return_value="opus",
+        ):
+            await negotiate_uplink_codec_at_register(
+                ws,
+                pipeline=pipeline,
+                capabilities={"audio_codec": ["pcm", "opus"]},
+                device_id="dev3",
+                safe_send_json=send,
+            )
+
+        pipeline.set_uplink_codec.assert_called_once_with("opus")
+        send.assert_not_awaited()  # applied=pcm → no client switch
+
+    @pytest.mark.asyncio
+    async def test_no_capabilities_skips(self):
+        ws = _make_ws()
+        pipeline = _make_pipeline_returning("pcm")
+        send = _make_safe_send_json()
+
+        await negotiate_uplink_codec_at_register(
+            ws,
+            pipeline=pipeline,
+            capabilities=None,
+            device_id="dev4",
+            safe_send_json=send,
+        )
+
+        pipeline.set_uplink_codec.assert_not_called()
+        send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_no_audio_codec_field_skips(self):
+        """Capabilities block exists but `audio_codec` is missing —
+        legacy field set without codec advertisement."""
+        ws = _make_ws()
+        pipeline = _make_pipeline_returning("pcm")
+        send = _make_safe_send_json()
+
+        await negotiate_uplink_codec_at_register(
+            ws,
+            pipeline=pipeline,
+            capabilities={"widgets": {"types": ["live"]}},
+            device_id="dev5",
+            safe_send_json=send,
+        )
+
+        pipeline.set_uplink_codec.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_audio_codec_not_a_list_skips(self):
+        """Defensive: if the field somehow isn't a list (string,
+        dict, etc.), silently skip rather than crashing."""
+        ws = _make_ws()
+        pipeline = _make_pipeline_returning("pcm")
+        send = _make_safe_send_json()
+
+        await negotiate_uplink_codec_at_register(
+            ws,
+            pipeline=pipeline,
+            capabilities={"audio_codec": "opus"},  # string, not list
+            device_id="dev6",
+            safe_send_json=send,
+        )
+
+        pipeline.set_uplink_codec.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_exception_in_negotiate_does_not_propagate(self):
+        """audio_codec.negotiate_uplink could raise; whole chain
+        wrapped in try/except so it never tears down register."""
+        from unittest.mock import patch
+        ws = _make_ws()
+        pipeline = _make_pipeline_returning("pcm")
+        send = _make_safe_send_json()
+
+        with patch(
+            "dragon_voice.audio_codec.negotiate_uplink",
+            side_effect=RuntimeError("malformed"),
+        ):
+            # Must NOT raise.
+            await negotiate_uplink_codec_at_register(
+                ws,
+                pipeline=pipeline,
+                capabilities={"audio_codec": ["pcm", "opus"]},
+                device_id="dev7",
+                safe_send_json=send,
+            )
+
+        send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exception_in_set_uplink_codec_does_not_propagate(self):
+        from unittest.mock import patch
+        ws = _make_ws()
+        pipeline = MagicMock()
+        pipeline.set_uplink_codec = MagicMock(
+            side_effect=RuntimeError("backend dead"),
+        )
+        send = _make_safe_send_json()
+
+        with patch(
+            "dragon_voice.audio_codec.negotiate_uplink",
+            return_value="opus",
+        ):
+            # Must NOT raise.
+            await negotiate_uplink_codec_at_register(
+                ws,
+                pipeline=pipeline,
+                capabilities={"audio_codec": ["pcm", "opus"]},
+                device_id="dev8",
+                safe_send_json=send,
+            )
+
+    @pytest.mark.asyncio
+    async def test_ws_closed_skips_ack_but_still_sets_codec(self):
+        from unittest.mock import patch
+        ws = _make_ws(closed=True)
+        pipeline = _make_pipeline_returning("opus")
+        send = _make_safe_send_json()
+
+        with patch(
+            "dragon_voice.audio_codec.negotiate_uplink",
+            return_value="opus",
+        ):
+            await negotiate_uplink_codec_at_register(
+                ws,
+                pipeline=pipeline,
+                capabilities={"audio_codec": ["pcm", "opus"]},
+                device_id="dev9",
+                safe_send_json=send,
+            )
+
+        pipeline.set_uplink_codec.assert_called_once_with("opus")
+        # ACK skipped (ws closed)
+        send.assert_not_awaited()

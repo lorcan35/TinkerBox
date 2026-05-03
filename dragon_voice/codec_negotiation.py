@@ -1,41 +1,43 @@
-"""Audio codec negotiation — handles `config_update` frames that
-include an `audio_uplink_codec` field for mid-session codec swap.
+"""Audio codec negotiation — register-time + mid-session paths.
 
-Wave 23 SOLID-audit follow-up — fifth sub-handler extract from
-`_handle_config_update` (after vision_capability #214,
-cap_downgrade #215, config_swap #216, config_swap_guards #217).
+Wave 23 SOLID-audit follow-up.  Two sibling functions:
 
-## What this does
+  * `negotiate_uplink_codec_at_register` — initial pick from the
+    capabilities list Tab5 advertises in its `register` frame.
+    Picks the best mutual codec (e.g. opus when both sides
+    support it) and tells Tab5 if the result is non-default.
+    Originally PR #173 / TinkerTab #262; extracted from
+    `_handle_register` in the round-4 spillover (PR #241).
 
-Tab5 may send a `config_update` with `audio_uplink_codec` to swap
-the uplink codec mid-session (e.g. from a Settings toggle).  This
-module:
+  * `maybe_swap_uplink_codec` — handles `config_update` frames
+    with an `audio_uplink_codec` field for mid-session codec
+    swap (e.g. from a Settings toggle).  Originally PR #218
+    sub-extract from `_handle_config_update`.
 
-  1. Parses the codec from the WS frame (with backward-compat
-     alias `audio_codec`).
-  2. Calls `pipeline.set_uplink_codec(...)` to apply it on the
-     active pipeline.
-  3. Sends a confirmation `config_update` echoing the codec that
-     was *actually* applied.
-
-The "actually applied" piece matters for fallback observability:
-if Tab5 requests `opus` but Dragon doesn't have libopus available,
-`set_uplink_codec` falls back to `pcm` and the client needs to
-know.
+Both share the "ACK with the codec that was actually applied"
+contract — if Tab5 requests `opus` but Dragon falls back to
+`pcm` (libopus missing), the client needs to know.
 
 ## Failure isolation
 
-If no pipeline is wired yet (boot race) the function is a no-op.
-The `safe_send_json` callable is passed in (DIP) — same shape as
-the other extracted modules.
+* `negotiate_uplink_codec_at_register`: any exception in the
+  whole chain (import, negotiate, set, send) is logged at
+  EXCEPTION but never re-raised — codec negotiation is a
+  voice-quality optimisation, not session-correctness.  The
+  pipeline starts on PCM if the negotiation fails.
+* `maybe_swap_uplink_codec`: silent no-op when no pipeline is
+  wired yet (boot race) or no codec is in the cmd.
+
+The `safe_send_json` callable is passed in (DIP) — same shape
+as the other extracted modules.
 
 ## Why a separate module
 
 Codec negotiation is a different axis of change than backend
-selection (PR 216), validation guards (PR 217), and per-mode UX
-notifications (vision/cap_downgrade).  It can grow independently
-to handle Opus capability ACKs, downlink codec negotiation, etc.
-without touching the WS dispatcher.
+selection (PR #216), validation guards (PR #217), and per-mode
+UX notifications (vision/cap_downgrade).  It can grow
+independently to handle Opus capability ACKs, downlink codec
+negotiation, etc. without touching the WS dispatcher.
 
 Refs: PR #173, TinkerTab #262 (initial codec-swap protocol).
 """
@@ -60,6 +62,68 @@ def _extract_codec_from_cmd(cmd: dict) -> Optional[str]:
     `audio_codec` alias for backward compat with older Tab5
     firmware.  Returns None when neither is present."""
     return cmd.get("audio_uplink_codec") or cmd.get("audio_codec")
+
+
+async def negotiate_uplink_codec_at_register(
+    ws: web.WebSocketResponse,
+    *,
+    pipeline: Any,                       # VoicePipeline
+    capabilities: Optional[dict],        # `register.capabilities` block
+    device_id: str,
+    safe_send_json: SafeSendJson,
+) -> None:
+    """Pick the best mutual uplink codec from Tab5's capability
+    advertisement and apply it to the pipeline.  Sends Tab5 a
+    `config_update` frame ONLY when the chosen codec is
+    non-default (i.e. not "pcm") so legacy clients without the
+    capability stay on PCM with no extra round-trip.
+
+    Tab5's `register` frame may include
+    `capabilities.audio_codec = ["pcm", "opus"]`.  We pick the
+    best mutual one via `audio_codec.negotiate_uplink`, apply
+    via `pipeline.set_uplink_codec`, and ACK with the codec that
+    was *actually* applied (which may differ from the request
+    if libopus is missing on Dragon).
+
+    No-op when:
+      * `capabilities` is None or not a dict.
+      * `capabilities["audio_codec"]` is missing or not a list.
+      * The chosen codec is "pcm" (default — no client switch
+        needed).
+      * The WS is closed (the ACK is best-effort).
+
+    Failure isolation: any exception in the whole chain is
+    logged at EXCEPTION but never re-raised — codec negotiation
+    is a voice-quality optimisation, not session-correctness.
+    The pipeline starts on PCM if anything blows up.
+    """
+    try:
+        client_codecs = (
+            capabilities.get("audio_codec")
+            if isinstance(capabilities, dict) else None
+        )
+        if not isinstance(client_codecs, list):
+            return
+
+        # Local import preserves the pre-extract pattern (lazy
+        # so the audio_codec module's import cost only fires when
+        # a client actually sends the capability).
+        from dragon_voice import audio_codec as _ac
+
+        chosen = _ac.negotiate_uplink(client_codecs)
+        applied = pipeline.set_uplink_codec(chosen)
+        logger.info(
+            "Audio codec negotiation %s: client=%s chosen=%s applied=%s",
+            device_id, client_codecs, chosen, applied,
+        )
+        if applied != "pcm" and not ws.closed:
+            await safe_send_json(ws, {
+                "type": "config_update",
+                "audio_uplink_codec": applied,
+                "reason": "codec_negotiation",
+            })
+    except Exception:
+        logger.exception("audio codec negotiation failed (non-fatal)")
 
 
 async def maybe_swap_uplink_codec(

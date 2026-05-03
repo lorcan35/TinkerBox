@@ -22,7 +22,10 @@ from aiohttp import web, WSMsgType
 
 from dragon_voice.backend_swap import swap_pipeline_and_conversation_backends
 from dragon_voice.cap_downgrade import maybe_speak_cap_downgrade_alert
-from dragon_voice.codec_negotiation import maybe_swap_uplink_codec
+from dragon_voice.codec_negotiation import (
+    maybe_swap_uplink_codec,
+    negotiate_uplink_codec_at_register,
+)
 from dragon_voice.config_finalize import (
     apply_swap_config_to_conn,
     persist_session_config_to_db,
@@ -1032,30 +1035,23 @@ class VoiceServer:
 
         conn_state["pipeline"] = pipeline
 
-        # #173 / TinkerTab #262: codec negotiation.  Tab5 advertises
-        # capabilities.audio_codec = ["pcm", "opus"]; pick OPUS if both
-        # sides support it, send a config_update reply telling Tab5 to
-        # switch its encoder.  Backward-compat: legacy clients without
-        # the capability stay on PCM by default — no config_update
-        # needed for them.
-        try:
-            from . import audio_codec as _ac
-            client_codecs = (caps or {}).get("audio_codec") if isinstance(caps, dict) else None
-            if isinstance(client_codecs, list):
-                chosen = _ac.negotiate_uplink(client_codecs)
-                applied = pipeline.set_uplink_codec(chosen)
-                logger.info(
-                    "Audio codec negotiation %s: client=%s chosen=%s applied=%s",
-                    device_id, client_codecs, chosen, applied,
-                )
-                if applied != "pcm" and not ws.closed:
-                    await self._safe_send_json(ws, {
-                        "type": "config_update",
-                        "audio_uplink_codec": applied,
-                        "reason": "codec_negotiation",
-                    })
-        except Exception:
-            logger.exception("audio codec negotiation failed (non-fatal)")
+        # SOLID-audit follow-up: register-time codec negotiation
+        # (#173 / TinkerTab #262) extracted to
+        # codec_negotiation.negotiate_uplink_codec_at_register.
+        # That function picks the best mutual codec from
+        # capabilities.audio_codec, applies it on the pipeline,
+        # and sends config_update only when the result is non-PCM
+        # (so legacy clients without the capability stay on PCM
+        # with no extra round-trip).  Failure-isolated: codec
+        # negotiation is a voice-quality optimisation, never
+        # blocks register.
+        await negotiate_uplink_codec_at_register(
+            ws,
+            pipeline=pipeline,
+            capabilities=caps if isinstance(caps, dict) else None,
+            device_id=device_id,
+            safe_send_json=self._safe_send_json,
+        )
 
     async def _spawn_handler_task(
         self,

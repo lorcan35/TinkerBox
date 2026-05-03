@@ -90,74 +90,17 @@ class Database:
     async def _recover_corrupt_db(self) -> None:
         """Attempt to recover from a corrupt database file.
 
-        Strategy:
-        1. Close the connection if open.
-        2. Rename corrupt -wal and -shm files (preserve for diagnosis).
-        3. Retry opening the main DB (it should be consistent up to the
-           last successful WAL checkpoint).
-        4. If the main DB is also corrupt, rename it and create a fresh
-           database from schema.sql.
+        SOLID-audit follow-up: implementation extracted to
+        db_corruption_recovery.recover_corrupt_db.  This
+        wrapper resets `self._db` to None (the caller's
+        re-open path expects it) and forwards to the free
+        function.
         """
-        # Step 1: Close existing connection
-        if self._db is not None:
-            try:
-                await self._db.close()
-            except Exception:
-                pass
-            self._db = None
+        from dragon_voice.db_corruption_recovery import recover_corrupt_db
 
-        db_path = Path(self._db_path)
-        ts = int(time.time())
-
-        # Step 2: Rename WAL and SHM files
-        wal_path = db_path.with_name(db_path.name + "-wal")
-        shm_path = db_path.with_name(db_path.name + "-shm")
-
-        for sidecar in (wal_path, shm_path):
-            if sidecar.exists():
-                backup = sidecar.with_name(f"{sidecar.name}.corrupt.{ts}")
-                sidecar.rename(backup)
-                logger.error(
-                    "Renamed corrupt sidecar: %s -> %s", sidecar, backup.name
-                )
-
-        # Step 3: Try opening the main DB without the WAL
-        try:
-            test_db = await aiosqlite.connect(self._db_path)
-            await test_db.execute("PRAGMA integrity_check")
-            await test_db.close()
-            logger.info(
-                "Main database file is intact after removing corrupt WAL/SHM — "
-                "data up to last checkpoint is preserved"
-            )
-            return  # Main DB is OK, caller will open it normally
-        except Exception as retry_exc:
-            logger.error(
-                "Main database also corrupt after WAL removal: %s — "
-                "creating fresh database",
-                retry_exc,
-            )
-            try:
-                await test_db.close()
-            except Exception:
-                pass
-
-        # Step 4: Rename the entire DB and create fresh
-        if db_path.exists():
-            backup = db_path.with_name(f"{db_path.name}.corrupt.{ts}")
-            db_path.rename(backup)
-            logger.error(
-                "Renamed corrupt database: %s -> %s  "
-                "(recover data manually from this backup)",
-                db_path, backup.name,
-            )
-
-        # Fresh DB will be created by aiosqlite.connect + _apply_schema
-        logger.error(
-            "Recovery complete — a fresh empty database will be created. "
-            "Corrupt files preserved with .corrupt.%d suffix for diagnosis.",
-            ts,
-        )
+        prev_conn = self._db
+        self._db = None  # caller re-opens via aiosqlite.connect
+        await recover_corrupt_db(self._db_path, prev_conn)
 
     async def _apply_schema(self) -> None:
         """Read schema.sql and execute it (CREATE IF NOT EXISTS is idempotent)."""

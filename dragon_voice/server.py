@@ -59,6 +59,7 @@ from dragon_voice.disconnect_handler import handle_disconnect as _disconnect_cha
 from dragon_voice.handler_task_spawn import spawn_handler_task
 from dragon_voice.widget_action_handler import handle_widget_action
 from dragon_voice.text_turn_gate import invoke_with_text_turn_gate
+from dragon_voice.pipeline_callbacks import PipelineCallbacks
 from dragon_voice.rich_media_emit import emit_rich_media_for_text_turn
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.surface_register import register_surface_and_replay_scheduler
@@ -625,29 +626,22 @@ class VoiceServer:
         )
         self._active_connections[ws_id] = conn_state
 
-        # Callbacks for the pipeline.  v4·D audit P0 fix: route through
-        # the shared _safe_send_* helpers so transient disconnects mid-
-        # stream don't raise ConnectionResetError up into the pipeline's
-        # tight loop (which used to swallow real exceptions).
-        async def on_audio(audio_bytes: bytes) -> None:
-            if ws.closed:
-                return
-            await self._safe_send_bytes(ws, audio_bytes)
-
-        async def on_event(event: dict) -> None:
-            if not ws.closed:
-                await self._safe_send_json(ws, event)
-            # Persist API usage events for cost tracking
-            if event.get("type") == "api_usage" and self._db:
-                try:
-                    await self._db.add_event(
-                        "api_usage",
-                        session_id=conn_state.get("session_id"),
-                        device_id=conn_state.get("device_id"),
-                        data={k: v for k, v in event.items() if k != "type"},
-                    )
-                except Exception as e:
-                    logger.debug("Callback error: %s", e)
+        # SOLID-audit follow-up: pipeline callbacks bundled into
+        # PipelineCallbacks class.  on_audio routes through
+        # safe_send_bytes (v4·D audit P0 fix); on_event forwards
+        # via safe_send_json AND persists api_usage events to the
+        # DB events table for cost tracking.  Per-event conn_state
+        # lookup so a `clear` cmd that swaps session_id is
+        # reflected on the next persisted event.
+        _pipeline_callbacks = PipelineCallbacks(
+            ws,
+            conn_state=conn_state,
+            safe_send_bytes=self._safe_send_bytes,
+            safe_send_json=self._safe_send_json,
+            db=self._db,
+        )
+        on_audio = _pipeline_callbacks.on_audio
+        on_event = _pipeline_callbacks.on_event
 
         # Store callback refs for pipeline re-init (A04 memory monitor)
         conn_state["_on_audio"] = on_audio

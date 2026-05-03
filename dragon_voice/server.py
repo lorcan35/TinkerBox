@@ -31,6 +31,7 @@ from dragon_voice.config_swap import select_backends_for_mode
 from dragon_voice.config_swap_guards import validate_config_swap_prereqs
 from dragon_voice.config_update_ack import emit_config_update_ack
 from dragon_voice.conn_state import ConnState
+from dragon_voice.device_upsert import upsert_device_with_collision_guard
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.media.store import MediaStore
 from dragon_voice.media.pipeline import MediaPipeline
@@ -1046,40 +1047,22 @@ class VoiceServer:
             new_ws_id=ws_id,
         )
 
-        # Upsert device in DB.
-        #
-        # Audit D2 (#137): the `devices` table has a UNIQUE constraint on
-        # `hardware_id`, so a second `device_id` registering with a
-        # `hardware_id` that's already claimed raises sqlite3.IntegrityError
-        # which used to bubble up to the WS handler and drop the connection
-        # with no Tab5 signal.  Catch it specifically and emit a γ-arch
-        # FATAL/DEVICE error so the user sees what happened.
-        import sqlite3 as _sqlite3
-        try:
-            await self._db.upsert_device(
-                device_id=device_id,
-                hardware_id=hardware_id,
-                name=cmd.get("name", ""),
-                firmware_ver=cmd.get("firmware_ver", ""),
-                platform=cmd.get("platform", ""),
-                capabilities=cmd.get("capabilities"),
-            )
-        except _sqlite3.IntegrityError as e:
-            if "hardware_id" in str(e).lower():
-                logger.warning(
-                    "D2 hardware_id collision: device_id=%s wanted hw=%s but "
-                    "hw is already claimed by another device — rejecting register",
-                    device_id, hardware_id,
-                )
-                if not ws.closed:
-                    await self._safe_send_json(ws, error_event(
-                        code="hardware_id_collision",
-                        message="This hardware ID is already registered to another device.",
-                        severity=Severity.FATAL,
-                        scope=Scope.DEVICE,
-                    ))
-                return
-            raise
+        # SOLID-audit follow-up: device DB upsert + D2 collision guard
+        # extracted to device_upsert.upsert_device_with_collision_guard.
+        # Returns False when a hardware_id collision was caught (γ-arch
+        # error already sent); short-circuit out.
+        if not await upsert_device_with_collision_guard(
+            ws,
+            db=self._db,
+            device_id=device_id,
+            hardware_id=hardware_id,
+            name=cmd.get("name", ""),
+            firmware_ver=cmd.get("firmware_ver", ""),
+            platform=cmd.get("platform", ""),
+            capabilities=cmd.get("capabilities"),
+            safe_send_json=self._safe_send_json,
+        ):
+            return
 
         # v4·D audit P0 fix: expose the widget subset of client capabilities
         # on conn_state so skills can pull it via SurfaceManager and

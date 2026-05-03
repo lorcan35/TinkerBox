@@ -263,6 +263,9 @@ class Database:
         return await _impl(self.conn, retention_days=retention_days)
 
     # ── Messages ───────────────────────────────────────────────────────
+    # SOLID-audit follow-up (PR #262): message CRUD extracted
+    # to db_messages module.  Methods below are thin
+    # forwarders so existing call sites keep working unchanged.
 
     async def add_message(
         self,
@@ -277,26 +280,14 @@ class Database:
         model: Optional[str] = None,
         latency_ms: Optional[float] = None,
     ) -> dict:
-        """Insert an append-only message. Returns the message row as dict."""
-        now = time.time()
-        await self.conn.execute(
-            """
-            INSERT INTO messages (id, session_id, role, content, input_mode, interrupted,
-                                  audio_duration_s, token_count, model, latency_ms, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (message_id, session_id, role, content, input_mode,
-             1 if interrupted else 0, audio_duration_s, token_count,
-             model, latency_ms, now),
+        from dragon_voice.db_messages import add_message as _impl
+        return await _impl(
+            self.conn,
+            message_id=message_id, session_id=session_id, role=role,
+            content=content, input_mode=input_mode, interrupted=interrupted,
+            audio_duration_s=audio_duration_s, token_count=token_count,
+            model=model, latency_ms=latency_ms,
         )
-        await self.conn.commit()
-
-        # Update denormalized count
-        await self.increment_message_count(session_id)
-
-        cursor = await self.conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,))
-        row = await cursor.fetchone()
-        return dict(row) if row else {}
 
     async def get_messages(
         self,
@@ -304,134 +295,26 @@ class Database:
         limit: int = 100,
         offset: int = 0,
     ) -> list[dict]:
-        """Get messages for a session, ordered by creation time (ascending)."""
-        cursor = await self.conn.execute(
-            """
-            SELECT * FROM messages WHERE session_id = ?
-            ORDER BY created_at ASC LIMIT ? OFFSET ?
-            """,
-            (session_id, limit, offset),
-        )
-        rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
+        from dragon_voice.db_messages import get_messages as _impl
+        return await _impl(self.conn, session_id, limit=limit, offset=offset)
 
     async def count_messages(self, session_id: str) -> int:
-        """Count messages in a session."""
-        cursor = await self.conn.execute(
-            "SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,)
-        )
-        row = await cursor.fetchone()
-        return row[0] if row else 0
+        from dragon_voice.db_messages import count_messages as _impl
+        return await _impl(self.conn, session_id)
 
     async def get_message(self, message_id: str) -> Optional[dict]:
-        """Fetch a single message by ID."""
-        cursor = await self.conn.execute("SELECT * FROM messages WHERE id = ?", (message_id,))
-        row = await cursor.fetchone()
-        return dict(row) if row else None
+        from dragon_voice.db_messages import get_message as _impl
+        return await _impl(self.conn, message_id)
 
     async def purge_old_messages(
-        self, days: int = 30, batch_size: int = 500
+        self, days: int = 30, batch_size: int = 500,
     ) -> dict[str, int]:
-        """Purge messages and orphaned events older than `days`.
-
-        Skips messages belonging to active or paused sessions to avoid
-        deleting context from sessions still in use.
-
-        Wave 14 W14-H10: previously a single ``DELETE ... WHERE NOT IN
-        (SELECT ...)`` ran on the shared aiosqlite connection — on a
-        large tail it serialized every other coroutine behind 2-3 s of
-        purge. Now the delete runs in ``batch_size``-row chunks with
-        ``await asyncio.sleep(0)`` between batches, yielding the event
-        loop so WS keepalives and receipt emits can progress even on a
-        huge purge.
-
-        Returns dict with counts: {"messages": N, "events": M}.
-        """
-        if days <= 0:
-            logger.info("Message purge disabled (days=%d)", days)
-            return {"messages": 0, "events": 0}
-
-        cutoff = time.time() - (days * 86400)
-
-        # Delete old messages, but only from ended sessions (or sessions
-        # with no matching row, i.e. orphaned messages).
-        # Wave 14 W14-H10: batch via LIMIT + asyncio.sleep(0) yield so
-        # the purge does NOT hold the aiosqlite background thread
-        # exclusively for the full delete.
-        msg_count = 0
-        while True:
-            cursor = await self.conn.execute(
-                """
-                DELETE FROM messages
-                WHERE rowid IN (
-                    SELECT rowid FROM messages
-                    WHERE created_at < ?
-                      AND session_id NOT IN (
-                          SELECT id FROM sessions WHERE status IN ('active', 'paused')
-                      )
-                    LIMIT ?
-                )
-                """,
-                (cutoff, batch_size),
-            )
-            deleted = cursor.rowcount
-            await self.conn.commit()
-            msg_count += deleted
-            if deleted < batch_size:
-                break
-            await asyncio.sleep(0)  # yield the loop between batches
-
-        # Delete orphaned events older than the cutoff — same batching.
-        evt_count = 0
-        while True:
-            cursor = await self.conn.execute(
-                """
-                DELETE FROM events
-                WHERE rowid IN (
-                    SELECT rowid FROM events
-                    WHERE created_at < ?
-                      AND (session_id IS NULL
-                           OR session_id NOT IN (
-                               SELECT id FROM sessions WHERE status IN ('active', 'paused')
-                           ))
-                    LIMIT ?
-                )
-                """,
-                (cutoff, batch_size),
-            )
-            deleted = cursor.rowcount
-            await self.conn.commit()
-            evt_count += deleted
-            if deleted < batch_size:
-                break
-            await asyncio.sleep(0)
-
-        # PASSIVE checkpoint after bulk deletes — moves WAL pages back into
-        # the main DB file without blocking readers. Reduces WAL file growth
-        # and consolidates writes to reduce eMMC wear (DQ04).
-        if msg_count > 0 or evt_count > 0:
-            try:
-                await self.conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
-                logger.info("WAL passive checkpoint after purge")
-            except Exception as ckpt_err:
-                logger.warning("WAL checkpoint after purge failed: %s", ckpt_err)
-
-        logger.info(
-            "Purged %d messages and %d events older than %d days",
-            msg_count, evt_count, days,
-        )
-        return {"messages": msg_count, "events": evt_count}
+        from dragon_voice.db_messages import purge_old_messages as _impl
+        return await _impl(self.conn, days=days, batch_size=batch_size)
 
     async def delete_messages(self, session_id: str) -> int:
-        """Delete all messages for a session. Returns count deleted."""
-        count = await self.count_messages(session_id)
-        await self.conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
-        # Reset denormalized count
-        await self.conn.execute(
-            "UPDATE sessions SET message_count = 0 WHERE id = ?", (session_id,)
-        )
-        await self.conn.commit()
-        return count
+        from dragon_voice.db_messages import delete_messages as _impl
+        return await _impl(self.conn, session_id)
 
     # ── Notes ──────────────────────────────────────────────────────────
 

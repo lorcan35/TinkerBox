@@ -37,6 +37,7 @@ from dragon_voice.session_handshake import (
     replay_session_message_tail,
 )
 from dragon_voice.empty_response_wrap import maybe_synthesize_empty_response_wrap
+from dragon_voice.text_path_tts import synthesize_and_stream_text_response
 from dragon_voice.rich_media_emit import emit_rich_media_for_text_turn
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.surface_register import register_surface_and_replay_scheduler
@@ -1590,86 +1591,23 @@ class VoiceServer:
                     log_label="local",
                 )
 
-            # Synthesize TTS for the text response (only if response_mode != match_input)
-            # match_input = text in, text out. always_speak = always TTS.
-            pipeline = conn_state.get("pipeline")
-            response_mode = conn_state.get("response_mode", "always_speak")
-            if (pipeline and pipeline._tts and response_text.strip()
-                    and not ws.closed and response_mode != "match_input"):
-                try:
-                    await ws.send_json({"type": "tts_start"})
-                    t0 = time.monotonic()
-                    # v4·D audit P1: mode-aware TTS synth budget.  Piper
-                    # can take 15-25 s on Q6A ARM64 for a 200-word reply;
-                    # cloud gpt-audio-mini is fast but still needs a
-                    # cushion when OpenRouter edge adds latency.  The
-                    # hardcoded 30 s was too tight in practice for local
-                    # and wasteful for cloud.
-                    tts_backend = (conn_cfg.tts.backend if conn_cfg else "piper")
-                    tts_timeout = 90 if tts_backend != "openrouter" else 30
-                    audio_bytes = await asyncio.wait_for(
-                        pipeline._tts.synthesize(response_text),
-                        timeout=tts_timeout,
-                    )
-                    tts_ms = (time.monotonic() - t0) * 1000
-
-                    if audio_bytes:
-                        # Audit B8 (#137) + C8 (#137): shared async
-                        # resample with the voice-path TTS branch.
-                        # Long replies (~150 KB) hop to a worker thread
-                        # so this WS read loop stays free for cancels /
-                        # other frames.
-                        tts_rate = pipeline._tts.sample_rate
-                        target_rate = conn_cfg.audio.input_sample_rate if conn_cfg else 16000
-                        audio_bytes = await resample_pcm16_async(
-                            audio_bytes, tts_rate, target_rate
-                        )
-
-                        chunk_size = 4096
-                        pace_sleep = (chunk_size / 2) / target_rate * 0.8
-                        for i in range(0, len(audio_bytes), chunk_size):
-                            chunk = audio_bytes[i:i + chunk_size]
-                            if not ws.closed:
-                                await ws.send_bytes(chunk)
-                            if i > chunk_size * 3:
-                                await asyncio.sleep(pace_sleep)
-
-                    if not ws.closed:
-                        await ws.send_json({"type": "tts_end", "tts_ms": round(tts_ms)})
-                        # Audit F5 (2026-04-20): TTS receipt for text-path
-                        # synthesis so chat bubbles surface the TTS backend
-                        # that spoke the reply.
-                        try:
-                            await ws.send_json({
-                                "type": "receipt",
-                                "stage": "tts",
-                                "model": tts_backend,
-                                "tts_ms": round(tts_ms),
-                                "cost_mils": 0,
-                            })
-                        except Exception:
-                            pass
-                except (asyncio.TimeoutError, Exception) as tts_err:
-                    # #89 Phase 2 L3: kill any in-flight Piper subprocess
-                    # before bailing.  Without this the text path leaks
-                    # the zombie until Python exits — same class of bug
-                    # as A1 (cancel) but on the timeout edge.  Mirrors
-                    # the voice-path pattern at pipeline.py:1411-1421.
-                    if pipeline._tts and hasattr(pipeline._tts, "kill_active_procs"):
-                        try:
-                            pipeline._tts.kill_active_procs()
-                        except Exception:
-                            logger.debug("kill_active_procs raised", exc_info=True)
-                    if isinstance(tts_err, asyncio.TimeoutError):
-                        logger.warning(
-                            "Text-path TTS timed out after %ds — killed Piper procs",
-                            tts_timeout,
-                        )
-                    else:
-                        logger.exception("TTS for text input failed")
-                    # Always send tts_end so Tab5 doesn't hang in SPEAKING
-                    if not ws.closed:
-                        await ws.send_json({"type": "tts_end", "tts_ms": 0})
+            # SOLID-audit follow-up: text-path TTS synthesis +
+            # streaming extracted to
+            # text_path_tts.synthesize_and_stream_text_response.
+            # That module owns: precondition guards (no pipeline,
+            # whitespace-only, ws.closed, match_input mode),
+            # mode-aware timeout budget (90s local / 30s cloud),
+            # async resample, paced byte streaming, the F5 TTS
+            # receipt, the audit-L3 zombie-Piper-kill on timeout,
+            # and the always-tts_end invariant.
+            await synthesize_and_stream_text_response(
+                ws,
+                pipeline=conn_state.get("pipeline"),
+                response_text=response_text,
+                response_mode=conn_state.get("response_mode", "always_speak"),
+                conn_config=conn_cfg,
+                safe_send_json=self._safe_send_json,
+            )
 
             logger.info("Text response on session %s: %s", session_id, response_text[:80])
 

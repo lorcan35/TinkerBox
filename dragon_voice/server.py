@@ -43,6 +43,7 @@ from dragon_voice.local_text_stream import stream_local_text_with_tool_filter
 from dragon_voice.vision_turn import handle_vision_turn
 from dragon_voice.ws_voice_admission import check_ws_voice_admission
 from dragon_voice.ws_keepalive import run_ws_keepalive
+from dragon_voice.binary_frame_dispatch import dispatch_binary_frame
 from dragon_voice.rich_media_emit import emit_rich_media_for_text_turn
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.surface_register import register_surface_and_replay_scheduler
@@ -642,52 +643,18 @@ class VoiceServer:
                 _last_client_msg_time = time.monotonic()
 
                 if msg.type == WSMsgType.BINARY:
-                    # #175: video frames carry a 4-byte magic prefix
-                    # ("VID0").  Sniff the first bytes; if it matches,
-                    # route to the video handler instead of the audio
-                    # pipeline.  Audio frames are unprefixed raw PCM as
-                    # before, so absence of magic falls through to the
-                    # existing feed_audio path.
-                    from .video_upstream import parse_video_frame, get_handler as _vget
-                    if parse_video_frame.peek(msg.data):
-                        await _vget().on_frame(
-                            session_id=conn_state.get("session_id", ""),
-                            device_id=conn_state.get("device_id", ""),
-                            wire_bytes=msg.data,
-                            active_connections=self._active_connections,
-                        )
-                        continue
-
-                    # #181 / TinkerTab #272: in-call audio frames carry
-                    # the AUD0 magic.  Broadcast verbatim to other
-                    # connected clients and bypass STT — same model as
-                    # the video relay.  Bytes are raw int16 PCM (or
-                    # OPUS) inside; peers handle playback locally.
-                    from .audio_codec import peek_call_audio_magic
-                    if peek_call_audio_magic(msg.data):
-                        sender_sid = conn_state.get("session_id", "")
-                        for c in list(self._active_connections.values()):
-                            if c.get("session_id") == sender_sid:
-                                continue
-                            peer_ws = c.get("ws")
-                            if peer_ws is None or peer_ws.closed:
-                                continue
-                            try:
-                                await peer_ws.send_bytes(msg.data)
-                            except Exception as e:
-                                logger.debug("call-audio relay drop: %s", e)
-                        continue
-                    # Raw PCM audio data — forward to pipeline
-                    # Note: feed_audio is NOT locked (US-P10) — it only
-                    # appends to the audio buffer and the VAD check is
-                    # lightweight. The heavy processing (_process_utterance)
-                    # is triggered via asyncio.create_task inside feed_audio
-                    # and that task is serialized by the pipeline's own
-                    # _processing flag. Locking here would block audio
-                    # ingestion during LLM/TTS processing.
-                    pipeline = conn_state.get("pipeline")
-                    if pipeline:
-                        await pipeline.feed_audio(msg.data)
+                    # SOLID-audit follow-up: VID0 / AUD0 / raw PCM
+                    # routing extracted to
+                    # binary_frame_dispatch.dispatch_binary_frame.
+                    # That module owns: VID0 → video relay, AUD0 →
+                    # peer broadcast (sender excluded; closed peers
+                    # skipped; per-peer send failures swallowed at
+                    # DEBUG), raw PCM → pipeline.feed_audio.
+                    await dispatch_binary_frame(
+                        msg.data,
+                        conn_state=conn_state,
+                        active_connections=self._active_connections,
+                    )
 
                 elif msg.type == WSMsgType.TEXT:
                     try:

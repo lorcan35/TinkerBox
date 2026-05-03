@@ -289,6 +289,37 @@ class ConversationEngine:
             return self._llm.summarize(voice_mode)
         return None
 
+    def choose_vision_model(self, voice_mode: int):
+        """Return the `ModelSpec` for a vision turn at this voice_mode.
+
+        Closes audit ENC-1 (2026-05-03): pre-extract `server.py` reached
+        directly into `self._conversation._llm` and called `.choose(...)`
+        on the router instance from three different sites.  That violated
+        encapsulation (private attribute access) AND DIP (high-level
+        WS handler depending on a concrete `CapabilityAwareRouter` type
+        rather than a stable public surface).
+
+        Returns:
+            * The chosen `ModelSpec` (with `.model_id`, `.tier`, etc.) when
+              the active backend is a `CapabilityAwareRouter` AND a
+              vision-capable model exists in its fleet for the given tier.
+            * `None` when the active backend isn't a router (single-backend
+              configurations), or when the router has no vision-capable
+              candidate for this tier.
+
+        Callers (`server.py`'s `_handle_config_update` vision-capability
+        emit) interpret `None` as "no router-managed vision model
+        available — fall back to the substring-based capability gate".
+
+        :returns: `ModelSpec | None`
+        """
+        from dragon_voice.llm.base import Modality
+        from dragon_voice.llm.router import CapabilityAwareRouter
+
+        if not isinstance(self._llm, CapabilityAwareRouter):
+            return None
+        return self._llm.choose({Modality.TEXT, Modality.VISION}, voice_mode)
+
     async def process_text(
         self,
         session_id: str,

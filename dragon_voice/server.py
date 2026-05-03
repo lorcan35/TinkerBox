@@ -57,6 +57,7 @@ from dragon_voice.pipeline_init import build_and_initialize_pipeline
 from dragon_voice.widget_capabilities_init import init_widget_capabilities
 from dragon_voice.disconnect_handler import handle_disconnect as _disconnect_chain
 from dragon_voice.handler_task_spawn import spawn_handler_task
+from dragon_voice.widget_action_handler import handle_widget_action
 from dragon_voice.rich_media_emit import emit_rich_media_for_text_turn
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.surface_register import register_surface_and_replay_scheduler
@@ -799,24 +800,19 @@ class VoiceServer:
                         )
 
                     elif cmd_type == "widget_action":
-                        # v4·D Phase 4g (audit P0 fix): Tab5 fires this
-                        # when the user taps a prompt choice / live action
-                        # button / list row.  Before this branch existed,
-                        # every interactive widget tap was silently
-                        # dropped into the "Unknown command" logger.
-                        sid = conn_state.get("session_id")
-                        cid = cmd.get("card_id")
-                        ev  = cmd.get("event")
-                        payload = cmd.get("payload") or {}
-                        logger.info("widget_action: session=%s card=%s event=%s",
-                                    sid, cid, ev)
-                        if sid and cid and ev and self._surface_mgr is not None:
-                            try:
-                                await self._surface_mgr.handle_action(
-                                    sid, cid, ev, payload,
-                                )
-                            except Exception:
-                                logger.exception("widget_action dispatch failed")
+                        # SOLID-audit follow-up: widget_action chain
+                        # extracted to widget_action_handler.handle_widget_action.
+                        # That module owns: input field validation
+                        # (session_id / card_id / event present),
+                        # surface_mgr presence guard, dispatch via
+                        # handle_action, and the failure-isolation
+                        # try/except (a buggy skill must NOT tear
+                        # down the WS read loop).
+                        await handle_widget_action(
+                            cmd=cmd,
+                            conn_state=conn_state,
+                            surface_mgr=self._surface_mgr,
+                        )
 
                     elif cmd_type == "config_ack":
                         logger.debug("Connection %s: config_ack %s", ws_id, cmd.get("applied"))

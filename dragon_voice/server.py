@@ -40,6 +40,10 @@ from dragon_voice.empty_response_wrap import maybe_synthesize_empty_response_wra
 from dragon_voice.rich_media_emit import emit_rich_media_for_text_turn
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.surface_register import register_surface_and_replay_scheduler
+from dragon_voice.text_path_receipt import (
+    emit_text_path_llm_receipt,
+    emit_tinkerclaw_zero_cost_receipt,
+)
 from dragon_voice.tool_event_emitter import ToolEventEmitter
 from dragon_voice.media.store import MediaStore
 from dragon_voice.media.pipeline import MediaPipeline
@@ -1461,42 +1465,17 @@ class VoiceServer:
             if not ws.closed:
                 await ws.send_json({"type": "llm_done", "llm_ms": 0, "text": response_text})
 
-            # v4·D connectivity polish: emit a zero-cost receipt on the
-            # TinkerClaw bypass path so the chat bubble gets stamped
-            # ("claw-agent · FREE") instead of no stamp at all.  TC turns
-            # don't expose token counts the way OpenRouter does; we just
-            # surface the engine name so transparency-per-bubble still
-            # holds.
-            if not ws.closed:
-                # Wave 8 audit #2 (A4/F3/J12): the first-turn fallback was
-                # the bare string "tinkerclaw" which shows up in chat
-                # bubbles as a generic stamp until the gateway populates
-                # `_model`. Fall back to the LLMConfig default
-                # ("minimax/MiniMax-M2.5") when both `name` and `_model`
-                # are empty so the first bubble stamp is still honest.
-                inner = getattr(llm, "_model", "") or ""
-                conf_default = getattr(conn_cfg.llm, "tinkerclaw_model", "") or ""
-                tc_model = (
-                    inner
-                    or getattr(llm, "name", None)
-                    or conf_default
-                    or "minimax/MiniMax-M2.5"
-                )
-                try:
-                    await ws.send_json({
-                        "type": "receipt",
-                        "stage": "llm",
-                        "model": tc_model,
-                        "prompt_tokens": 0,
-                        "completion_tokens": 0,
-                        "total_tokens": 0,
-                        "cost_mils": 0,          # TC bills to its own gateway
-                        "llm_ms": 0,
-                        "retried": False,
-                        "retry_reason": "",
-                    })
-                except Exception:
-                    logger.debug("TC receipt emit failed", exc_info=True)
+            # SOLID-audit follow-up: TC zero-cost receipt extracted to
+            # text_path_receipt.emit_tinkerclaw_zero_cost_receipt.
+            # Same model-name resolution priority chain
+            # (_model → name → config_default → minimax fallback) is
+            # pinned by 4 dedicated tests.
+            await emit_tinkerclaw_zero_cost_receipt(
+                ws,
+                llm=llm,
+                tinkerclaw_model_default=getattr(conn_cfg.llm, "tinkerclaw_model", "") or "",
+                safe_send_json=self._safe_send_json,
+            )
 
             # SOLID-audit follow-up: rich media detection extracted to
             # rich_media_emit.emit_rich_media_for_text_turn (dedup with
@@ -1694,49 +1673,18 @@ class VoiceServer:
 
             logger.info("Text response on session %s: %s", session_id, response_text[:80])
 
-            # Phase 3 per-turn receipt for text-path turns. Voice-path
-            # receipts are emitted from pipeline._process_utterance; the
-            # text path reaches the LLM via ConversationEngine directly
-            # and bypasses pipeline entirely, so we emit here too.
-            try:
-                convo = conn_state.get("conversation") or self._conversation
-                cur_llm = getattr(convo, "_llm", None)
-                # Wave 21b (#204): isinstance(SupportsUsage) over hasattr —
-                # closes the "model='llm'" silent fallback for backends like
-                # `dual` and `tinkerclaw` that lacked get_last_usage entirely.
-                from dragon_voice.llm.base import SupportsUsage
-                if cur_llm is not None and isinstance(cur_llm, SupportsUsage):
-                    usage = cur_llm.get_last_usage()
-                    if usage and usage.get("total_tokens"):
-                        from dragon_voice.llm.openrouter_llm import price_for_model
-                        cost_mils = price_for_model(
-                            usage["model"],
-                            usage.get("prompt_tokens", 0),
-                            usage.get("completion_tokens", 0),
-                        )
-                        if not ws.closed:
-                            await ws.send_json({
-                                "type":              "receipt",
-                                "stage":             "llm",
-                                "model":             usage["model"],
-                                "prompt_tokens":     usage.get("prompt_tokens", 0),
-                                "completion_tokens": usage.get("completion_tokens", 0),
-                                "total_tokens":      usage.get("total_tokens", 0),
-                                "cost_mils":         cost_mils,
-                                # v4·D Gauntlet G2 surface retries
-                                "retried":           bool(usage.get("retried", False)),
-                                "retry_reason":      usage.get("retry_reason", ""),
-                            })
-                        logger.info(
-                            "Receipt emitted (text): model=%s tok=%d+%d=%d cost_mils=%d",
-                            usage["model"],
-                            usage.get("prompt_tokens", 0),
-                            usage.get("completion_tokens", 0),
-                            usage.get("total_tokens", 0),
-                            cost_mils,
-                        )
-            except Exception:
-                logger.exception("Text-path receipt emit failed")
+            # SOLID-audit follow-up: Phase 3 per-turn receipt
+            # extracted to text_path_receipt.emit_text_path_llm_receipt.
+            # Voice-path receipts are emitted from
+            # pipeline._process_utterance; the text path reaches the
+            # LLM via ConversationEngine directly and bypasses
+            # pipeline entirely, so we emit here too.
+            convo = conn_state.get("conversation") or self._conversation
+            await emit_text_path_llm_receipt(
+                ws,
+                conversation=convo,
+                safe_send_json=self._safe_send_json,
+            )
 
         except Exception:
             logger.exception("Text processing error on session %s", session_id)

@@ -36,6 +36,7 @@ from dragon_voice.session_handshake import (
     emit_session_start,
     replay_session_message_tail,
 )
+from dragon_voice.empty_response_wrap import maybe_synthesize_empty_response_wrap
 from dragon_voice.rich_media_emit import emit_rich_media_for_text_turn
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.surface_register import register_surface_and_replay_scheduler
@@ -1439,47 +1440,21 @@ class VoiceServer:
 
             response_text = "".join(full_response)
 
-            # Wave 15 W15-H09 + #75 phase 1b: empty-response guard.  When
-            # MiniMax / the TinkerClaw agent halts after a failed tool
-            # call without formulating a user-facing reply, OR when an
-            # FC-trained local model (xLAM, functiongemma, …) only
-            # emitted tool calls with no natural-language wrap, we'd
-            # otherwise send llm_done with text="" and Tab5 silently
-            # drops the chat bubble.
-            #
-            # Preference order:
-            #   1. If any tool fired this turn, synthesise a per-tool
-            #      template wrap from `conn_state["tool_calls_this_turn"]`
-            #      (response_wrap.synthesize_wrap).  Fast, deterministic,
-            #      describes what actually ran — users get a useful ack
-            #      like "Got it — magenta." rather than a frustrating
-            #      "Sorry, I couldn't generate a response."
-            #   2. Fall through to the legacy W15-H09 generic apology
-            #      when there were zero tool fires (e.g. real LLM error).
-            # #75 phase 1b refinement: trigger wrap when reply is
-            # bracket-noise-only too, not just strict-empty.  See
-            # looks_like_useful_text above for the heuristic.
-            if not looks_like_useful_text(response_text):
-                tool_calls = conn_state.get("tool_calls_this_turn") or []
-                if tool_calls:
-                    fallback = synthesize_wrap(tool_calls)
-                    logger.info(
-                        "#75 phase 1b: TC path produced near-empty LLM text "
-                        "(%r) but %d tool(s) fired — emitting template wrap (%d chars)",
-                        response_text[:30], len(tool_calls), len(fallback),
-                    )
-                else:
-                    fallback = (
-                        "Sorry, I couldn't generate a response for that. "
-                        "Please try rephrasing, or try again in a moment."
-                    )
-                    logger.warning(
-                        "W15-H09: TinkerClaw text path produced zero tokens — "
-                        "emitting fallback response"
-                    )
-                if not ws.closed:
-                    await ws.send_json({"type": "llm", "text": fallback})
-                response_text = fallback
+            # SOLID-audit follow-up: empty-response guard extracted to
+            # empty_response_wrap.maybe_synthesize_empty_response_wrap.
+            # TC semantics: pass fallback_when_no_tools="Sorry, ..."
+            # so the W15-H09 apology fires when zero tools fired.
+            response_text = await maybe_synthesize_empty_response_wrap(
+                ws,
+                response_text=response_text,
+                tool_calls=conn_state.get("tool_calls_this_turn") or [],
+                safe_send_json=self._safe_send_json,
+                log_label="tc",
+                fallback_when_no_tools=(
+                    "Sorry, I couldn't generate a response for that. "
+                    "Please try rephrasing, or try again in a moment."
+                ),
+            )
 
             logger.info("TinkerClaw text response (%d chars): %s",
                         len(response_text), response_text[:80])
@@ -1604,25 +1579,19 @@ class VoiceServer:
 
             response_text = _TOOL_RE_LOCAL.sub("", "".join(full_response))
 
-            # #75 phase 1b: if the local model fired tools but never
-            # produced user-facing text (common with FC-trained small
-            # models like xLAM that emit tool calls then stop), wrap
-            # the tool results in a templated natural-language ack so
-            # Tab5 doesn't render an empty bubble.  Same intent as the
-            # TC-path guard above, just applied to the local/conversation
-            # engine flow.
-            if not looks_like_useful_text(response_text):
-                tool_calls = conn_state.get("tool_calls_this_turn") or []
-                if tool_calls:
-                    wrap = synthesize_wrap(tool_calls)
-                    logger.info(
-                        "#75 phase 1b: local text path emitted near-empty text "
-                        "(%r) with %d tool fire(s) — sending template wrap (%d chars)",
-                        response_text[:30], len(tool_calls), len(wrap),
-                    )
-                    if not ws.closed:
-                        await ws.send_json({"type": "llm", "text": wrap})
-                    response_text = wrap
+            # SOLID-audit follow-up: same empty-response guard as
+            # the TC path above, but with fallback_when_no_tools=None
+            # to preserve the local-path semantics where empty +
+            # no tools just falls through (the legacy "let it pass"
+            # behaviour — Tab5 drops the empty bubble silently).
+            response_text = await maybe_synthesize_empty_response_wrap(
+                ws,
+                response_text=response_text,
+                tool_calls=conn_state.get("tool_calls_this_turn") or [],
+                safe_send_json=self._safe_send_json,
+                log_label="local",
+                fallback_when_no_tools=None,
+            )
 
             if not ws.closed:
                 await ws.send_json({"type": "llm_done", "llm_ms": 0})

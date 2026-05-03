@@ -23,6 +23,7 @@ from aiohttp import web, WSMsgType
 from dragon_voice.conn_state import ConnState
 from dragon_voice.media.store import MediaStore
 from dragon_voice.media.pipeline import MediaPipeline
+from dragon_voice.vision_capability import emit_vision_capability
 from dragon_voice.config import (
     VoiceConfig,
     SYSTEM_PROMPT_LOCAL, SYSTEM_PROMPT_HYBRID, SYSTEM_PROMPT_CLOUD,
@@ -2451,79 +2452,19 @@ class VoiceServer:
 
                 # v4·D Phase 4b vision capability advertisement.  Tab5's
                 # camera screen renders a "VISION · <model> READY" chip based
-                # on this.  #183 PR 3: prefer the router's per-modality
-                # pick when available; fall back to the legacy
-                # substring-on-model-name heuristic for single-backend
-                # configurations.
-                try:
-                    vision_model = ""
-                    per_frame_mils = 0
-                    # OCP-2 (audit 2026-05-03): single source of truth for
-                    # per-frame mils.  Kills the parallel switch on
-                    # gpt-4o/sonnet/haiku/gemini that silently defaulted
-                    # Opus 4.x, Grok 4.x, Kimi K2.6, Qwen 3.6, GLM, MiMo
-                    # to 0 mils — every cloud-vision turn on those models
-                    # was invisible to the daily-cap budget enforcement.
-                    from dragon_voice.llm.openrouter_llm import vision_per_frame_mils
-                    # ENC-1 (audit 2026-05-03): replaced the prior
-                    # `isinstance(self._conversation._llm, CapabilityAwareRouter)`
-                    # private-attribute reach-through with the public
-                    # `ConversationEngine.choose_vision_model(voice_mode)`
-                    # accessor.  Returns ModelSpec | None — None falls
-                    # through to the substring-based capability gate
-                    # below for single-backend configurations.
-                    # Combined with OCP-1 (#211): pass int(vmode) so the
-                    # router still receives the integer tier key it
-                    # expects.
-                    spec = (
-                        self._conversation.choose_vision_model(int(vmode))
-                        if self._conversation else None
-                    )
-                    if spec is not None:
-                        vision_model = spec.model_id
-                        # Local-tier sub-backends are free regardless of
-                        # the canonical pricing table (which is OR-only);
-                        # short-circuit to avoid a `_default`-table
-                        # surprise on a local vision model id.
-                        per_frame_mils = (
-                            0 if spec.tier == "local"
-                            else vision_per_frame_mils(spec.model_id)
-                        )
-                    else:
-                        # Note: `or_model_lc` (was `vm`) renamed to avoid
-                        # shadowing the outer `vmode` VoiceMode added in
-                        # the OCP-1 audit fix.
-                        or_model_lc = conn_config.llm.openrouter_model.lower() \
-                            if vmode.is_cloud() else ""
-                        om = conn_config.llm.ollama_model.lower() \
-                            if vmode.is_local() else ""
-                        if vmode.is_cloud():
-                            # Vision-capability gate stays substring-based
-                            # for now (the router branch above is the
-                            # capability-aware path).  Pricing now goes
-                            # through the centralized helper so adding a
-                            # vendor to the substring list automatically
-                            # gets correct mils via _PRICING_MILS_PER_M.
-                            if any(hint in or_model_lc for hint in (
-                                    "gpt-4o", "sonnet", "haiku", "gemini",
-                                    "opus", "grok", "kimi", "qwen3.6", "glm",
-                                    "mimo")):
-                                vision_model = active_model
-                                per_frame_mils = vision_per_frame_mils(
-                                    conn_config.llm.openrouter_model
-                                )
-                        elif vmode.is_local():
-                            if "vision" in om or "llava" in om:
-                                vision_model = active_model
-                                per_frame_mils = 0
-                    await ws.send_json({
-                        "type":           "vision_capability",
-                        "can_see":        bool(vision_model),
-                        "model":          vision_model,
-                        "per_frame_mils": per_frame_mils,
-                    })
-                except Exception:
-                    logger.exception("vision_capability emit failed")
+                # on this.  Extracted to vision_capability.emit_vision_capability
+                # in the SOLID-audit follow-up — the inline 80-LOC block was
+                # tangled with the config_update ACK + cap_downgrade speak;
+                # three sub-responsibilities that change for different
+                # reasons (router fleet shape vs Tab5 chip rendering vs cap
+                # policy) and shouldn't share a method body.
+                await emit_vision_capability(
+                    ws,
+                    conversation=self._conversation,
+                    vmode=vmode,
+                    conn_config=conn_config,
+                    active_model=active_model,
+                )
 
             # v4·D Gauntlet G7-F: speak a short alert when the Tab5
             # auto-downgrades because the daily cap was hit.

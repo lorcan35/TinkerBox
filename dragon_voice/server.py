@@ -42,6 +42,7 @@ from dragon_voice.tinkerclaw_text_path import handle_tinkerclaw_text_path
 from dragon_voice.local_text_stream import stream_local_text_with_tool_filter
 from dragon_voice.vision_turn import handle_vision_turn
 from dragon_voice.ws_voice_admission import check_ws_voice_admission
+from dragon_voice.ws_keepalive import run_ws_keepalive
 from dragon_voice.rich_media_emit import emit_rich_media_for_text_turn
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.surface_register import register_surface_and_replay_scheduler
@@ -570,75 +571,25 @@ class VoiceServer:
         peer = request.remote or "unknown"
         logger.info("WebSocket connected: %s (ws_id=%s)", peer, ws_id)
 
-        # Server-side keepalive: ping every 15s to prevent ngrok idle timeout.
-        # ngrok drops WS connections after ~30s of silence. Detects dead
-        # connections via send-failure counter + response timeout (US-DQ20).
-        _keepalive_running = True
-        # Shared flag: last time ANY message was received from the client.
-        # Updated in the main message loop; read by the keepalive task.
+        # SOLID-audit follow-up: server-side keepalive task
+        # extracted to ws_keepalive.run_ws_keepalive.  That module
+        # owns: 15s JSON-pong loop (ngrok counts data frames),
+        # 5s send-timeout per ping (US-DQ05 GIL-contention guard),
+        # 3-consecutive-failure WS-close threshold (US-DQ20).
+        # See module docstring for the 195 s dead-detection budget
+        # tuned around #75 LLM-flap and Tab5's pingpong window.
+        _keepalive_stop = asyncio.Event()
+        _keepalive_task = asyncio.create_task(
+            run_ws_keepalive(ws, ws_id=ws_id, stop_event=_keepalive_stop)
+        )
+
+        # Shared flag: last time ANY message was received from the
+        # client.  Updated in the main message loop; left for
+        # potential future silence-check use (the old 30s silence
+        # check was removed when Tab5 migrated to
+        # esp_websocket_client whose control frames don't surface
+        # to the message loop).
         _last_client_msg_time = time.monotonic()
-
-        async def _ws_keepalive():
-            nonlocal _last_client_msg_time
-            fail_count = 0
-            while _keepalive_running and not ws.closed:
-                await asyncio.sleep(15)  # 15s < ngrok's ~30s idle threshold
-                if ws.closed or not _keepalive_running:
-                    break
-                # Send JSON pong (data frame) — ngrok counts data frames as activity.
-                # 5s timeout prevents sends from blocking indefinitely when the
-                # event loop is delayed by GIL contention from inference (US-DQ05).
-                try:
-                    await asyncio.wait_for(
-                        ws.send_json({"type": "pong"}), timeout=5.0
-                    )
-                    fail_count = 0
-                except asyncio.TimeoutError:
-                    fail_count += 1
-                    logger.warning(
-                        "Keepalive send timed out for %s (%d/3) — event loop may be blocked",
-                        ws_id, fail_count,
-                    )
-                    if fail_count >= 3:
-                        logger.warning("Keepalive: 3 consecutive timeouts, closing WS %s", ws_id)
-                        try:
-                            await ws.close()
-                        except Exception:
-                            pass
-                        break
-                    continue
-                except Exception:
-                    fail_count += 1
-                    logger.warning("Keepalive send failed for %s (%d/3)", ws_id, fail_count)
-                    if fail_count >= 3:
-                        logger.warning("Keepalive: 3 consecutive send failures, closing WS %s", ws_id)
-                        try:
-                            await ws.close()
-                        except Exception:
-                            pass
-                        break
-                    continue
-
-                # NOTE: The old 30s "no client message" silence check was removed.
-                # Tab5 migrated to esp_websocket_client (voice.c commit 3af34b0) which
-                # uses WS-level PING/PONG control frames at 15s interval. Control
-                # frames do NOT update _last_client_msg_time (aiohttp handles them
-                # internally and they never surface to the message loop), so the
-                # silence check produced a 30-45s false-positive close every cycle.
-                # Liveness is now detected by: (1) WS-level ping/pong timeout on
-                # Tab5 side (Tab5's voice.c sets ping_interval_sec=15 +
-                # pingpong_timeout_sec=180, so worst-case idle dead-detect ≈ 195 s
-                # — deliberately wide to tolerate slow Ollama LLM turns without
-                # tearing the WS during a legit thinking window), (2) this task's
-                # send-failure counter above (3 consecutive send failures), and
-                # (3) TCP RST propagation.  Audit D1 (#137) flagged "45 s
-                # detection latency" but the actual budget is 195 s — the 45 s
-                # number was from a pre-#75 iteration and the comment is stale.
-                # Lowering the PONG budget below ~120 s reintroduces the LLM-flap
-                # class #75 was built to fix.
-                # _last_client_msg_time is left as-is for potential future use.
-
-        _keepalive_task = asyncio.create_task(_ws_keepalive())
 
         # Connection state — populated after register.
         #
@@ -976,8 +927,11 @@ class VoiceServer:
         except Exception:
             logger.exception("WebSocket handler error for %s", ws_id)
         finally:
-            # Stop keepalive
-            _keepalive_running = False
+            # Stop keepalive — set the event for a clean exit on
+            # the next wake; cancel for the harder-edged interrupt
+            # of the in-flight asyncio.sleep.  Both are wired so
+            # the task can't outlive the handler.
+            _keepalive_stop.set()
             _keepalive_task.cancel()
             # Clean up: pause session, mark device offline, shut down pipeline
             await self._handle_disconnect(conn_state)

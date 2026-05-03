@@ -78,81 +78,17 @@ async def run_startup(server: Any, app: web.Application) -> None:
     from dragon_voice.lifecycle.agentic_init import init_agentic_modules
     await init_agentic_modules(server)
 
-    # v4·D Phase 4g stability fix (audit P0 #1): SurfaceManager so Tab5
-    # widget_action events have somewhere to land.
-    from dragon_voice.surfaces import SurfaceManager
-    server._surface_mgr = SurfaceManager()
-    logger.info("SurfaceManager initialized")
-
-    # Phase 5 ε1a/ε2 (issues #128, #131): in-process scheduler.
-    # ε2 (this PR) switches the default store from InMemoryNotificationStore
-    # to SqliteNotificationStore so notifications survive Dragon
-    # restart.  The in-memory store remains available as a fallback
-    # if SQLite store init fails (no rows lost in that case — the
-    # tables are still in place; just no fresh insertions persist
-    # until the next restart).
-    server._scheduler_mgr = None
-    try:
-        from dragon_voice.scheduler import (
-            InMemoryNotificationStore,
-            SchedulerManager,
-            SqliteNotificationStore,
-        )
-        # ε2: SqliteNotificationStore is the default.  Boot replay
-        # (in manager.start) reads list_due(now) so any due-but-
-        # unfired notifications from the prior process get
-        # rescheduled within the 15-minute REPLAY_WINDOW_SECONDS
-        # cap (RFC R8).
-        try:
-            server._scheduler_store = SqliteNotificationStore(server._db)
-        except Exception as e:
-            logger.warning(
-                "SqliteNotificationStore init failed: %s — "
-                "falling back to InMemoryNotificationStore "
-                "(notifications won't survive restart this run)", e,
-            )
-            server._scheduler_store = InMemoryNotificationStore()
-        server._scheduler_mgr = SchedulerManager(
-            store=server._scheduler_store,
-            surface_mgr=server._surface_mgr,
-            session_mgr=server._session_mgr,
-        )
-        await server._scheduler_mgr.start()
-        logger.info(
-            "SchedulerManager initialized (store=%s)",
-            type(server._scheduler_store).__name__,
-        )
-    except Exception as e:
-        logger.warning("SchedulerManager init failed: %s", e)
-
-    # Register widget-emitting tools AFTER surface_mgr exists.
-    if server._tool_registry is not None:
-        try:
-            from dragon_voice.tools.timesense_tool import TimesenseTool
-            server._tool_registry.register(TimesenseTool(server._surface_mgr))
-            logger.info("TimesenseTool registered (widget emitter)")
-            # Wave 12 skill SDK reference — declarative
-            # ``surface.prompt(on_action=handler)`` style.
-            from dragon_voice.tools.quick_poll_tool import QuickPollTool
-            server._tool_registry.register(QuickPollTool(server._surface_mgr))
-            logger.info("QuickPollTool registered (declarative widget skill)")
-        except Exception as e:
-            logger.warning("TimesenseTool registration failed: %s", e)
-
-        # Phase 5 ε1a: scheduler tool registration.  Separate try
-        # block so a tool-init error doesn't take down the rest of
-        # the registry.
-        if server._scheduler_mgr is not None:
-            try:
-                from dragon_voice.tools.schedule_reminder_tool import (
-                    ScheduleReminderTool,
-                )
-                server._tool_registry.register(
-                    ScheduleReminderTool(server._scheduler_mgr, server._db)
-                )
-                logger.info("ScheduleReminderTool registered (scheduler skill)")
-            except Exception as e:
-                logger.warning("ScheduleReminderTool registration failed: %s", e)
+    # SOLID-audit follow-up: SurfaceManager + SchedulerManager
+    # + widget/scheduler-tool registration extracted to
+    # lifecycle/surfaces_scheduler_init.py.  Mutates _surface_mgr,
+    # _scheduler_mgr, _scheduler_store; registers TimesenseTool +
+    # QuickPollTool + ScheduleReminderTool on the existing
+    # _tool_registry.  Layered try/except — failure of any
+    # sub-step doesn't take down the others.
+    from dragon_voice.lifecycle.surfaces_scheduler_init import (
+        init_surfaces_and_scheduler,
+    )
+    await init_surfaces_and_scheduler(server)
 
     # Conversation engine (shared LLM backend for text/API input).
     # #183 PR 3: pass media_store so multimodal user messages persist

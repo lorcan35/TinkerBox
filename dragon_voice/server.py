@@ -23,6 +23,10 @@ from aiohttp import web, WSMsgType
 from dragon_voice.backend_swap import swap_pipeline_and_conversation_backends
 from dragon_voice.cap_downgrade import maybe_speak_cap_downgrade_alert
 from dragon_voice.codec_negotiation import maybe_swap_uplink_codec
+from dragon_voice.config_finalize import (
+    apply_swap_config_to_conn,
+    persist_session_config_to_db,
+)
 from dragon_voice.config_swap import select_backends_for_mode
 from dragon_voice.config_swap_guards import validate_config_swap_prereqs
 from dragon_voice.config_update_ack import emit_config_update_ack
@@ -2199,46 +2203,26 @@ class VoiceServer:
             ):
                 return
 
-            # Update session system prompt in DB for conversation engine
-            # Chat v4·C (refs #27): also persist voice_mode + llm_model
-            # onto the session row so the drawer surfaces the active
-            # mode fingerprint and pipeline-resume picks the right
-            # backends without a fresh config_update from the client.
-            sid = conn_state.get("session_id")
-            if sid and self._db:
-                # Resolve the best "active model" string to persist,
-                # matching the client-visible payload below.
-                if vmode.is_cloud():
-                    active_model_db = conn_config.llm.openrouter_model or ""
-                elif llm_be == "tinkerclaw":
-                    active_model_db = conn_config.llm.tinkerclaw_model or ""
-                elif llm_be == "ollama":
-                    active_model_db = conn_config.llm.ollama_model or ""
-                else:
-                    active_model_db = str(llm_model or "")
-                try:
-                    await self._db.update_session(
-                        sid,
-                        system_prompt=conn_config.llm.system_prompt,
-                        voice_mode=int(vmode),
-                        llm_model=active_model_db[:128],
-                    )
-                except Exception:
-                    logger.warning(
-                        "Failed to update session system_prompt / mode"
-                    )
-
-            # Apply config
-            conn_config.stt.backend = stt_be
-            conn_config.tts.backend = tts_be
-            conn_config.llm.backend = llm_be
-
-            # Propagate API keys for cloud STT/TTS backends (modes 1-2, or mode 3 with cloud STT)
-            if vmode.needs_cloud_stt_tts() or (vmode.is_tinkerclaw() and stt_be == "openrouter"):
-                conn_config.stt.openrouter_api_key = conn_config.llm.openrouter_api_key
-                conn_config.stt.openrouter_url = conn_config.llm.openrouter_url
-                conn_config.tts.openrouter_api_key = conn_config.llm.openrouter_api_key
-                conn_config.tts.openrouter_url = conn_config.llm.openrouter_url
+            # SOLID-audit follow-up: session DB persist + conn_config
+            # finalize (backend names + cloud STT/TTS API key
+            # propagation) extracted to config_finalize.{persist_session_config_to_db,
+            # apply_swap_config_to_conn}.  Both run AFTER validation +
+            # backend selection, BEFORE the actual swap.
+            await persist_session_config_to_db(
+                self._db,
+                session_id=conn_state.get("session_id"),
+                vmode=vmode,
+                conn_config=conn_config,
+                llm_backend=llm_be,
+                llm_model_request=llm_model,
+            )
+            apply_swap_config_to_conn(
+                conn_config,
+                vmode=vmode,
+                stt_backend=stt_be,
+                tts_backend=tts_be,
+                llm_backend=llm_be,
+            )
 
             # SOLID-audit follow-up: pipeline swap + ConvEngine swap
             # extracted to backend_swap.swap_pipeline_and_conversation_backends.

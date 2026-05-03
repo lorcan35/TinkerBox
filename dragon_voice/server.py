@@ -1645,10 +1645,14 @@ class VoiceServer:
         """Body of _handle_text, wrapped by the B1 turn-gate bracket above."""
 
         # TinkerClaw mode: bypass ConversationEngine, use ConversationEngine's
-        # swapped LLM (not pipeline._llm which may be stale after swap race)
+        # swapped LLM (not pipeline._llm which may be stale after swap race).
+        #
+        # ENC-1 (audit 2026-05-03): goes through the public `.llm`
+        # property instead of the private `_llm` attribute.  Behavior
+        # unchanged — the property is a thin pass-through.
         conn_cfg = conn_state.get("config")
-        if conn_cfg and conn_cfg.llm.backend == "tinkerclaw" and self._conversation and self._conversation._llm:
-            llm = self._conversation._llm
+        if conn_cfg and conn_cfg.llm.backend == "tinkerclaw" and self._conversation and self._conversation.llm:
+            llm = self._conversation.llm
             logger.info("_handle_text TinkerClaw bypass via ConvEngine LLM: %s", llm.name)
             # Wave 21b (#204): isinstance(SupportsSessionKey) over hasattr.
             from dragon_voice.llm.base import SupportsSessionKey
@@ -2455,12 +2459,6 @@ class VoiceServer:
                 try:
                     vision_model = ""
                     per_frame_mils = 0
-                    # Wave 22b: this isinstance was previously sharing an
-                    # import with the swap path which moved into ConvEngine.
-                    # Local import keeps the vision-model lookup self-
-                    # contained until a future ConvEngine.choose_vision_model
-                    # follow-up subsumes it.
-                    from dragon_voice.llm.router import CapabilityAwareRouter
                     # OCP-2 (audit 2026-05-03): single source of truth for
                     # per-frame mils.  Kills the parallel switch on
                     # gpt-4o/sonnet/haiku/gemini that silently defaulted
@@ -2468,25 +2466,30 @@ class VoiceServer:
                     # to 0 mils — every cloud-vision turn on those models
                     # was invisible to the daily-cap budget enforcement.
                     from dragon_voice.llm.openrouter_llm import vision_per_frame_mils
-                    if (self._conversation
-                            and isinstance(
-                                self._conversation._llm,
-                                CapabilityAwareRouter,
-                            )):
-                        from dragon_voice.llm.base import Modality
-                        spec = self._conversation._llm.choose(
-                            {Modality.TEXT, Modality.VISION}, int(vmode),
+                    # ENC-1 (audit 2026-05-03): replaced the prior
+                    # `isinstance(self._conversation._llm, CapabilityAwareRouter)`
+                    # private-attribute reach-through with the public
+                    # `ConversationEngine.choose_vision_model(voice_mode)`
+                    # accessor.  Returns ModelSpec | None — None falls
+                    # through to the substring-based capability gate
+                    # below for single-backend configurations.
+                    # Combined with OCP-1 (#211): pass int(vmode) so the
+                    # router still receives the integer tier key it
+                    # expects.
+                    spec = (
+                        self._conversation.choose_vision_model(int(vmode))
+                        if self._conversation else None
+                    )
+                    if spec is not None:
+                        vision_model = spec.model_id
+                        # Local-tier sub-backends are free regardless of
+                        # the canonical pricing table (which is OR-only);
+                        # short-circuit to avoid a `_default`-table
+                        # surprise on a local vision model id.
+                        per_frame_mils = (
+                            0 if spec.tier == "local"
+                            else vision_per_frame_mils(spec.model_id)
                         )
-                        if spec:
-                            vision_model = spec.model_id
-                            # Local-tier sub-backends are free regardless of
-                            # the canonical pricing table (which is OR-only);
-                            # short-circuit to avoid a `_default`-table
-                            # surprise on a local vision model id.
-                            per_frame_mils = (
-                                0 if spec.tier == "local"
-                                else vision_per_frame_mils(spec.model_id)
-                            )
                     else:
                         # Note: `or_model_lc` (was `vm`) renamed to avoid
                         # shadowing the outer `vmode` VoiceMode added in

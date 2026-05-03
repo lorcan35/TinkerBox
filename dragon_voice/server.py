@@ -38,6 +38,7 @@ from dragon_voice.session_handshake import (
 )
 from dragon_voice.empty_response_wrap import maybe_synthesize_empty_response_wrap
 from dragon_voice.text_path_tts import synthesize_and_stream_text_response
+from dragon_voice.tinkerclaw_text_path import handle_tinkerclaw_text_path
 from dragon_voice.rich_media_emit import emit_rich_media_for_text_turn
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.surface_register import register_surface_and_replay_scheduler
@@ -1387,110 +1388,28 @@ class VoiceServer:
     ) -> None:
         """Body of _handle_text, wrapped by the B1 turn-gate bracket above."""
 
-        # TinkerClaw mode: bypass ConversationEngine, use ConversationEngine's
-        # swapped LLM (not pipeline._llm which may be stale after swap race).
-        #
-        # ENC-1 (audit 2026-05-03): goes through the public `.llm`
-        # property instead of the private `_llm` attribute.  Behavior
-        # unchanged — the property is a thin pass-through.
+        # SOLID-audit follow-up: TinkerClaw bypass branch
+        # extracted to tinkerclaw_text_path.handle_tinkerclaw_text_path.
+        # That module owns: precondition gate (voice_mode 3 + live
+        # ConvEngine LLM), session-key set, thinking indicator,
+        # token streaming with #75 PING-during-inference keepalive,
+        # γ2-M6 (#106) DragonError fast-fail, empty-response wrap
+        # with W15-H09 apology fallback, llm_done, TC zero-cost
+        # receipt, and rich media emit (dedup with local path).
+        # Returns True when handled (we return); False when not in
+        # TC mode (we fall through to the local ConvEngine path).
         conn_cfg = conn_state.get("config")
-        if conn_cfg and conn_cfg.llm.backend == "tinkerclaw" and self._conversation and self._conversation.llm:
-            llm = self._conversation.llm
-            logger.info("_handle_text TinkerClaw bypass via ConvEngine LLM: %s", llm.name)
-            # Wave 21b (#204): isinstance(SupportsSessionKey) over hasattr.
-            from dragon_voice.llm.base import SupportsSessionKey
-            if isinstance(llm, SupportsSessionKey):
-                llm.set_session_key(conn_state.get("session_id", ""))
-
-            # Send a "thinking" indicator immediately to keep the WS alive.
-            # TinkerClaw agent can take 10-30s before first token (memory recall,
-            # skill execution). Without this, ngrok kills the idle connection.
-            if not ws.closed:
-                await ws.send_json({"type": "llm", "text": ""})
-
-            # #75 phase 1a: WS-level PING every 5 s while the LLM is
-            # generating.  Previously inlined here as `_keepalive()` at
-            # 10 s; now the shared helper lives on the class so the
-            # vision-upload path (below in _handle_user_media) gets the
-            # same protection instead of running bare.  5 s is safely
-            # under every Tab5 firmware's PONG-watch window (30–45 s);
-            # the outer `WebSocketResponse(heartbeat=60)` timer is too
-            # slow for a 90 s 4 B-class Ollama turn.  See docs/AUDIT.md
-            # "Local-mode gauntlet" for the observed P13-eviction race.
-            full_response = []
-            try:
-                async with self._ws_keepalive_during_inference(ws, label="tc_text"):
-                    async for token in llm.generate_stream_with_messages([
-                        {"role": "user", "content": text}
-                    ]):
-                        full_response.append(token)
-                        if not ws.closed:
-                            await ws.send_json({"type": "llm", "text": token})
-            except DragonError as e:
-                # γ2-M6 (issue #106): TC gateway pre-flight health check
-                # failed in ≤ 5 s.  Emit the structured γ1 error frame
-                # so Tab5 can surface a FATAL/GATEWAY banner — pre-fix
-                # the user waited the full 600 s sock_read timeout
-                # before the connection-error fallback fired.
-                logger.warning(
-                    "TC text path fast-failed: %s (code=%s)",
-                    e.message, e.code,
-                )
-                if not ws.closed:
-                    await self._safe_send_json(ws, e.to_event())
-                    await ws.send_json({
-                        "type": "llm_done", "llm_ms": 0, "text": "",
-                    })
-                return
-
-            response_text = "".join(full_response)
-
-            # SOLID-audit follow-up: empty-response guard extracted to
-            # empty_response_wrap.maybe_synthesize_empty_response_wrap.
-            # TC semantics: pass fallback_when_no_tools="Sorry, ..."
-            # so the W15-H09 apology fires when zero tools fired.
-            response_text = await maybe_synthesize_empty_response_wrap(
-                ws,
-                response_text=response_text,
-                tool_calls=conn_state.get("tool_calls_this_turn") or [],
-                safe_send_json=self._safe_send_json,
-                log_label="tc",
-                fallback_when_no_tools=(
-                    "Sorry, I couldn't generate a response for that. "
-                    "Please try rephrasing, or try again in a moment."
-                ),
-            )
-
-            logger.info("TinkerClaw text response (%d chars): %s",
-                        len(response_text), response_text[:80])
-            if not ws.closed:
-                await ws.send_json({"type": "llm_done", "llm_ms": 0, "text": response_text})
-
-            # SOLID-audit follow-up: TC zero-cost receipt extracted to
-            # text_path_receipt.emit_tinkerclaw_zero_cost_receipt.
-            # Same model-name resolution priority chain
-            # (_model → name → config_default → minimax fallback) is
-            # pinned by 4 dedicated tests.
-            await emit_tinkerclaw_zero_cost_receipt(
-                ws,
-                llm=llm,
-                tinkerclaw_model_default=getattr(conn_cfg.llm, "tinkerclaw_model", "") or "",
-                safe_send_json=self._safe_send_json,
-            )
-
-            # SOLID-audit follow-up: rich media detection extracted to
-            # rich_media_emit.emit_rich_media_for_text_turn (dedup with
-            # the local-path branch below).
-            if full_response:
-                await emit_rich_media_for_text_turn(
-                    ws,
-                    response_text=response_text,
-                    media_pipeline=self._media_pipeline,
-                    session_id=session_id,
-                    safe_send_json=self._safe_send_json,
-                    log_label="tc",
-                )
-
+        if await handle_tinkerclaw_text_path(
+            ws,
+            conn_state=conn_state,
+            conn_config=conn_cfg,
+            text=text,
+            session_id=session_id,
+            conversation=self._conversation,
+            media_pipeline=self._media_pipeline,
+            ws_keepalive=self._ws_keepalive_during_inference,
+            safe_send_json=self._safe_send_json,
+        ):
             return
 
         try:

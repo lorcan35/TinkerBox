@@ -9,7 +9,9 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 from dragon_voice.tools.formatter import (
+    COMPACT_PRIORITY_THRESHOLD,
     COMPACT_PRIORITY_TOOLS,
+    _is_compact_eligible,
     format_for_llm,
 )
 
@@ -20,6 +22,7 @@ def _make_tool(
     description: str = "test desc",
     properties: dict | None = None,
     required: list[str] | None = None,
+    priority: int = 50,
 ) -> MagicMock:
     tool = MagicMock()
     tool.name = name
@@ -28,6 +31,7 @@ def _make_tool(
         "properties": properties or {},
         "required": required or [],
     }
+    tool.priority = priority
     return tool
 
 
@@ -203,3 +207,100 @@ class TestPriorityToolListPin:
             "calculator",
             "schedule_reminder",
         )
+
+
+# ─── OCP-3 priority-attribute path (PR #251) ─────────────────
+
+
+class TestPriorityAttributeOcp3:
+    def test_default_priority_is_50_excluded_from_compact(self):
+        """Default-priority tools (not in legacy name list) must
+        NOT appear in compact — preserves "noisy tool list confuses
+        small models" semantic."""
+        tools = [_make_tool("custom_tool", priority=50)]
+        result = format_for_llm(tools, compact=True)
+        # Falls back to first 4 since none are priority — but
+        # "custom_tool" IS the only registered tool, so it appears
+        # via fallback.  Construct the test such that a default-50
+        # tool doesn't qualify on the priority path while priority
+        # tools that DO qualify are also present.
+        priority_tool = _make_tool("web_search", priority=50)  # name-list match
+        default_tool = _make_tool("custom_tool", priority=50)  # neither path
+        result = format_for_llm(
+            [priority_tool, default_tool], compact=True,
+        )
+        assert "web_search" in result
+        # custom_tool is excluded because its priority is 50 AND
+        # its name is not in the legacy list
+        assert "custom_tool" not in result
+
+    def test_low_priority_attribute_includes_in_compact(self):
+        """OCP-3 closure: a tool with priority < threshold must be
+        included in the compact prompt EVEN IF its name is not in
+        COMPACT_PRIORITY_TOOLS — lets new tools opt into the
+        compact slot without editing the formatter."""
+        new_tool = _make_tool("brand_new_tool", priority=15)
+        result = format_for_llm([new_tool], compact=True)
+        assert "brand_new_tool" in result
+
+    def test_high_priority_attribute_excluded_from_compact(self):
+        """priority >= threshold means "not in compact" — pin the
+        boundary semantic."""
+        tools = [
+            _make_tool("legacy_priority", priority=10),  # in
+            _make_tool("at_threshold", priority=50),     # out (not strict <)
+            _make_tool("over_threshold", priority=99),   # out
+        ]
+        # Need at least ONE legacy or low-priority tool to avoid
+        # the fallback-to-first-N path.
+        result = format_for_llm(tools, compact=True)
+        assert "legacy_priority" in result
+        assert "at_threshold" not in result
+        assert "over_threshold" not in result
+
+    def test_legacy_name_list_path_still_works(self):
+        """Backward compat pin: a tool with default priority=50
+        but a name in the legacy list MUST still appear (existing
+        Tool subclasses don't set priority)."""
+        legacy_tool = _make_tool("calculator", priority=50)
+        result = format_for_llm([legacy_tool], compact=True)
+        assert "calculator" in result
+
+    def test_both_paths_or_combined(self):
+        """A tool qualifies via EITHER path (OR-combined) so legacy
+        + new tools can coexist in the same registry."""
+        legacy = _make_tool("web_search", priority=50)        # name match
+        new = _make_tool("smart_search", priority=20)         # priority match
+        result = format_for_llm([legacy, new], compact=True)
+        assert "web_search" in result
+        assert "smart_search" in result
+
+
+# ─── _is_compact_eligible helper ─────────────────────────────
+
+
+class TestCompactEligibility:
+    def test_legacy_name_match_eligible(self):
+        tool = _make_tool("web_search", priority=50)
+        assert _is_compact_eligible(tool) is True
+
+    def test_low_priority_eligible(self):
+        tool = _make_tool("anything", priority=10)
+        assert _is_compact_eligible(tool) is True
+
+    def test_default_priority_non_legacy_name_not_eligible(self):
+        tool = _make_tool("randomtool", priority=50)
+        assert _is_compact_eligible(tool) is False
+
+    def test_threshold_constant_pin(self):
+        """Pin: threshold is 50.  Lower = higher priority."""
+        assert COMPACT_PRIORITY_THRESHOLD == 50
+
+    def test_tool_without_priority_attr_treated_as_50(self):
+        """getattr fallback: an external Tool subclass that doesn't
+        inherit from Tool (custom impl) must still work — assume
+        priority=50 (excluded)."""
+        bare = MagicMock(spec=["name"])
+        bare.name = "external"
+        # No priority attribute at all
+        assert _is_compact_eligible(bare) is False

@@ -20,12 +20,21 @@ import inspect
 
 
 def test_handle_text_body_kills_piper_on_tts_timeout() -> None:
-    """``_handle_text_body``'s TTS except branch must call
-    ``kill_active_procs()`` to clean up an in-flight Piper subprocess
-    on timeout / failure.  Mirrors the voice path at
-    ``pipeline.py:1411-1421`` (audit L3 / Phase 2 of #89)."""
-    from dragon_voice.server import VoiceServer
-    src = inspect.getsource(VoiceServer._handle_text_body)
+    """``synthesize_and_stream_text_response``'s TTS except branch must
+    call ``kill_active_procs()`` to clean up an in-flight Piper
+    subprocess on timeout / failure.  Mirrors the voice path at
+    ``pipeline.py:1411-1421`` (audit L3 / Phase 2 of #89).
+
+    SOLID-audit follow-up: the text-path TTS chunk was extracted
+    from ``_handle_text_body`` into
+    ``dragon_voice.text_path_tts.synthesize_and_stream_text_response``
+    in PR-E of round 4.  This test now chases the inspection into
+    that module so the L3 zombie-kill invariant still gets pinned.
+    """
+    from dragon_voice.text_path_tts import (
+        synthesize_and_stream_text_response,
+    )
+    src = inspect.getsource(synthesize_and_stream_text_response)
     # The except must catch TimeoutError explicitly so the timeout
     # branch is distinguishable from a generic synthesize failure.
     assert "asyncio.TimeoutError" in src, (

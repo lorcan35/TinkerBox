@@ -1282,25 +1282,15 @@ class VoicePipeline:
         the screen off.  Delivered through the live TTS path so it respects
         the currently-selected voice (Piper / OpenRouter) and inherits the
         existing pacing + resampling.
+
+        SOLID-audit follow-up: the bracket invariant (snapshot
+        `_tts_started`, run synth, conditionally emit `tts_end`)
+        extracted to speak_system.speak_system_message so it's
+        testable in isolation.  This wrapper kept for backward
+        compat with existing call sites.
         """
-        if not text or not self._tts:
-            return
-        prev_started = self._tts_started
-        try:
-            await self._synthesize_and_send(text)
-        except Exception:
-            logger.exception("speak_system failed: %s", text[:40])
-        finally:
-            # Close the utterance so the Tab5 flushes its ring buffer.
-            if self._tts_started and not prev_started:
-                try:
-                    await self._on_event({
-                        "type": "tts_end",
-                        "tts_ms": round(self._tts_total_ms),
-                    })
-                except Exception:
-                    pass
-                self._tts_started = False
+        from dragon_voice.speak_system import speak_system_message
+        await speak_system_message(self, text)
 
     async def _synthesize_and_send(self, text: str) -> None:
         """Synthesize a sentence, resample to 16kHz, and stream paced to client.

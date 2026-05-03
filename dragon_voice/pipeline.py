@@ -52,45 +52,21 @@ def shutdown_inference_executor(wait: bool = False) -> None:
         # Python < 3.9 doesn't support cancel_futures
         inference_executor.shutdown(wait=wait)
 
-# Regex for sentence boundary detection
-_SENTENCE_END = re.compile(r"[.!?]\s*$")
-_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
-
-# Clause boundary for local mode — start TTS earlier on slow models
-# Triggers on comma/semicolon/colon/dash with 20+ chars buffered
-_CLAUSE_END = re.compile(r"[,;:\u2014—]\s*$")
-
-# Phase 2 H2 (issue #94): word-boundary timeout-flush regex — finds the
-# last whitespace position so the timeout flush splits at a word break,
-# not mid-word.  Used only when the LLM has been silent on punctuation
-# for >300 ms AND the buffer has enough content to make a meaningful
-# TTS chunk.
-_LAST_WORD_BOUNDARY = re.compile(r"\s\S*$")
-
-# Phase 2 H2 (issue #94): triple-backtick toggle for code-block
-# detection.  While inside a code block the clause-flush is suppressed
-# (a colon in `def foo():` is structural, not a natural pause).  The
-# sentence-flush (.!?) still applies because periods are rare in code
-# blocks and a `.` is usually meaningful (e.g. `obj.method()`).
-# Timeout-flush also suppressed in code so the whole block emits as
-# one TTS unit.
-_TRIPLE_BACKTICK = "```"
-
-# Phase 2 H2 (issue #94): timeout-flush parameters.  300 ms is long
-# enough that a normal punctuation-rich response never trips it
-# (sentences land their `.` well within 300 ms of each other on any
-# model > 5 tok/s) but short enough that an LLM rambling without
-# punctuation still feels responsive.  Minimum buffer of 20 chars
-# prevents micro-stuttered chunks.
-_LOCAL_TIMEOUT_FLUSH_S = 0.30
-_LOCAL_TIMEOUT_FLUSH_MIN_CHARS = 20
-
-# Hallucination stop patterns — LLMs sometimes simulate user turns or continue
-# generating after answering. Truncate response at these markers.
-_HALLUCINATION_STOPS = re.compile(
-    r"(?:^|\n\n\n|\n)(User:|Human:|Assistant:|<\|end|<\|im_end)",
-    re.IGNORECASE,
+# SOLID-audit follow-up (PR #264): token-flush helpers +
+# constants extracted to dragon_voice.token_flush.  Re-exported
+# here under their pre-extract names so existing tests +
+# call sites keep working unchanged.
+from dragon_voice.token_flush import (  # noqa: F401  (re-exports preserve names)
+    CLAUSE_END as _CLAUSE_END,
+    HALLUCINATION_STOPS as _HALLUCINATION_STOPS,
+    LAST_WORD_BOUNDARY as _LAST_WORD_BOUNDARY,
+    LOCAL_TIMEOUT_FLUSH_MIN_CHARS as _LOCAL_TIMEOUT_FLUSH_MIN_CHARS,
+    LOCAL_TIMEOUT_FLUSH_S as _LOCAL_TIMEOUT_FLUSH_S,
+    SENTENCE_END as _SENTENCE_END,
+    SENTENCE_SPLIT as _SENTENCE_SPLIT,
+    TRIPLE_BACKTICK as _TRIPLE_BACKTICK,
 )
+
 
 # VAD constants
 _SILENCE_THRESHOLD = 500  # RMS amplitude below this = silence (int16 range)

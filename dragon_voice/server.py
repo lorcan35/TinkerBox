@@ -31,6 +31,7 @@ from dragon_voice.config_swap import select_backends_for_mode
 from dragon_voice.config_swap_guards import validate_config_swap_prereqs
 from dragon_voice.config_update_ack import emit_config_update_ack
 from dragon_voice.conn_state import ConnState
+from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.media.store import MediaStore
 from dragon_voice.media.pipeline import MediaPipeline
 from dragon_voice.vision_capability import emit_vision_capability
@@ -1031,62 +1032,19 @@ class VoiceServer:
         logger.info("Registering device %s (hw=%s) on connection %s", device_id, hardware_id, ws_id)
 
         # P13: Evict stale connections for the same device_id.
-        # Race condition: new connection arrives before aiohttp detects old TCP close.
-        # The old keepalive task is still running, and its pipeline isn't shut down yet.
-        for old_ws_id, old_conn in list(self._active_connections.items()):
-            if old_ws_id == ws_id:
-                continue  # Skip ourselves
-            if old_conn.get("device_id") == device_id and old_conn.get("registered"):
-                logger.warning(
-                    "P13: Device %s already has connection %s — evicting stale connection",
-                    device_id, old_ws_id,
-                )
-                # γ2-M5 (issue #108): tell the old client why it's being
-                # disconnected BEFORE we tear its pipeline down.  Pre-fix
-                # the client just saw TCP close and had no signal that
-                # another instance had claimed the slot — Tab5 would then
-                # auto-reconnect into the same eviction loop.  FATAL/DEVICE
-                # is the "operator action needed; do NOT auto-reconnect"
-                # signal Tab5 (γ2-H8) routes to the caption + retry banner.
-                old_on_event = old_conn.get("_on_event")
-                if old_on_event:
-                    try:
-                        await old_on_event(error_event(
-                            code="device_evicted",
-                            message="Another device claimed this session.",
-                            severity=Severity.FATAL,
-                            scope=Scope.DEVICE,
-                        ))
-                    except Exception as e:
-                        # Stale / closed WS — eviction must still proceed.
-                        # The user-visible signal is best-effort; the new
-                        # connection's success matters more.
-                        logger.debug(
-                            "P13: device_evicted notice not delivered to %s: %s",
-                            old_ws_id, e,
-                        )
-
-                # Shut down the old pipeline
-                old_pipeline = old_conn.get("pipeline")
-                if old_pipeline:
-                    try:
-                        await old_pipeline.shutdown()
-                    except Exception as e:
-                        logger.warning("P13: old pipeline shutdown failed for %s: %s", old_ws_id, e)
-                    old_conn["pipeline"] = None
-
-                # Pause the old session (not end — it might be resumed by the new connection)
-                old_sid = old_conn.get("session_id")
-                if old_sid and self._session_mgr:
-                    await self._session_mgr.pause_session(old_sid)
-
-                # Mark as unregistered so _handle_disconnect won't mark device offline
-                old_conn["registered"] = False
-
-                # Remove from active connections — _handle_disconnect will be a no-op
-                self._active_connections.pop(old_ws_id, None)
-
-                logger.info("P13: Evicted stale connection %s for device %s", old_ws_id, device_id)
+        # SOLID-audit follow-up: extracted to
+        # stale_conn_eviction.evict_stale_connections_for_device.
+        # The whole γ2-M5 device_evicted notify + pipeline shutdown +
+        # session pause + active_conns cleanup chain lives there now,
+        # backed by 11 unit tests pinning every failure-isolation
+        # branch (notify failure, shutdown failure, missing pipeline,
+        # missing on_event, multi-evict, etc.).
+        await evict_stale_connections_for_device(
+            active_connections=self._active_connections,
+            session_mgr=self._session_mgr,
+            device_id=device_id,
+            new_ws_id=ws_id,
+        )
 
         # Upsert device in DB.
         #

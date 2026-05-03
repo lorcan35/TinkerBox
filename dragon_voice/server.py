@@ -20,6 +20,7 @@ from typing import AsyncIterator, Optional
 import aiohttp
 from aiohttp import web, WSMsgType
 
+from dragon_voice.cap_downgrade import maybe_speak_cap_downgrade_alert
 from dragon_voice.conn_state import ConnState
 from dragon_voice.media.store import MediaStore
 from dragon_voice.media.pipeline import MediaPipeline
@@ -2468,21 +2469,12 @@ class VoiceServer:
 
             # v4·D Gauntlet G7-F: speak a short alert when the Tab5
             # auto-downgrades because the daily cap was hit.
-            try:
-                if cmd.get("reason") == "cap_downgrade":
-                    pipeline = conn_state.get("pipeline")
-                    if pipeline and hasattr(pipeline, "speak_system"):
-                        # Wave 14 W14-C06: track the task so
-                        # _handle_disconnect can cancel it if the user
-                        # closes mid-utterance.
-                        bg = conn_state["bg_tasks"]
-                        t = asyncio.create_task(pipeline.speak_system(
-                            "Daily budget cap reached. Switched back to local mode."
-                        ))
-                        bg.add(t)
-                        t.add_done_callback(bg.discard)
-            except Exception:
-                logger.exception("cap_downgrade alert failed")
+            # Extracted to cap_downgrade.maybe_speak_cap_downgrade_alert
+            # in the SOLID-audit follow-up — this and the vision-
+            # capability emit above were the two cleanest "different
+            # axis of change" sub-responsibilities to split out of
+            # _handle_config_update.
+            maybe_speak_cap_downgrade_alert(cmd, conn_state)
 
     async def _handle_user_media(self, ws, conn_state, cmd):
         """Handle image/audio uploaded by Tab5 for multimodal LLM analysis.

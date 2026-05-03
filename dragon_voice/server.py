@@ -58,6 +58,7 @@ from dragon_voice.widget_capabilities_init import init_widget_capabilities
 from dragon_voice.disconnect_handler import handle_disconnect as _disconnect_chain
 from dragon_voice.handler_task_spawn import spawn_handler_task
 from dragon_voice.widget_action_handler import handle_widget_action
+from dragon_voice.text_turn_gate import invoke_with_text_turn_gate
 from dragon_voice.rich_media_emit import emit_rich_media_for_text_turn
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.surface_register import register_surface_and_replay_scheduler
@@ -1080,42 +1081,22 @@ class VoiceServer:
     async def _handle_text(
         self, ws: web.WebSocketResponse, conn_state: dict, cmd: dict
     ) -> None:
-        """Handle text input message — goes directly to conversation engine."""
-        session_id = conn_state.get("session_id")
-        if not session_id or not self._conversation:
-            await ws.send_json(error_event(
-                code="session_invalid",
-                message="Not registered — send register first.",
-                severity=Severity.FATAL, scope=Scope.SESSION,
-            ))
-            return
+        """Handle text input message — goes directly to conversation engine.
 
-        content = cmd.get("content", "").strip()
-        if not content:
-            return
-
-        text = content
-        logger.info("Text input on session %s: %s", session_id, text[:80])
-
-        # #75 phase 1b: reset the per-turn tool-call tracker.  Each
-        # incoming text starts a new turn; the `_on_tool_result`
-        # callback accumulates here so the end-of-turn empty-reply guard
-        # can synthesise a template wrap from what actually fired.
-        conn_state["tool_calls_this_turn"] = []
-
-        # Audit B1 (#165): mark turn busy so scheduler-fired widgets
-        # defer until this text turn completes — prevents the
-        # `llm token / widget_card / llm token` interleave.
-        if self._surface_mgr is not None:
-            self._surface_mgr.mark_turn_start(session_id)
-        try:
-            await self._handle_text_body(ws, conn_state, cmd, text, session_id, content)
-        finally:
-            if self._surface_mgr is not None:
-                try:
-                    await self._surface_mgr.mark_turn_end(session_id)
-                except Exception:
-                    logger.exception("B1: turn-end drain failed for text turn")
+        SOLID-audit follow-up: precondition guard + per-turn
+        tool-tracker reset + B1 turn-busy bracket extracted to
+        text_turn_gate.invoke_with_text_turn_gate.  That module
+        owns the gating; `_handle_text_body` owns the actual
+        LLM/TTS work and is invoked as the body callable.
+        """
+        await invoke_with_text_turn_gate(
+            ws,
+            conn_state=conn_state,
+            cmd=cmd,
+            conversation=self._conversation,
+            surface_mgr=self._surface_mgr,
+            body_fn=self._handle_text_body,
+        )
 
     async def _handle_text_body(
         self, ws: web.WebSocketResponse, conn_state: dict, cmd: dict,

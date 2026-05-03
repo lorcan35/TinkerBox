@@ -37,6 +37,7 @@ from dragon_voice.session_handshake import (
     replay_session_message_tail,
 )
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
+from dragon_voice.surface_register import register_surface_and_replay_scheduler
 from dragon_voice.media.store import MediaStore
 from dragon_voice.media.pipeline import MediaPipeline
 from dragon_voice.vision_capability import emit_vision_capability
@@ -1101,43 +1102,19 @@ class VoiceServer:
         conn_state["registered"] = True
         conn_state["response_mode"] = "always_speak"  # voice device gets TTS
 
-        # v4·D Phase 4g: register this connection's surface with the
-        # shared SurfaceManager.  Skills dispatch widget_* emissions
-        # through here and widget_action events route back via
-        # handle_action().
-        # v4·D audit P1: route surface + tool-event sends through the
-        # _safe_send_json helper so a transient close mid-widget-emit
-        # doesn't bubble into the WS handler and tear the session down.
-        if self._surface_mgr is not None:
-            async def _surface_send(msg: dict):
-                if not ws.closed:
-                    await self._safe_send_json(ws, msg)
-            await self._surface_mgr.register_session(session_id, _surface_send, caps=conn_state.get("widget_capabilities"))
-
-        # Phase 5 ε2 (issue #131): replay any queued offline
-        # notifications for this device.  Hook fires AFTER
-        # SurfaceManager.register_session so the scheduler manager
-        # can find a live Tab5Surface for this session.  Best-effort:
-        # a queue-drain failure logs a warning but doesn't block
-        # registration (the user's reminders just stay queued for
-        # the next register).
-        scheduler_mgr = getattr(self, "_scheduler_mgr", None)
-        if scheduler_mgr is not None:
-            try:
-                replayed = await scheduler_mgr.replay_queued_for_device(
-                    device_id,
-                )
-                if replayed > 0:
-                    logger.info(
-                        "Scheduler offline-queue replay: delivered %d "
-                        "frame(s) to %s on session %s",
-                        replayed, device_id, session_id,
-                    )
-            except Exception as e:
-                logger.warning(
-                    "Scheduler offline-queue replay failed for %s: %s",
-                    device_id, e,
-                )
+        # SOLID-audit follow-up: Surface + Scheduler wiring extracted
+        # to surface_register.register_surface_and_replay_scheduler.
+        # Hook ordering (register before replay) is preserved + pinned
+        # by a dedicated test.
+        await register_surface_and_replay_scheduler(
+            ws,
+            surface_mgr=self._surface_mgr,
+            scheduler_mgr=getattr(self, "_scheduler_mgr", None),
+            session_id=session_id,
+            device_id=device_id,
+            widget_capabilities=conn_state.get("widget_capabilities"),
+            safe_send_json=self._safe_send_json,
+        )
 
         # Store tool event callbacks per-connection (NOT on shared conversation engine)
         if self._tool_registry:

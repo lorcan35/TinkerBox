@@ -41,6 +41,7 @@ from dragon_voice.text_path_tts import synthesize_and_stream_text_response
 from dragon_voice.tinkerclaw_text_path import handle_tinkerclaw_text_path
 from dragon_voice.local_text_stream import stream_local_text_with_tool_filter
 from dragon_voice.vision_turn import handle_vision_turn
+from dragon_voice.ws_voice_admission import check_ws_voice_admission
 from dragon_voice.rich_media_emit import emit_rich_media_for_text_turn
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.surface_register import register_surface_and_replay_scheduler
@@ -511,60 +512,22 @@ class VoiceServer:
                     config_update, error, event
             - Binary: PCM int16 audio at config.tts_sample_rate
         """
-        # Wave 14 W14-C04: authenticate the WS upgrade request.  Prior to
-        # this, /ws/voice was publicly reachable and the `register` frame
-        # only required a non-empty device_id — so any attacker with the
-        # ngrok URL could impersonate any Tab5, hijack sessions, and burn
-        # OpenRouter/TinkerClaw budget.
-        #
-        # Contract:
-        #   - If server.api_token is configured: client MUST present
-        #       `Authorization: Bearer <token>` on the upgrade request,
-        #       matched with hmac.compare_digest.  Mismatch → 401.
-        #   - If server.api_token is blank (unprovisioned/dev): allow the
-        #       handshake but log-warn so the operator knows they're
-        #       running unauthenticated.  This matches the pattern of
-        #       letting first-run bootstraps work without breaking Tab5
-        #       flashes mid-upgrade.
+        # SOLID-audit follow-up: WS auth + connection-cap admission
+        # gate extracted to ws_voice_admission.check_ws_voice_admission.
+        # That module owns: W14-C04 bearer-token check via
+        # hmac.compare_digest, the dev-mode unauthenticated bypass
+        # warning, the >= max_connections cap, and the γ3-Dragon
+        # (#111) JSON error-frame shape for both 401 / 503.  Returns
+        # None to proceed; a ready-to-return Response when rejected.
         expected_token = (getattr(self._config.server, "api_token", "") or "").strip()
-        if expected_token:
-            auth_header = request.headers.get("Authorization", "")
-            supplied = auth_header[7:].strip() if auth_header.startswith("Bearer ") else ""
-            import hmac as _hmac
-            if not supplied or not _hmac.compare_digest(supplied, expected_token):
-                logger.warning(
-                    "WS /ws/voice: rejecting unauthenticated upgrade from %s (header_present=%s)",
-                    request.remote, bool(auth_header))
-                # γ3-Dragon (issue #111): JSON body with `code` so future
-                # ops tooling / dashboard introspection can distinguish
-                # auth failure from other 401 sources without parsing
-                # prose.  Tab5 (γ3-Tab5 follow-up) still uses the raw
-                # status code for its stop-retry decision since
-                # esp_websocket_client doesn't expose the body cleanly.
-                return web.json_response(
-                    {
-                        "code": "auth_failed",
-                        "message": "Invalid Dragon token — check Settings.",
-                    },
-                    status=401,
-                )
-        else:
-            logger.warning(
-                "WS /ws/voice: server.api_token not configured — allowing "
-                "unauthenticated WS. Set DRAGON_API_TOKEN to enforce.")
-
-        # Reject if at connection limit
-        if len(self._active_connections) >= self._max_connections:
-            logger.warning("Connection limit reached (%d), rejecting", self._max_connections)
-            # γ3-Dragon (issue #111): same JSON-body treatment as the
-            # 401 path above — see comment there for rationale.
-            return web.json_response(
-                {
-                    "code": "server_full",
-                    "message": "Dragon is at capacity — try again in a moment.",
-                },
-                status=503,
-            )
+        rejection = check_ws_voice_admission(
+            request,
+            expected_token=expected_token,
+            active_connection_count=len(self._active_connections),
+            max_connections=self._max_connections,
+        )
+        if rejection is not None:
+            return rejection
 
         # v4·D connectivity audit -- ROOT CAUSE FIX #3.
         #

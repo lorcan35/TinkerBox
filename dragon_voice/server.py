@@ -22,6 +22,7 @@ from aiohttp import web, WSMsgType
 
 from dragon_voice.cap_downgrade import maybe_speak_cap_downgrade_alert
 from dragon_voice.config_swap import select_backends_for_mode
+from dragon_voice.config_swap_guards import validate_config_swap_prereqs
 from dragon_voice.conn_state import ConnState
 from dragon_voice.media.store import MediaStore
 from dragon_voice.media.pipeline import MediaPipeline
@@ -2184,79 +2185,17 @@ class VoiceServer:
                         conn_config.llm.openrouter_model if vmode.is_cloud() else "(local)",
                         conn_config.llm.max_tokens)
 
-            # Validate TinkerClaw gateway is reachable before switching to TC mode
-            if vmode.is_tinkerclaw():
-                try:
-                    tc_url = (conn_config.llm.tinkerclaw_url or "http://localhost:18789").rstrip("/")
-                    async with aiohttp.ClientSession(
-                        timeout=aiohttp.ClientTimeout(total=5)
-                    ) as tc_session:
-                        async with tc_session.get(f"{tc_url}/health") as tc_resp:
-                            if tc_resp.status != 200:
-                                logger.error("TinkerClaw health check returned %d", tc_resp.status)
-                                raise RuntimeError(f"health check returned {tc_resp.status}")
-                    logger.info("TinkerClaw gateway health OK at %s", tc_url)
-                except Exception as tc_err:
-                    logger.error("TinkerClaw gateway not reachable: %s", tc_err)
-                    # Audit G5 (2026-04-20): revert to Local so Tab5 doesn't
-                    # sit wedged on mode 3 showing an error. Matches the
-                    # OpenRouter-key-missing path below.
-                    # Audit D5 (#137): same γ-arch shape as B7 / OR-key
-                    # for consistency — error_event + plain config_update
-                    # revert.
-                    if not ws.closed:
-                        await self._safe_send_json(ws, error_event(
-                            code="tc_gateway_unreachable",
-                            message="TinkerClaw gateway is not reachable — reverted to local.",
-                            severity=Severity.FATAL,
-                            scope=Scope.GATEWAY,
-                        ))
-                        await self._safe_send_json(ws, {
-                            "type": "config_update",
-                            "voice_mode": 0,
-                        })
-                    return
-
-            # Validate API key for cloud modes (1=Hybrid, 2=Cloud need OpenRouter)
-            # Mode 3 (TinkerClaw) doesn't need Dragon's OpenRouter key — uses own gateway.
-            #
-            # Audit D5 (#137): pre-fix the toast was a bare
-            # `config_update.error` raw-string that didn't tell the user
-            # what happened next.  Migrated to the same γ-arch error_event
-            # + revert pattern as B7 (TC token check) for consistency.
-            if vmode.needs_openrouter_key() and not conn_config.llm.openrouter_api_key:
-                logger.error("Cloud mode requested but no API key configured")
-                if not ws.closed:
-                    await self._safe_send_json(ws, error_event(
-                        code="openrouter_key_missing",
-                        message="OpenRouter key not configured — reverted to local.",
-                        severity=Severity.FATAL,
-                        scope=Scope.LLM,
-                    ))
-                    await self._safe_send_json(ws, {
-                        "type": "config_update",
-                        "voice_mode": 0,
-                    })
-                return
-
-            # B7 (audit, #137): TC mode needs a token; without one the
-            # backend's __init__ raises ValueError, which would leak via
-            # the A4 raw-exception path below.  Validate up-front like
-            # the OpenRouter key check above so the user sees a clean
-            # γ-arch error and a clean revert instead of a stack trace.
-            if vmode.is_tinkerclaw() and not (conn_config.llm.tinkerclaw_token or "").strip():
-                logger.error("TC mode requested but tinkerclaw_token is blank")
-                if not ws.closed:
-                    await self._safe_send_json(ws, error_event(
-                        code="tc_token_missing",
-                        message="TinkerClaw token not configured — reverted to local",
-                        severity=Severity.FATAL,
-                        scope=Scope.GATEWAY,
-                    ))
-                    await self._safe_send_json(ws, {
-                        "type": "config_update",
-                        "voice_mode": 0,
-                    })
+            # SOLID-audit follow-up: TC gateway / OR key / TC token
+            # validation guards extracted to config_swap_guards.
+            # Returns False iff any guard failed (in which case it
+            # already sent the γ-arch error_event + revert frames);
+            # caller's only obligation is to short-circuit out.
+            if not await validate_config_swap_prereqs(
+                ws,
+                vmode=vmode,
+                conn_config=conn_config,
+                safe_send_json=self._safe_send_json,
+            ):
                 return
 
             # Update session system prompt in DB for conversation engine

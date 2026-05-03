@@ -21,7 +21,6 @@ one callsite that always wants to wire the same graph.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 from typing import Any
 
@@ -30,7 +29,6 @@ from aiohttp import web
 
 from dragon_voice.conversation import ConversationEngine
 from dragon_voice.db import Database
-from dragon_voice.lifecycle import monitors, purge
 from dragon_voice.messages import MessageStore
 from dragon_voice.sessions import SessionManager
 
@@ -139,69 +137,24 @@ async def run_startup(server: Any, app: web.Application) -> None:
         scheduler_mgr=getattr(server, "_scheduler_mgr", None),
     )
 
-    # Notes API routes
-    try:
-        from dragon_voice.notes.api import setup_routes as setup_notes_routes
-        from dragon_voice.notes.db import NotesDB
-        from dragon_voice.notes.service import NotesService
+    # SOLID-audit follow-up: notes module + tool registration
+    # extracted to lifecycle/notes_init.py.
+    from dragon_voice.lifecycle.notes_init import init_notes_module
+    await init_notes_module(server, app)
 
-        notes_db = NotesDB()
-        # Wave 14 W14-C05: NotesDB.initialize is async now.  NotesService
-        # awaits it internally, so we don't call it here.
-        notes_svc = NotesService(server._config, notes_db)
-        await notes_svc.initialize()
-        server._notes_svc = notes_svc
-        setup_notes_routes(app, notes_svc)
-        logger.info("Notes API routes registered")
+    # SOLID-audit follow-up: MCP server bridges extracted to
+    # lifecycle/mcp_init.py.
+    from dragon_voice.lifecycle.mcp_init import init_mcp_bridges
+    await init_mcp_bridges(server)
 
-        # Register NoteTool now that NotesService is available.
-        if server._tool_registry and server._notes_svc:
-            from dragon_voice.tools.note_tool import NoteTool
-            server._tool_registry.register(NoteTool(server._notes_svc))
-            logger.info("Note tool registered (notes service available)")
-    except Exception as e:
-        logger.warning("Notes API not available: %s", e)
-
-    # MCP servers (from config)
-    try:
-        from dragon_voice.mcp.bridge import bridge_mcp_server
-        mcp_servers = getattr(server._config, "mcp_servers", [])
-        for mcp in mcp_servers:
-            count = await bridge_mcp_server(
-                server._tool_registry,
-                name=mcp.get("name", "mcp"),
-                url=mcp.get("url"),
-                token=mcp.get("token"),
-            )
-            logger.info("MCP %s: %d tools bridged", mcp.get("name"), count)
-    except Exception as e:
-        logger.warning("MCP bridge not available: %s", e)
-
-    # Run initial message purge + schedule periodic (US-DQ14)
-    retention_days = server._config.database.message_retention_days
-    if retention_days > 0:
-        try:
-            result = await server._db.purge_old_messages(days=retention_days)
-            logger.info(
-                "Startup purge complete: %d messages, %d events removed (retention=%d days)",
-                result["messages"], result["events"], retention_days,
-            )
-        except Exception as e:
-            logger.warning("Startup purge failed: %s", e)
-
-        server._purge_task = asyncio.create_task(
-            purge.periodic_purge_loop(server, retention_days)
-        )
-
-    # Media cleanup (hourly, removes expired uploads)
-    server._media_cleanup_task = asyncio.create_task(purge.media_cleanup_loop(server))
-
-    # Start periodic memory monitor (A04)
-    server._memory_monitor_task = asyncio.create_task(monitors.memory_monitor_loop(server))
-    rss = monitors.get_rss_mb()
-    logger.info(
-        "Memory monitor started (RSS=%.0f MB, warn=%d MB, crit=%d MB)",
-        rss, server._mem_warn_mb, server._mem_crit_mb,
+    # SOLID-audit follow-up: background-task scheduling
+    # (purge + media cleanup + memory monitor) extracted to
+    # lifecycle/background_tasks_init.py.  Synchronous (only
+    # spawns tasks) so the boot sequence never blocks on the
+    # initial purge.
+    from dragon_voice.lifecycle.background_tasks_init import (
+        init_background_tasks,
     )
+    init_background_tasks(server)
 
     logger.info("Foundation modules initialized")

@@ -51,6 +51,7 @@ from dragon_voice.cancel_handler import handle_cancel_command
 from dragon_voice.clear_handler import handle_clear_command
 from dragon_voice.stop_handler import handle_stop_command
 from dragon_voice.pipeline_init import build_and_initialize_pipeline
+from dragon_voice.widget_capabilities_init import init_widget_capabilities
 from dragon_voice.rich_media_emit import emit_rich_media_for_text_turn
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.surface_register import register_surface_and_replay_scheduler
@@ -897,20 +898,19 @@ class VoiceServer:
         ):
             return
 
-        # v4·D audit P0 fix: expose the widget subset of client capabilities
-        # on conn_state so skills can pull it via SurfaceManager and
-        # downgrade emissions (smaller lists, lower-res media) for low-end
-        # clients.  The register frame already ships this under
-        # capabilities.widgets; pluck it out for quick lookup.
+        # SOLID-audit follow-up: widget-capability init extracted
+        # to widget_capabilities_init.init_widget_capabilities.
+        # That module owns: pluck `capabilities.widgets`,
+        # default-fallback shape (types/list/chart/prompt caps),
+        # the deep-copy of the default constant so two
+        # connections sharing the fallback can't mutate each
+        # other's caps via the shared `types` list reference.
         caps = cmd.get("capabilities") or {}
-        widget_caps = caps.get("widgets") if isinstance(caps, dict) else None
-        conn_state["widget_capabilities"] = widget_caps or {
-            "types": ["live", "card"],
-            "list_max_items": 3, "chart_max_points": 8,
-            "prompt_max_choices": 2,
-        }
-        logger.info("widget_capabilities for %s: %s",
-                    device_id, conn_state["widget_capabilities"])
+        init_widget_capabilities(
+            conn_state,
+            capabilities=caps if isinstance(caps, dict) else None,
+            device_id=device_id,
+        )
         await self._db.add_event(
             "device.connected", device_id=device_id,
             data={"platform": cmd.get("platform", ""), "firmware_ver": cmd.get("firmware_ver", "")}

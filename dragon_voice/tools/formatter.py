@@ -64,6 +64,12 @@ from dragon_voice.tools.base import Tool
 # hallucinated "no such tool available" when the user asked
 # for a reminder.  Adding ~30 tokens to the system prompt is a
 # worthwhile trade for unlocking a high-value capability.
+#
+# Wave 23 audit OCP-3 closure (PR #251): the name-list approach
+# is the legacy path; new tools should set their `priority`
+# class attribute to < `COMPACT_PRIORITY_THRESHOLD` instead of
+# extending this constant.  Both paths are honoured in
+# `_format_compact` so existing subclasses keep working.
 COMPACT_PRIORITY_TOOLS: tuple[str, ...] = (
     "web_search",
     "datetime",
@@ -72,6 +78,11 @@ COMPACT_PRIORITY_TOOLS: tuple[str, ...] = (
     "calculator",
     "schedule_reminder",
 )
+
+# Tools with `Tool.priority` strictly less than this value are
+# always included in the compact prompt.  See `Tool.priority`
+# docstring on dragon_voice/tools/base.py.
+COMPACT_PRIORITY_THRESHOLD: int = 50
 
 # Fallback when none of the priority tools are registered (e.g.
 # a test harness with a custom tool set).  Keeps the compact
@@ -108,14 +119,37 @@ def format_for_llm(
     return _format_full(tools_list)
 
 
+def _is_compact_eligible(tool: Tool) -> bool:
+    """A tool is eligible for the compact prompt slot when EITHER
+    its name appears in the legacy `COMPACT_PRIORITY_TOOLS` list
+    OR its `Tool.priority` class attribute is below
+    `COMPACT_PRIORITY_THRESHOLD`.
+
+    The two paths are OR-combined for backward compat: the
+    legacy name list is the well-trodden path; the priority
+    attribute is the OCP-3 OCP-friendlier alternative for new
+    tools that want to opt into the compact slot without editing
+    the formatter.
+    """
+    if tool.name in COMPACT_PRIORITY_TOOLS:
+        return True
+    return getattr(tool, "priority", 50) < COMPACT_PRIORITY_THRESHOLD
+
+
 def _format_compact(tools: list[Tool]) -> str:
     """Minimal tool format for small models (qwen3:1.7b etc).
 
     Uses fewer tokens and simpler structure to avoid confusing
     small models.  Only shows the priority tools to reduce
     context bloat.
+
+    Selection: a tool is included if its name is in the legacy
+    `COMPACT_PRIORITY_TOOLS` constant OR its `Tool.priority`
+    class attribute is below `COMPACT_PRIORITY_THRESHOLD` (audit
+    OCP-3 OCP-friendly path).  Both paths are honoured for
+    backward compat.
     """
-    selected = [t for t in tools if t.name in COMPACT_PRIORITY_TOOLS]
+    selected = [t for t in tools if _is_compact_eligible(t)]
     if not selected:
         # No priority tools registered — fall back to the first
         # few tools so the block isn't empty/broken.

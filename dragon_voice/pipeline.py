@@ -259,6 +259,13 @@ class VoicePipeline:
         from dragon_voice.fallback_stt_cache import FallbackSttCache
         self._fallback_stt_cache = FallbackSttCache()
 
+        # SOLID-audit follow-up: fallback TTS cache mirrors the
+        # STT one — when cloud TTS fails, fall back to local
+        # Piper.  Lazy-load only (TTS doesn't have a "swap to
+        # cloud" trigger that warrants pre-warm).
+        from dragon_voice.fallback_tts_cache import FallbackTtsCache
+        self._fallback_tts_cache = FallbackTtsCache()
+
     async def initialize(self) -> None:
         """Create and initialize all backends.
 
@@ -1358,30 +1365,20 @@ class VoicePipeline:
                 if hasattr(self._tts, "kill_active_procs"):
                     self._tts.kill_active_procs()
                 if self._config.tts.backend == "openrouter":
-                    logger.error("Cloud TTS failed: %s — falling back to local", tts_err)
-                    # v4·D audit P1 fix: cache fallback Piper instance so
-                    # repeated cloud failures don't re-initialize it
-                    # (expensive cold start every time).
-                    if not getattr(self, "_fallback_tts", None):
-                        from dragon_voice.tts import create_tts
-                        from dragon_voice.config import TTSConfig
-                        self._fallback_tts = create_tts(TTSConfig(backend="piper"))
-                        await self._fallback_tts.initialize()
-                        logger.info("Pre-warmed fallback TTS (piper) cached")
-                    # Phase 2 L3 (issue #94): the fallback Piper itself
-                    # can stall — wrap with a wait_for and kill its
-                    # procs on a second timeout.  Without the second
-                    # guard a TTS-down scenario with no second fallback
-                    # could leak indefinitely.
-                    # Audit C3 (#137): use the same 90 s budget as the
-                    # primary path now that we know Piper can need it.
+                    logger.error(
+                        "Cloud TTS failed: %s — falling back to local", tts_err,
+                    )
+                    # SOLID-audit follow-up: fallback Piper
+                    # cache (lazy-load + 90 s wait_for + L3
+                    # kill_active_procs on stall) extracted to
+                    # FallbackTtsCache.synthesize.  Re-raises
+                    # on second failure so the user-facing
+                    # config_update emit (below) is skipped.
                     try:
-                        audio_bytes = await asyncio.wait_for(
-                            self._fallback_tts.synthesize(text), timeout=90
+                        audio_bytes = await self._fallback_tts_cache.synthesize(
+                            text, timeout_s=90.0,
                         )
                     except (Exception, asyncio.TimeoutError) as fb_err:
-                        if hasattr(self._fallback_tts, "kill_active_procs"):
-                            self._fallback_tts.kill_active_procs()
                         logger.error("Fallback Piper TTS also failed: %s", fb_err)
                         raise
                     await self._on_event({
@@ -1606,17 +1603,11 @@ class VoicePipeline:
             tasks.append(self._tts.shutdown())
         if self._llm and not self._pooled_llm:
             tasks.append(self._llm.shutdown())
-        # SOLID-audit follow-up: fallback STT prewarm + cached
-        # backend shutdown extracted to
-        # FallbackSttCache.shutdown — handles cancel + await of
-        # the prewarm task and the cached backend's shutdown.
+        # SOLID-audit follow-up: fallback STT + TTS lifecycles
+        # both extracted to FallbackSttCache + FallbackTtsCache.
+        # Shutdown each in parallel with the primary backends.
         await self._fallback_stt_cache.shutdown()
-        # Fallback TTS still inline (separate cache lifecycle —
-        # follow-up PR could symmetrise).
-        fb_tts = getattr(self, "_fallback_tts", None)
-        if fb_tts:
-            tasks.append(fb_tts.shutdown())
+        await self._fallback_tts_cache.shutdown()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
-        self._fallback_tts = None
         logger.info("Voice pipeline shut down")

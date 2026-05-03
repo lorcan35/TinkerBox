@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import copy
 import logging
-import re
 from typing import AsyncIterator
 
 from dragon_voice.config import LLMConfig
@@ -41,29 +40,17 @@ from dragon_voice.llm.base import LLMBackend, Modality
 logger = logging.getLogger(__name__)
 
 
-# Mirror of server.py's `_BRACKET_NOISE` / `_RESIDUAL_XML_TAG` /
-# `_looks_like_useful_text` heuristic.  Kept inline here because
-# `dragon_voice.llm.dual` is imported during pipeline init via
-# `create_llm`, well before `dragon_voice.server` finishes loading —
-# importing from server.py would create a cycle.  Once #79 lands and
-# both modules need this helper a dedicated `dragon_voice.text_utils`
-# module is the natural extraction point.
-_BRACKET_NOISE = set("<>[]{}()\"'` \t\n\r")
-_RESIDUAL_XML_TAG = re.compile(r"<[^>]*>|\[[^]]*\]|\{[^}]*\}")
-
-
-def _looks_like_useful_text(text: str) -> bool:
-    """True if `text` carries enough signal to be worth showing the user
-    over running the responder.  Mirrors server.py's heuristic verbatim."""
-    if not text:
-        return False
-    if re.search(r"</\w+>", text):
-        return False
-    stripped = _RESIDUAL_XML_TAG.sub("", text).strip()
-    if len(stripped) < 3:
-        return False
-    meaningful = [c for c in stripped if c not in _BRACKET_NOISE]
-    return len(meaningful) >= 3
+# SOLID-audit follow-up (PR #267 / SRP-9): dedupped against
+# the canonical `tools.response_wrap.looks_like_useful_text`.
+# The pre-extract comment claimed importing from server.py
+# would cycle — but the canonical lives in `tools.response_wrap`
+# which has zero internal deps (only `re` + `typing`), so the
+# cycle worry doesn't apply.  Re-exported as
+# `_looks_like_useful_text` to preserve the call site
+# unchanged at line 238.
+from dragon_voice.tools.response_wrap import (  # noqa: F401
+    looks_like_useful_text as _looks_like_useful_text,
+)
 
 
 def _has_tool_marker(text: str) -> bool:

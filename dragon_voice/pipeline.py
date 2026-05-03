@@ -757,109 +757,28 @@ class VoicePipeline:
             logger.warning("Dictation post-processing task failed: %s", exc)
 
     async def _post_process_dictation(self, transcript: str) -> None:
-        """Generate title + summary for completed dictation via LLM."""
+        """Generate title + summary for completed dictation via LLM.
+
+        SOLID-audit follow-up: implementation extracted to
+        dictation_post.run_dictation_post_process.  This method
+        resolves the active LLM (ConvEngine first, then
+        pipeline._llm fallback) and forwards to the free
+        function with the on_event callback + emit_legacy flag.
+        """
+        from dragon_voice.dictation_post import run_dictation_post_process
+
         llm = None
         if self._conversation_engine and self._conversation_engine.llm:
             llm = self._conversation_engine.llm
         elif self._llm:
             llm = self._llm
 
-        if not llm:
-            logger.warning("No LLM available for dictation post-processing")
-            # Phase 2 H4 (issue #94): tell Tab5 the post-process won't run.
-            # Pre-fix this would silently log and leave Tab5 waiting for a
-            # `dictation_summary` event that never arrives — UI gets stuck
-            # on the "Generating summary..." caption forever.
-            # β-arch (issue #123): pair-emit — legacy frame for unmodified
-            # Tab5 + new progress.error frame carrying the γ1 error
-            # taxonomy so γ2-H8 routing applies.
-            await emit_progress_pair(
-                self._on_event,
-                legacy={
-                    "type": "dictation_postprocessing_error",
-                    "error": "no_llm_available",
-                    "message": "Note saved — summary unavailable (LLM offline)",
-                },
-                phase=Phase.DICTATION_POST,
-                stage=Stage.ERROR,
-                code="no_llm_available",
-                message="Note saved — summary unavailable (LLM offline)",
-                severity=Severity.TRANSIENT,
-                scope=Scope.LLM,
-                emit_legacy=self._config.progress_bus_emit_legacy,
-            )
-            return
-
-        prompt = (
-            "Given this voice transcript, provide:\n"
-            "1. A short title (max 8 words)\n"
-            "2. A 1-2 sentence summary\n\n"
-            f"Transcript: {transcript[:2000]}\n\n"
-            "Respond in this exact format:\n"
-            "TITLE: <title>\nSUMMARY: <summary>"
+        await run_dictation_post_process(
+            transcript,
+            llm=llm,
+            on_event=self._on_event,
+            emit_legacy=self._config.progress_bus_emit_legacy,
         )
-
-        try:
-            response = ""
-            async for token in llm.generate_stream(prompt, "You are a concise note summarizer."):
-                response += token
-
-            title = "Untitled Note"
-            summary = transcript[:200]
-            for line in response.split("\n"):
-                line = line.strip()
-                if line.upper().startswith("TITLE:"):
-                    title = line[6:].strip().strip('"')
-                elif line.upper().startswith("SUMMARY:"):
-                    summary = line[8:].strip().strip('"')
-
-            logger.info("Dictation summary: title='%s'", title)
-            # β-arch (issue #123): pair-emit — legacy `dictation_summary`
-            # carries title/summary at the top level; the new progress
-            # frame nests them in `payload` so the bus is uniform.
-            await emit_progress_pair(
-                self._on_event,
-                legacy={
-                    "type": "dictation_summary",
-                    "title": title,
-                    "summary": summary,
-                },
-                phase=Phase.DICTATION_POST,
-                stage=Stage.DONE,
-                payload={"title": title, "summary": summary},
-                emit_legacy=self._config.progress_bus_emit_legacy,
-            )
-        except asyncio.CancelledError:
-            # Phase 2 H4 (issue #94): the cancelled-side event is emitted
-            # by `finish_dictation` BEFORE it spawns a new task — we don't
-            # double-emit here.  Just propagate.  (Caller handles via
-            # add_done_callback.)
-            raise
-        except Exception as e:
-            logger.exception("Dictation post-processing failed")
-            # Phase 2 H4 (issue #94): user-visible error so Tab5 can clear
-            # the "Generating summary..." caption + show a toast.  The
-            # transcript is already in the chat from the prior `stt` event,
-            # so the user hasn't lost data — they just don't get the
-            # auto-generated title/summary.
-            # β-arch (issue #123): pair-emit so the new progress.error
-            # frame carries the γ1 taxonomy.  `code` uses the exception
-            # class name (matches the legacy `error` field convention).
-            await emit_progress_pair(
-                self._on_event,
-                legacy={
-                    "type": "dictation_postprocessing_error",
-                    "error": type(e).__name__,
-                    "message": "Note saved — summary generation failed",
-                },
-                phase=Phase.DICTATION_POST,
-                stage=Stage.ERROR,
-                code=type(e).__name__,
-                message="Note saved — summary generation failed",
-                severity=Severity.TRANSIENT,
-                scope=Scope.LLM,
-                emit_legacy=self._config.progress_bus_emit_legacy,
-            )
 
     # ── Ask mode (existing) ────────────────────────────────────────
 

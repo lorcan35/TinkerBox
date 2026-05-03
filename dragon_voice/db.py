@@ -181,14 +181,13 @@ class Database:
         await _impl(self.conn, device_id)
 
     # ── Sessions ───────────────────────────────────────────────────────
+    # SOLID-audit follow-up (PR #261): session CRUD extracted
+    # to db_sessions module.  Methods below are thin
+    # forwarders so existing call sites keep working unchanged.
 
-    # Explicit column list for sessions SELECTs. Never use `SELECT *` so
-    # schema drift (e.g. new columns added via migration on an older DB
-    # build) surfaces as a query-time error instead of a silent mismatch.
-    _SESSION_COLUMNS = (
-        "id, device_id, type, status, title, system_prompt, config, metadata, "
-        "message_count, voice_mode, llm_model, created_at, last_active_at, ended_at"
-    )
+    # Re-exposed for backward compat with anything that
+    # imported `Database._SESSION_COLUMNS` directly.
+    from dragon_voice.db_sessions import SESSION_COLUMNS as _SESSION_COLUMNS  # noqa: E402
 
     async def create_session(
         self,
@@ -200,36 +199,17 @@ class Database:
         voice_mode: int = 0,
         llm_model: str = "",
     ) -> dict:
-        """Create a new session. Returns the session row as dict.
-
-        ``voice_mode`` (0-3) and ``llm_model`` persist the active chat v4·C
-        mode onto the session row so the conversation-drawer can show its
-        fingerprint and the pipeline can restore it on resume.
-        """
-        now = time.time()
-        await self.conn.execute(
-            """
-            INSERT INTO sessions (id, device_id, type, status, system_prompt, config,
-                                  voice_mode, llm_model,
-                                  created_at, last_active_at)
-            VALUES (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)
-            """,
-            (session_id, device_id, session_type, system_prompt,
-             json.dumps(config or {}),
-             int(voice_mode), str(llm_model or ""),
-             now, now),
+        from dragon_voice.db_sessions import create_session as _impl
+        return await _impl(
+            self.conn,
+            session_id=session_id, device_id=device_id,
+            session_type=session_type, system_prompt=system_prompt,
+            config=config, voice_mode=voice_mode, llm_model=llm_model,
         )
-        await self.conn.commit()
-        return await self.get_session(session_id)
 
     async def get_session(self, session_id: str) -> Optional[dict]:
-        """Fetch a session by ID."""
-        cursor = await self.conn.execute(
-            f"SELECT {self._SESSION_COLUMNS} FROM sessions WHERE id = ?",
-            (session_id,),
-        )
-        row = await cursor.fetchone()
-        return dict(row) if row else None
+        from dragon_voice.db_sessions import get_session as _impl
+        return await _impl(self.conn, session_id)
 
     async def list_sessions(
         self,
@@ -238,157 +218,49 @@ class Database:
         limit: int = 50,
         offset: int = 0,
     ) -> list[dict]:
-        """List sessions with optional filters and pagination."""
-        conditions = []
-        params: list[Any] = []
-
-        if device_id:
-            conditions.append("device_id = ?")
-            params.append(device_id)
-        if status:
-            conditions.append("status = ?")
-            params.append(status)
-
-        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-        query = (
-            f"SELECT {self._SESSION_COLUMNS} FROM sessions {where} "
-            f"ORDER BY last_active_at DESC LIMIT ? OFFSET ?"
+        from dragon_voice.db_sessions import list_sessions as _impl
+        return await _impl(
+            self.conn, device_id=device_id, status=status,
+            limit=limit, offset=offset,
         )
-        params.extend([limit, offset])
-
-        cursor = await self.conn.execute(query, params)
-        rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
 
     async def update_session_status(
-        self, session_id: str, status: str
+        self, session_id: str, status: str,
     ) -> None:
-        """Update session status (active, paused, ended)."""
-        now = time.time()
-        ended_at = now if status == "ended" else None
-        await self.conn.execute(
-            """
-            UPDATE sessions SET status = ?, last_active_at = ?,
-                               ended_at = COALESCE(?, ended_at)
-            WHERE id = ?
-            """,
-            (status, now, ended_at, session_id),
-        )
-        await self.conn.commit()
+        from dragon_voice.db_sessions import update_session_status as _impl
+        await _impl(self.conn, session_id, status)
 
     async def update_session_status_if(
         self, session_id: str, new_status: str, expected_current: str,
     ) -> bool:
-        """v4·D audit P1: atomic CAS on session.status.
-
-        Returns True if the row was updated (i.e., status transitioned
-        new_status from expected_current), False otherwise.  Uses a
-        single UPDATE ... WHERE so two concurrent disconnects on the
-        same session can't both fire "session.paused" events.
-        """
-        now = time.time()
-        ended_at = now if new_status == "ended" else None
-        cursor = await self.conn.execute(
-            """
-            UPDATE sessions
-               SET status = ?, last_active_at = ?,
-                   ended_at = COALESCE(?, ended_at)
-             WHERE id = ? AND status = ?
-            """,
-            (new_status, now, ended_at, session_id, expected_current),
+        from dragon_voice.db_sessions import update_session_status_if as _impl
+        return await _impl(
+            self.conn, session_id, new_status, expected_current,
         )
-        await self.conn.commit()
-        return cursor.rowcount > 0
 
     async def touch_session(self, session_id: str) -> None:
-        """Update last_active_at timestamp."""
-        now = time.time()
-        await self.conn.execute(
-            "UPDATE sessions SET last_active_at = ? WHERE id = ?",
-            (now, session_id),
-        )
-        await self.conn.commit()
+        from dragon_voice.db_sessions import touch_session as _impl
+        await _impl(self.conn, session_id)
 
     async def increment_message_count(self, session_id: str) -> None:
-        """Increment the denormalized message_count on a session."""
-        await self.conn.execute(
-            "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
-            (session_id,),
-        )
-        await self.conn.commit()
+        from dragon_voice.db_sessions import increment_message_count as _impl
+        await _impl(self.conn, session_id)
 
     async def update_session(self, session_id: str, **kwargs) -> None:
-        """Update session fields.
+        from dragon_voice.db_sessions import update_session as _impl
+        await _impl(self.conn, session_id, **kwargs)
 
-        Allowed: ``title``, ``system_prompt``, ``metadata``, ``config``,
-        ``voice_mode``, ``llm_model``.
-        """
-        allowed = {"title", "system_prompt", "metadata", "config",
-                   "voice_mode", "llm_model"}
-        updates = {k: v for k, v in kwargs.items() if k in allowed}
-        if not updates:
-            return
-        now = time.time()
-        sets = []
-        params = []
-        for k, v in updates.items():
-            if k in ("metadata", "config"):
-                params.append(json.dumps(v))
-            elif k == "voice_mode":
-                params.append(int(v))
-            elif k == "llm_model":
-                params.append(str(v or ""))
-            else:
-                params.append(v)
-            sets.append(f"{k} = ?")
-        sets.append("last_active_at = ?")
-        params.append(now)
-        params.append(session_id)
-        await self.conn.execute(
-            f"UPDATE sessions SET {', '.join(sets)} WHERE id = ?", params
-        )
-        await self.conn.commit()
+    async def get_stale_sessions(
+        self, timeout_seconds: float = 1800,
+    ) -> list[dict]:
+        from dragon_voice.db_sessions import get_stale_sessions as _impl
+        return await _impl(self.conn, timeout_seconds=timeout_seconds)
 
-    async def get_stale_sessions(self, timeout_seconds: float = 1800) -> list[dict]:
-        """Find active/paused sessions inactive beyond the timeout."""
-        cutoff = time.time() - timeout_seconds
-        cursor = await self.conn.execute(
-            f"""
-            SELECT {self._SESSION_COLUMNS} FROM sessions
-            WHERE status IN ('active', 'paused') AND last_active_at < ?
-            ORDER BY last_active_at ASC
-            """,
-            (cutoff,),
-        )
-        rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
-
-    async def get_old_paused_sessions(self, retention_days: int) -> list[dict]:
-        """Find paused-only sessions older than retention_days.
-
-        δ2 / H6 (issue #116): companion to get_stale_sessions.  The
-        existing 30-min stale check misses the device-idle-for-a-month
-        scenario because motion-sensor wakeups refresh last_active_at
-        via Tab5 register→resume→touch_session.  This long-window
-        query targets the actually-abandoned case (no motion-sensor
-        pings for >= retention_days), so paused sessions stop
-        accumulating forever.
-
-        Returns [] when retention_days <= 0 (disabled).
-        """
-        if retention_days <= 0:
-            return []
-        cutoff = time.time() - (retention_days * 86400)
-        cursor = await self.conn.execute(
-            f"""
-            SELECT {self._SESSION_COLUMNS} FROM sessions
-            WHERE status = 'paused' AND last_active_at < ?
-            ORDER BY last_active_at ASC
-            """,
-            (cutoff,),
-        )
-        rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
+    async def get_old_paused_sessions(
+        self, retention_days: int,
+    ) -> list[dict]:
+        from dragon_voice.db_sessions import get_old_paused_sessions as _impl
+        return await _impl(self.conn, retention_days=retention_days)
 
     # ── Messages ───────────────────────────────────────────────────────
 

@@ -139,6 +139,9 @@ class Database:
         return self._db
 
     # ── Devices ────────────────────────────────────────────────────────
+    # SOLID-audit follow-up (PR #260): device CRUD extracted to
+    # db_devices module.  Methods below are thin forwarders so
+    # all existing call sites keep working unchanged.
 
     async def upsert_device(
         self,
@@ -149,82 +152,33 @@ class Database:
         platform: str = "",
         capabilities: Optional[dict] = None,
     ) -> dict:
-        """Register or update a device. Returns the device row as dict."""
-        now = time.time()
-        caps_json = json.dumps(capabilities or {})
-
-        await self.conn.execute(
-            """
-            INSERT INTO devices (id, hardware_id, name, firmware_ver, platform,
-                                 capabilities, is_online, last_seen_at, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                hardware_id = excluded.hardware_id,
-                name = CASE WHEN excluded.name != '' THEN excluded.name ELSE devices.name END,
-                firmware_ver = CASE WHEN excluded.firmware_ver != '' THEN excluded.firmware_ver ELSE devices.firmware_ver END,
-                platform = CASE WHEN excluded.platform != '' THEN excluded.platform ELSE devices.platform END,
-                capabilities = CASE WHEN excluded.capabilities != '{}' THEN excluded.capabilities ELSE devices.capabilities END,
-                is_online = 1,
-                last_seen_at = excluded.last_seen_at,
-                updated_at = excluded.updated_at
-            """,
-            (device_id, hardware_id, name, firmware_ver, platform, caps_json, now, now, now),
+        from dragon_voice.db_devices import upsert_device as _impl
+        return await _impl(
+            self.conn,
+            device_id=device_id, hardware_id=hardware_id,
+            name=name, firmware_ver=firmware_ver, platform=platform,
+            capabilities=capabilities,
         )
-        await self.conn.commit()
-        return await self.get_device(device_id)
 
     async def get_device(self, device_id: str) -> Optional[dict]:
-        """Fetch a device by ID."""
-        cursor = await self.conn.execute("SELECT * FROM devices WHERE id = ?", (device_id,))
-        row = await cursor.fetchone()
-        return dict(row) if row else None
+        from dragon_voice.db_devices import get_device as _impl
+        return await _impl(self.conn, device_id)
 
     async def list_devices(self, online_only: bool = False) -> list[dict]:
-        """List all devices, optionally filtered to online-only."""
-        if online_only:
-            cursor = await self.conn.execute(
-                "SELECT * FROM devices WHERE is_online = 1 ORDER BY last_seen_at DESC"
-            )
-        else:
-            cursor = await self.conn.execute(
-                "SELECT * FROM devices ORDER BY last_seen_at DESC"
-            )
-        rows = await cursor.fetchall()
-        return [dict(r) for r in rows]
+        from dragon_voice.db_devices import list_devices as _impl
+        return await _impl(self.conn, online_only=online_only)
 
     async def set_device_online(self, device_id: str, online: bool) -> None:
-        """Mark a device as online or offline."""
-        now = time.time()
-        await self.conn.execute(
-            "UPDATE devices SET is_online = ?, last_seen_at = ?, updated_at = ? WHERE id = ?",
-            (1 if online else 0, now, now, device_id),
-        )
-        await self.conn.commit()
+        from dragon_voice.db_devices import set_device_online as _impl
+        await _impl(self.conn, device_id, online)
 
     async def update_device(self, device_id: str, **kwargs) -> None:
-        """Update device fields. Allowed: name, config."""
-        allowed = {"name", "config"}
-        updates = {k: v for k, v in kwargs.items() if k in allowed}
-        if not updates:
-            return
-        now = time.time()
-        sets = []
-        params = []
-        for k, v in updates.items():
-            sets.append(f"{k} = ?")
-            params.append(json.dumps(v) if k == "config" else v)
-        sets.append("updated_at = ?")
-        params.append(now)
-        params.append(device_id)
-        await self.conn.execute(
-            f"UPDATE devices SET {', '.join(sets)} WHERE id = ?", params
-        )
-        await self.conn.commit()
+        from dragon_voice.db_devices import update_device as _impl
+        await _impl(self.conn, device_id, **kwargs)
 
     async def delete_device(self, device_id: str) -> None:
-        """Delete a device. Sessions with this device get device_id=NULL (FK ON DELETE SET NULL)."""
-        await self.conn.execute("DELETE FROM devices WHERE id = ?", (device_id,))
-        await self.conn.commit()
+        from dragon_voice.db_devices import delete_device as _impl
+        await _impl(self.conn, device_id)
 
     # ── Sessions ───────────────────────────────────────────────────────
 

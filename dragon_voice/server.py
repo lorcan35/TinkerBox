@@ -45,6 +45,7 @@ from dragon_voice.ws_voice_admission import check_ws_voice_admission
 from dragon_voice.ws_keepalive import run_ws_keepalive
 from dragon_voice.binary_frame_dispatch import dispatch_binary_frame
 from dragon_voice.cancel_handler import handle_cancel_command
+from dragon_voice.clear_handler import handle_clear_command
 from dragon_voice.rich_media_emit import emit_rich_media_for_text_turn
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.surface_register import register_surface_and_replay_scheduler
@@ -718,38 +719,19 @@ class VoiceServer:
                                     await pipeline.start_processing()
 
                     elif cmd_type == "clear":
-                        pipeline = conn_state.get("pipeline")
-                        if pipeline:
-                            pipeline.clear_history()
-                        # End current session and create a fresh one (clears DB context)
-                        old_sid = conn_state.get("session_id")
-                        device_id = conn_state.get("device_id")
-                        if old_sid and self._session_mgr:
-                            await self._session_mgr.end_session(old_sid)
-                            # closes #56: create_session returns a single dict,
-                            # NOT a (dict, bool) tuple — that's
-                            # get_or_create_session.  The old tuple-unpack
-                            # raised ValueError and tore down the WS handler,
-                            # leaving Tab5 dead after a 'clear' + mode-swap
-                            # sequence.  Symptom: Tab5 sat in RECONNECTING and
-                            # every /chat returned 'voice not connected' with
-                            # a blank chat view.
-                            session = await self._session_mgr.create_session(
-                                device_id=device_id, session_type="conversation"
-                            )
-                            conn_state["session_id"] = session["id"]
-                            logger.info("Connection %s: history cleared, new session %s",
-                                        ws_id, session["id"])
-                            if not ws.closed:
-                                await ws.send_json({
-                                    "type": "session_start",
-                                    "session_id": session["id"],
-                                    "device_id": device_id,
-                                    "resumed": False,
-                                    "message_count": 0,
-                                })
-                        else:
-                            logger.info("Connection %s: conversation history cleared", ws_id)
+                        # SOLID-audit follow-up: clear chain extracted
+                        # to clear_handler.handle_clear_command.  That
+                        # module owns: pipeline.clear_history,
+                        # end_session + create_session DB swap (with
+                        # the #56 single-dict-return contract pinned),
+                        # conn_state.session_id update, and the
+                        # session_start emit.
+                        await handle_clear_command(
+                            ws,
+                            ws_id=ws_id,
+                            conn_state=conn_state,
+                            session_mgr=self._session_mgr,
+                        )
 
                     elif cmd_type == "cancel":
                         # SOLID-audit follow-up: cancel chain extracted

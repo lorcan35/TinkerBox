@@ -47,6 +47,7 @@ from dragon_voice.binary_frame_dispatch import dispatch_binary_frame
 from dragon_voice.cancel_handler import handle_cancel_command
 from dragon_voice.clear_handler import handle_clear_command
 from dragon_voice.stop_handler import handle_stop_command
+from dragon_voice.pipeline_init import build_and_initialize_pipeline
 from dragon_voice.rich_media_emit import emit_rich_media_for_text_turn
 from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
 from dragon_voice.surface_register import register_surface_and_replay_scheduler
@@ -1000,56 +1001,36 @@ class VoiceServer:
                 safe_send_json=self._safe_send_json,
             )
 
-        # Reset conn_config to local defaults before pipeline init.
-        # Tab5 will immediately send config_update with its actual mode,
-        # so this avoids initializing cloud backends only to swap them out.
-        # Only swap out when the configured backend is a cloud one — local
-        # backends (ollama, lmstudio, npu_genie, dual) are already what
-        # the user wants for mode 0/1, and re-pointing them at "ollama"
-        # silently breaks any local-but-non-ollama default (notably the
-        # dual-model pipeline added in #80).
-        conn_config.stt.backend = "moonshine"
-        conn_config.tts.backend = "piper"
-        if conn_config.llm.backend in ("openrouter", "tinkerclaw"):
-            conn_config.llm.backend = conn_config.llm.local_backend or "ollama"
-        conn_config.llm.system_prompt = SYSTEM_PROMPT_LOCAL
-        conn_config.llm.max_tokens = MAX_TOKENS_LOCAL
-
-        # NOW initialize the voice pipeline (slow: Moonshine load ~2s)
-        # This happens AFTER session_start is sent so Tab5 doesn't timeout.
-        # Audit A2 (#142): pass the per-conn tool callbacks built above so
-        # voice turns surface tool indicators just like text turns do.
-        pipeline = VoicePipeline(
-            conn_config, on_audio, on_event,
-            conversation_engine=self._conversation,
+        # SOLID-audit follow-up: pipeline construction +
+        # local-defaults reset + initialize + failure-emit
+        # extracted to pipeline_init.build_and_initialize_pipeline.
+        # That module owns: cloud-config-leakage protection
+        # (resets stt/tts/llm to local-tier when carrying over
+        # from a prior session), VoicePipeline construction with
+        # all per-connection deps (tool callbacks A2/#142,
+        # surface_mgr B1/#165), and the structured
+        # pipeline_init_failed FATAL emit on init failure.
+        # Returns the live pipeline on success, None on failure.
+        pipeline = await build_and_initialize_pipeline(
+            ws,
+            ws_id=ws_id,
+            conn_config=conn_config,
+            on_audio=on_audio,
+            on_event=on_event,
+            conversation=self._conversation,
             session_id=session_id,
             media_pipeline=self._media_pipeline,
             backend_pool=self._backend_pool,
             on_tool_call=conn_state.get("on_tool_call"),
             on_tool_result=conn_state.get("on_tool_result"),
             on_tool_error=conn_state.get("on_tool_error"),
-            # Audit B1 (#165): surface_mgr lets the pipeline gate
-            # scheduler-fired widgets so they don't interleave with
-            # LLM token frames.
             surface_mgr=self._surface_mgr,
+            safe_send_json=self._safe_send_json,
         )
-        try:
-            await pipeline.initialize()
-        except Exception as e:
-            logger.exception("Failed to initialize pipeline for %s", ws_id)
-            if not ws.closed:
-                # Don't leak the raw exception to the user — Tab5
-                # surfaces this in the voice caption.  Operator can
-                # see the actual `e` in the journal.
-                await ws.send_json(error_event(
-                    code="pipeline_init_failed",
-                    message="Voice pipeline failed to start.  Try reconnecting.",
-                    severity=Severity.FATAL, scope=Scope.SESSION,
-                ))
-            return
+        if pipeline is None:
+            return  # init failed; FATAL frame already emitted
 
         conn_state["pipeline"] = pipeline
-        logger.info("Pipeline ready for %s", ws_id)
 
         # #173 / TinkerTab #262: codec negotiation.  Tab5 advertises
         # capabilities.audio_codec = ["pcm", "opus"]; pick OPUS if both

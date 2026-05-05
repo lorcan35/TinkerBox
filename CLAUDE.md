@@ -74,12 +74,13 @@ If you touched middleware, run `test_auth_middleware` + `test_security_headers` 
 A file is too big when it has more than one *reason to change*.  Before extracting, answer: "what stakeholder cares about the code I'm moving?"  If it's the same stakeholder as the rest of the file, don't extract yet.  Good candidates: middleware (ops/security), debug endpoints (dev/diagnostics), lifecycle (ops/reliability), business endpoints (product).
 
 ## Dragon Access
-- **Host:** 192.168.1.91 (static IP on LAN)
+- **Host (current 2026-05-04):** `192.168.70.242` (LAN flips between `192.168.1.x` and `192.168.70.x` — historic IP `192.168.1.91` was valid on the .1.x LAN; verify with `ping radxa-dragon-q6a` or `nmap -p 22,3502,18789 --open <subnet>/24`)
+- **Hostname:** `radxa-dragon-q6a` (nmap reverse DNS)
 - **User:** radxa
-- **Password:** `<DRAGON_SSH_PASSWORD>`
-- **SSH:** `ssh radxa@192.168.1.91  # password in ~/.ssh/config or use key auth`
+- **Password:** `<DRAGON_SSH_PASSWORD>` (passes via `sshpass -p '<pw>'`; sudo on Dragon is currently passwordless after SSH login)
+- **SSH:** `ssh radxa@192.168.70.242  # or whatever the current LAN IP is`
 - **OS:** Ubuntu (Dragon Q6A — Qualcomm QCS6490, ARM64)
-- **Connection:** Ethernet only (WiFi disabled). Static IP on enp1s0.
+- **Connection:** Ethernet, DHCP-managed via enp1s0 (was documented as static — empirically the IP rotates between LANs, so treat as DHCP).
 - **Services stripped:** gdm3, snapd, nanobot, rustdesk, fwupd masked.  Active services: tinkerclaw-voice, tinkerclaw-dashboard, tinkerclaw-ngrok, **ollama** (active for embeddings + Local-mode LLM inference; was previously masked but unmasked when the multi-model router landed in #185).
 
 ## Service Map
@@ -99,12 +100,12 @@ A file is too big when it has more than one *reason to change*.  Before extracti
 ## Deploy
 ```bash
 # Sync code to Dragon (includes new STT/TTS backends + notes module)
-scp -r dragon_voice/ radxa@192.168.1.91:/home/radxa/
-scp dashboard.py radxa@192.168.1.91:/home/radxa/
-scp schema.sql radxa@192.168.1.91:/home/radxa/
+scp -r dragon_voice/ radxa@192.168.70.242:/home/radxa/
+scp dashboard.py radxa@192.168.70.242:/home/radxa/
+scp schema.sql radxa@192.168.70.242:/home/radxa/
 
 # Restart services
-ssh radxa@192.168.1.91 "sudo systemctl restart tinkerclaw-voice"
+ssh radxa@192.168.70.242 "sudo systemctl restart tinkerclaw-voice"
 ```
 
 ### Post-Deploy Checklist
@@ -763,6 +764,6 @@ Aggregate pytest run (excluding `tests/audit/` which needs pytest-asyncio): **55
 
 Run tests against a live Dragon instance:
 ```bash
-# From workstation (Dragon must be running on 192.168.1.91:3502)
+# From workstation (Dragon must be running on 192.168.70.242:3502 — see Dragon Access for current IP)
 python3 tests/test_api_e2e.py
 ```

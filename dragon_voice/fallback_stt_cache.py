@@ -96,6 +96,14 @@ class FallbackSttCache:
         if self._prewarm_task is not None and not self._prewarm_task.done():
             return
 
+        # download.moonshine.ai returns 404 for all models since 2026-05.
+        # Tiny was never cached locally; medium-only path works because the
+        # cache predates the URL outage. Skip prewarm to avoid log spam;
+        # the lazy path in transcribe() will surface a clear error if
+        # ever invoked.
+        logger.info('Fallback STT prewarm skipped (moonshine.ai download endpoint dead; medium-only operation)')
+        return
+
         async def _prewarm() -> None:
             try:
                 from dragon_voice.config import STTConfig

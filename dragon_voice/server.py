@@ -682,12 +682,22 @@ class VoiceServer:
                         if pipeline:
                             mode = cmd.get("mode", "ask")
                             conn_state["mode"] = mode
+                            # W4-B (cross-stack audit 2026-05-11): Tab5 stamps a
+                            # 12-hex turn_id on every start/text frame so a
+                            # turn's Tab5 obs events correlate with Dragon's
+                            # log lines.  Store on conn_state for downstream
+                            # emit echo + log alongside session_id.
+                            turn_id = cmd.get("turn_id") or "-"
+                            conn_state["turn_id"] = turn_id
                             pipeline._audio_buffer.clear()
                             pipeline._dictation_mode = (mode == "dictate")
                             if mode == "dictate":
                                 pipeline._segment_buffer.clear()
                                 pipeline._dictation_segments.clear()
-                            logger.info("Connection %s: start (mode=%s, audio buffer cleared)", ws_id, mode)
+                            logger.info(
+                                "Connection %s: start (mode=%s, turn_id=%s, audio buffer cleared)",
+                                ws_id, mode, turn_id,
+                            )
 
                     elif cmd_type == "segment":
                         pipeline = conn_state.get("pipeline")
@@ -1083,6 +1093,16 @@ class VoiceServer:
         owns the gating; `_handle_text_body` owns the actual
         LLM/TTS work and is invoked as the body callable.
         """
+        # W4-B (cross-stack audit 2026-05-11): Tab5 stamps a turn_id
+        # on every text frame.  Store on conn_state so downstream
+        # emits + log lines can echo it back, enabling cross-system
+        # trace correlation with Tab5 obs events.
+        turn_id = cmd.get("turn_id") or "-"
+        conn_state["turn_id"] = turn_id
+        logger.info(
+            "Text turn enqueued (turn_id=%s, session=%s)",
+            turn_id, conn_state.get("session_id", "-"),
+        )
         await invoke_with_text_turn_gate(
             ws,
             conn_state=conn_state,

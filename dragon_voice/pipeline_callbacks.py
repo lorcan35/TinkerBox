@@ -132,7 +132,20 @@ class PipelineCallbacks:
         Failure isolation: DB write errors logged at DEBUG but
         never re-raised — events are observability, not
         session-correctness.
+
+        W4-C (cross-stack audit 2026-05-11): every pipeline-side
+        emit gets a `turn_id` field stamped from `conn_state.turn_id`
+        before forwarding.  This is THE single chokepoint for
+        Dragon→Tab5 frames originating in the voice pipeline
+        (stt / llm / llm_done / tts_start / tts_end / api_usage),
+        so a one-line injection wires the full round-trip with
+        Tab5's outbound turn_id (W4-A) and Dragon's stored
+        turn_id (W4-B).  Skip if a caller already set the field
+        explicitly — let downstream code override per-event.
         """
+        if "turn_id" not in event:
+            event["turn_id"] = self._conn_state.get("turn_id", "-")
+
         if not self._ws.closed:
             await self._safe_send_json(self._ws, event)
 

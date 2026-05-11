@@ -107,6 +107,65 @@ class TestOnEvent:
         send_json.assert_awaited_once_with(ws, event)
 
     @pytest.mark.asyncio
+    async def test_turn_id_stamped_from_conn_state(self):
+        """W4-C: every Dragon→Tab5 emit picks up `turn_id` from
+        conn_state.  Single chokepoint for cross-system trace
+        correlation."""
+        ws = _make_ws()
+        send_json = _make_safe_send_json()
+        cb = PipelineCallbacks(
+            ws,
+            conn_state={"session_id": "s", "device_id": "d", "turn_id": "abc123def456"},
+            safe_send_bytes=_make_safe_send_bytes(),
+            safe_send_json=send_json,
+            db=None,
+        )
+        await cb.on_event({"type": "llm_done", "llm_ms": 123})
+
+        # Frame forwarded to ws includes turn_id from conn_state.
+        forwarded = send_json.await_args.args[1]
+        assert forwarded["turn_id"] == "abc123def456"
+        assert forwarded["type"] == "llm_done"
+        assert forwarded["llm_ms"] == 123
+
+    @pytest.mark.asyncio
+    async def test_turn_id_default_when_conn_state_missing_field(self):
+        """Pre-W4-A firmwares + warm-boot before first turn → conn_state
+        has no turn_id → fall back to "-" so logs/frames stay
+        greppable + structurally consistent."""
+        ws = _make_ws()
+        send_json = _make_safe_send_json()
+        cb = PipelineCallbacks(
+            ws,
+            conn_state={"session_id": "s", "device_id": "d"},
+            safe_send_bytes=_make_safe_send_bytes(),
+            safe_send_json=send_json,
+            db=None,
+        )
+        await cb.on_event({"type": "stt", "text": "hello"})
+        forwarded = send_json.await_args.args[1]
+        assert forwarded["turn_id"] == "-"
+
+    @pytest.mark.asyncio
+    async def test_explicit_turn_id_in_event_not_overwritten(self):
+        """W4-C respects an explicit turn_id set by the caller — lets
+        downstream emit sites override per-event (rare; useful for
+        background out-of-band emits like scheduler reminders that
+        don't belong to the current foreground turn)."""
+        ws = _make_ws()
+        send_json = _make_safe_send_json()
+        cb = PipelineCallbacks(
+            ws,
+            conn_state={"session_id": "s", "device_id": "d", "turn_id": "foreground"},
+            safe_send_bytes=_make_safe_send_bytes(),
+            safe_send_json=send_json,
+            db=None,
+        )
+        await cb.on_event({"type": "scheduler_fire", "turn_id": "background-scheduler-1"})
+        forwarded = send_json.await_args.args[1]
+        assert forwarded["turn_id"] == "background-scheduler-1"
+
+    @pytest.mark.asyncio
     async def test_closed_ws_skips_send_json_but_still_persists(self):
         """When ws is closed mid-flight, we skip the WS emit but
         STILL persist api_usage to the DB (cost tracking must
@@ -157,11 +216,16 @@ class TestApiUsagePersistence:
         assert db.add_event.await_args.args[0] == "api_usage"
         assert call_kwargs["session_id"] == "sess-A"
         assert call_kwargs["device_id"] == "tab5-7"
-        # Data dict has everything except `type` (already in pos arg)
+        # Data dict has everything except `type` (already in pos arg).
+        # W4-C (audit 2026-05-11) stamps `turn_id` from conn_state on every
+        # event, so it also lands in the persisted api_usage row — useful
+        # for per-turn cost analysis.  conn_state has no turn_id field in
+        # this test fixture, so falls back to the "-" default.
         assert call_kwargs["data"] == {
             "model": "anthropic/claude-haiku",
             "tokens": 150,
             "cost_mils": 5,
+            "turn_id": "-",
         }
 
     @pytest.mark.asyncio

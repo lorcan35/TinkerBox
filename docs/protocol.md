@@ -1648,9 +1648,9 @@ Untagged binary frames remain raw mic PCM bound for STT (existing §3.2 behaviou
 
 ## 19. Progress Event Bus (β-arch, April 2026)
 
-**Added with the β-arch refactor (TinkerBox PR #N, issue #123).** A unified `progress` channel that supersedes the per-phase ad-hoc events introduced by Phase 2 (`dictation_postprocessing`, `tool_call`/`tool_result`, etc.).  The vision: one Tab5 renderer for all in-flight signals; new progress phases plug in for free without protocol churn.
+**Added with the β-arch refactor (TinkerBox PR #124, closes issue #123).** A unified `progress` channel that supersedes the per-phase ad-hoc events introduced by Phase 2 (`dictation_postprocessing`, `tool_call`/`tool_result`, etc.).  The vision: one Tab5 renderer for all in-flight signals; new progress phases plug in for free without protocol churn.
 
-### 18.1 Wire format
+### 19.1 Wire format
 
 ```json
 {
@@ -1669,7 +1669,7 @@ Untagged binary frames remain raw mic PCM bound for STT (existing §3.2 behaviou
 
 `error` and `cancelled` stages carry the same `code` / `message` taxonomy as the §8 error frames.  `error` additionally carries `severity` + `scope` so Tab5's γ2-H8 routing-by-severity logic applies (TRANSIENT → toast, FATAL → caption + retry).  `cancelled` is semantically distinct — no operator action needed — and omits severity/scope.
 
-### 18.2 Phase enum
+### 19.2 Phase enum
 
 | Wire value | Meaning |
 |---|---|
@@ -1680,7 +1680,7 @@ Untagged binary frames remain raw mic PCM bound for STT (existing §3.2 behaviou
 | `dictation_post` | Post-dictation summary generation |
 | `media_render` | Rich-media rendering (Pygments, Pillow tables, image fetches) |
 
-### 18.3 Stage enum
+### 19.3 Stage enum
 
 | Wire value | Meaning | Tab5 surface action |
 |---|---|---|
@@ -1690,7 +1690,7 @@ Untagged binary frames remain raw mic PCM bound for STT (existing §3.2 behaviou
 | `error` | Failure (carries γ1 taxonomy) | Apply γ2-H8 routing-by-severity |
 | `cancelled` | Superseded by a newer request | Clear in-flight UI; no banner |
 
-### 18.4 Migrated channels (this PR)
+### 19.4 Migrated channels (this PR)
 
 | Phase | Stage | Legacy event (still emitted in transition) | Notes |
 |---|---|---|---|
@@ -1702,11 +1702,11 @@ Untagged binary frames remain raw mic PCM bound for STT (existing §3.2 behaviou
 | `tool` | `done` | `{"type":"tool_result","tool":...,"result":...,"execution_ms":...}` | `payload` nests result fields |
 | `tool` | `error` | §8 error frame `{"code":"tool_args_invalid",...}` | Pair carries identical taxonomy |
 
-### 18.5 Backward compatibility — double-write transition
+### 19.5 Backward compatibility — double-write transition
 
 Migrated emitters in the Dragon server send BOTH the legacy ad-hoc event AND the new `progress` event in that order, gated by the server-side `VoiceConfig.progress_bus_emit_legacy` flag (default `True`).  An unmodified Tab5 silently ignores the new `type: "progress"` frames (the `voice.c` event-handler chain has no terminal panic for unknown types).  Once Tab5 ships a `progress`-aware build, set the flag to `False` to drop the legacy emit lines in a follow-up cleanup PR.
 
-### 18.6 Not yet migrated (deferred to future PRs)
+### 19.6 Not yet migrated (deferred to future PRs)
 
 `stt`, `llm`, `tts`, and `media_render` phases are intentionally out of scope for this PR — they're deeply wired into Tab5's audio + chat-bubble rendering and need more careful migration. Their phase entries are reserved in the enum so tooling that switches on `Phase` doesn't break when they land.
 

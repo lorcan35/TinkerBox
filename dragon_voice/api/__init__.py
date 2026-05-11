@@ -14,6 +14,7 @@ from dragon_voice.api.devices import DeviceRoutes
 from dragon_voice.api.config_routes import ConfigRoutes
 from dragon_voice.api.events import EventRoutes
 from dragon_voice.api.agent_log import AgentLogRoutes
+from dragon_voice.api.spend import SpendRoutes  # W5-A: daily spend
 from dragon_voice.api.media_routes import MediaRoutes
 from dragon_voice.api.synthesize import SynthesizeRoutes
 from dragon_voice.api.completions import CompletionRoutes
@@ -57,6 +58,8 @@ def setup_all_routes(
     # (populated via dragon_voice.api.agent_log.record_call/result
     # from the WS voice handler's existing _on_tool_call hooks).
     AgentLogRoutes().register(app)
+    # W5-A: daily spend rollup from api_usage events
+    SpendRoutes(db).register(app)
 
     # Media endpoints (TTS synthesis, STT transcription, OTA)
     if voice_config:

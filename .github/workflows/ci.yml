@@ -126,4 +126,5 @@ jobs:
             tests/test_short_utterance_signal.py \
             tests/test_voice_modes.py \
             tests/test_config_swap.py \
-            tests/test_api_messages_post.py
+            tests/test_api_messages_post.py \
+            tests/test_spend_tracker.py

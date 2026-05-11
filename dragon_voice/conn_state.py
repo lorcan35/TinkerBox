@@ -90,6 +90,12 @@ class ConnState:
 
     # ── Per-turn ephemeral state ──────────────────────────────────
     tool_calls_this_turn: list = field(default_factory=list)
+    # W4-B (cross-stack audit 2026-05-11): Tab5 stamps a 12-hex
+    # turn_id on each `start` / `text` frame.  Stored here so
+    # downstream emits + log lines can echo back, enabling cross-
+    # system trace correlation with Tab5 obs events.  Default "-"
+    # before the first turn (and for pre-W4-A firmwares).
+    turn_id: str = "-"
 
     # ── Background work tracking ──────────────────────────────────
     bg_tasks: set = field(default_factory=set)

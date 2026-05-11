@@ -150,6 +150,29 @@ class ToolsConfig:
 
 
 @dataclass
+class BillingConfig:
+    """W5-B (cross-stack audit 2026-05-11): server-side daily budget cap.
+
+    When `daily_cap_cents > 0` and the running total of all
+    `api_usage` events for today UTC exceeds the cap, Dragon emits a
+    `cap_downgrade` frame to Tab5 — same shape the existing
+    Tab5→Dragon `config_update` with `reason='cap_downgrade'` uses,
+    just in the reverse direction.
+
+    Tab5's `voice_billing.c` will (in a follow-up wave) handle the
+    incoming frame by flipping NVS `voice_mode` to LOCAL and
+    surfacing a toast.  For now Dragon-side emit is observable via
+    journalctl + Tab5 obs ring.
+
+    Set via env var `BUDGET_DAILY_CENTS` (overrides config file).
+    `0` = disabled (default).  Per-connection state tracks whether
+    the alert already fired this day so we don't spam every
+    subsequent turn.
+    """
+    daily_cap_cents: int = 0
+
+
+@dataclass
 class DatabaseConfig:
     message_retention_days: int = 30  # Purge messages older than this (0 = never purge)
     # δ2 / H6 (issue #116): auto-end sessions in `paused` state whose
@@ -191,6 +214,7 @@ class VoiceConfig:
     tools: ToolsConfig = field(default_factory=ToolsConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
+    billing: BillingConfig = field(default_factory=BillingConfig)
 
     # β-arch (issue #123): protocol-level transition flag for the
     # progress event bus.  When True (default), migrated emitters
@@ -342,6 +366,20 @@ def load_config(path: Optional[str] = None) -> VoiceConfig:
     _dragon_api_token = os.environ.get("DRAGON_API_TOKEN", "").strip()
     if _dragon_api_token:
         config.server.api_token = _dragon_api_token
+
+    # W5-B (cross-stack audit 2026-05-11): BUDGET_DAILY_CENTS env
+    # overrides the on-disk billing.daily_cap_cents (0 = disabled).
+    # Treating the env path as authoritative so an oncall can flip
+    # the cap without redeploying config.yaml.
+    _budget_cents_raw = os.environ.get("BUDGET_DAILY_CENTS", "").strip()
+    if _budget_cents_raw:
+        try:
+            _budget_cents = int(_budget_cents_raw)
+            if _budget_cents >= 0:
+                config.billing.daily_cap_cents = _budget_cents
+        except ValueError:
+            # Malformed env — ignore, leave config-file value in place.
+            pass
 
     # Wave 13 H7: same pattern for the TinkerClaw gateway token. Used to live
     # in config.yaml in the committed tree, which is a leak vector — now the

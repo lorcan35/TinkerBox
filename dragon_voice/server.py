@@ -639,6 +639,13 @@ class VoiceServer:
             safe_send_bytes=self._safe_send_bytes,
             safe_send_json=self._safe_send_json,
             db=self._db,
+            # W5-B: server-side daily-cap trigger.  Reads
+            # daily_cap_cents on every api_usage; emits
+            # cap_downgrade once per UTC day when exceeded.
+            # `conn_config` here is the per-WS deep copy; the
+            # billing dataclass is shared by reference (no
+            # per-connection overrides for it today).
+            billing_config=getattr(conn_config, "billing", None),
         )
         on_audio = _pipeline_callbacks.on_audio
         on_event = _pipeline_callbacks.on_event

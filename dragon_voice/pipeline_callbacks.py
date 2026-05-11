@@ -105,12 +105,20 @@ class PipelineCallbacks:
         safe_send_bytes: SafeSendBytes,
         safe_send_json: SafeSendJson,
         db: Optional[Any],
+        billing_config: Optional[Any] = None,
     ) -> None:
         self._ws = ws
         self._conn_state = conn_state
         self._safe_send_bytes = safe_send_bytes
         self._safe_send_json = safe_send_json
         self._db = db
+        # W5-B: server-side daily-cap trigger.  When daily_cap_cents > 0
+        # and today's total spend exceeds it, emit a cap_downgrade
+        # frame once per UTC day per connection.  `_cap_alerted_day`
+        # tracks the ISO day we last fired so we don't spam every
+        # turn after the cap is hit.
+        self._billing_config = billing_config
+        self._cap_alerted_day: Optional[str] = None
 
     async def on_audio(self, audio_bytes: bytes) -> None:
         """TTS PCM frames flowing FROM pipeline TO Tab5.
@@ -163,3 +171,68 @@ class PipelineCallbacks:
                 )
             except Exception as e:
                 logger.debug("Callback error: %s", e)
+            # W5-B: check the daily cap *after* persistence so the
+            # SELECT inside spend_tracker sees the row we just
+            # wrote.  Best-effort — any failure here is logged + swallowed
+            # so observability never breaks a turn.
+            await self._maybe_emit_cap_downgrade()
+
+    async def _maybe_emit_cap_downgrade(self) -> None:
+        """W5-B: if BUDGET_DAILY_CENTS is set and today's spend
+        exceeds it, emit a one-shot `cap_downgrade` frame so Tab5
+        can flip back to LOCAL mode + surface a toast.
+
+        Idempotent across the same UTC day per connection — the
+        first hit fires the alert, subsequent turns same-day are
+        no-ops.  A WS reconnect resets the per-connection latch
+        which is OK: a reconnect after a cap hit means the user
+        probably noticed and we can re-alert if cost is still
+        accumulating.
+        """
+        if not self._billing_config:
+            return
+        cap_cents = getattr(self._billing_config, "daily_cap_cents", 0)
+        if cap_cents <= 0:
+            return
+        if self._db is None:
+            return
+
+        # Import inside the method so test fixtures that don't
+        # construct a Database aren't forced to satisfy the import
+        # graph.
+        from dragon_voice.billing.spend_tracker import (
+            summarize_spend_for_day,
+            today_iso,
+        )
+
+        try:
+            summary = await summarize_spend_for_day(self._db)
+        except Exception as e:
+            logger.debug("cap-check spend summary failed: %s", e)
+            return
+
+        if summary.total_cents < cap_cents:
+            return
+        # Once-per-day per connection.
+        day = today_iso()
+        if self._cap_alerted_day == day:
+            return
+        self._cap_alerted_day = day
+
+        frame: dict = {
+            "type": "cap_downgrade",
+            "reason": "daily_cap_hit",
+            "spent_cents": summary.total_cents,
+            "cap_cents": cap_cents,
+            "day": day,
+        }
+        # Stamp turn_id like every other emit (W4-C).  on_event
+        # already does this when frames flow through it; we're
+        # bypassing on_event here (would recurse), so stamp manually.
+        frame["turn_id"] = self._conn_state.get("turn_id", "-")
+        logger.warning(
+            "Daily cap hit (spent=%dc, cap=%dc, day=%s) — emitting cap_downgrade to client",
+            summary.total_cents, cap_cents, day,
+        )
+        if not self._ws.closed:
+            await self._safe_send_json(self._ws, frame)

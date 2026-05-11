@@ -123,4 +123,7 @@ jobs:
             tests/test_missing_key_gamma_arch.py \
             tests/test_d_tier_polish.py \
             tests/test_turn_gate.py \
-            tests/test_short_utterance_signal.py
+            tests/test_short_utterance_signal.py \
+            tests/test_voice_modes.py \
+            tests/test_config_swap.py \
+            tests/test_api_messages_post.py

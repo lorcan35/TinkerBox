@@ -28,6 +28,10 @@ class MessageRoutes:
         # Sprint 1: new endpoints
         app.router.add_get("/api/v1/messages/{message_id}", self.get_message)
         app.router.add_delete("/api/v1/sessions/{session_id}/messages", self.delete_messages)
+        # Wave 3-C-a (cross-stack cohesion audit 2026-05-11): Tab5
+        # POSTs SOLO/K144 turn pairs here so Dragon becomes the
+        # canonical chat-message store across all 6 voice modes.
+        app.router.add_post("/api/v1/sessions/{session_id}/messages", self.add_message)
 
     async def list_messages(self, request: web.Request) -> web.Response:
         """GET /api/v1/sessions/{session_id}/messages"""
@@ -99,3 +103,80 @@ class MessageRoutes:
             return json_error("Session not found", 404)
         deleted = await self._db.delete_messages(session_id)
         return web.json_response({"status": "purged", "session_id": session_id, "deleted_count": deleted})
+
+    # ── Wave 3-C-a ──
+
+    _ALLOWED_ROLES = ("user", "assistant", "system", "tool")
+    _ALLOWED_INPUT_MODES = ("text", "voice", "system")
+
+    async def add_message(self, request: web.Request) -> web.Response:
+        """POST /api/v1/sessions/{session_id}/messages — append a turn.
+
+        Wave 3-C-a (cross-stack cohesion audit 2026-05-11).  Tab5 POSTs
+        SOLO and ONBOARD turn pairs here so the messages DB is the
+        canonical chat log across all 6 voice modes.
+
+        Body (JSON):
+            role      : "user" | "assistant" | "system" | "tool"  (required)
+            content   : str                                       (required)
+            input_mode: "text" | "voice" | "system"               (default "text")
+            model     : str | null                                (optional)
+            token_count    : int | null                           (optional)
+            latency_ms     : float | null                         (optional)
+            audio_duration_s : float | null                       (optional)
+            interrupted    : bool                                 (default false)
+            media_id  : str | null                                (optional, multimodal)
+
+        Returns 201 + the created message row.  404 if session not
+        found.  400 on validation failure.
+        """
+        session_id = request.match_info["session_id"]
+        session = await self._session_mgr.get_session(session_id)
+        if not session:
+            return json_error("Session not found", 404)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return json_error("Invalid JSON body")
+        if not isinstance(body, dict):
+            return json_error("Body must be a JSON object")
+
+        role = body.get("role")
+        if role not in self._ALLOWED_ROLES:
+            return json_error(
+                f"'role' must be one of {self._ALLOWED_ROLES}; got {role!r}"
+            )
+
+        content = body.get("content")
+        if not isinstance(content, str) or content == "":
+            # Allow empty-content turns through MessageStore directly
+            # only via the WS path (assistant placeholder bubbles); REST
+            # callers always have real content because they're posting
+            # after the turn completes.
+            return json_error("'content' must be a non-empty string")
+
+        input_mode = body.get("input_mode", "text")
+        if input_mode not in self._ALLOWED_INPUT_MODES:
+            return json_error(
+                f"'input_mode' must be one of {self._ALLOWED_INPUT_MODES}; got {input_mode!r}"
+            )
+
+        try:
+            msg = await self._messages.add_message(
+                session_id=session_id,
+                role=role,
+                content=content,
+                input_mode=input_mode,
+                interrupted=bool(body.get("interrupted", False)),
+                audio_duration_s=body.get("audio_duration_s"),
+                token_count=body.get("token_count"),
+                model=body.get("model"),
+                latency_ms=body.get("latency_ms"),
+                media_id=body.get("media_id"),
+            )
+        except Exception as e:
+            logger.exception("add_message failed for session %s", session_id)
+            return json_error(f"Failed to add message: {e}", 500)
+
+        return web.json_response(msg, status=201)

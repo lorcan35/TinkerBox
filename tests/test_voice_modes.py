@@ -33,27 +33,38 @@ class VoiceModeWireValuesTests(unittest.TestCase):
     def test_onboard_is_four(self):
         self.assertEqual(int(VoiceMode.ONBOARD), 4)
 
+    def test_solo_is_five(self):
+        # W3-A (TT cross-stack audit 2026-05-11): SOLO_DIRECT.
+        # Tab5 firmware ships vmode=5 since TT #370 (2026-05-11);
+        # pre-W3-A this fell through from_int as None and silently
+        # downgraded to LOCAL.
+        self.assertEqual(int(VoiceMode.SOLO), 5)
+
     def test_total_modes(self):
-        # If a 6th mode is added, also update Tab5 firmware's enum.
-        self.assertEqual(len(VoiceMode), 5)
+        # If a 7th mode is added, also update Tab5 firmware's enum.
+        self.assertEqual(len(VoiceMode), 6)
 
 
 class VoiceModeFromIntTests(unittest.TestCase):
     """``from_int`` is a safe parser — never raises."""
 
     def test_valid_ints_round_trip(self):
-        for i in range(5):
+        for i in range(6):
             with self.subTest(value=i):
                 vm = VoiceMode.from_int(i)
                 self.assertIsNotNone(vm)
                 self.assertEqual(int(vm), i)
+
+    def test_solo_round_trips(self):
+        # W3-A: explicit anchor — pre-W3-A this returned None.
+        self.assertEqual(VoiceMode.from_int(5), VoiceMode.SOLO)
 
     def test_none_returns_none(self):
         self.assertIsNone(VoiceMode.from_int(None))
 
     def test_out_of_range_returns_none(self):
         self.assertIsNone(VoiceMode.from_int(-1))
-        self.assertIsNone(VoiceMode.from_int(5))
+        self.assertIsNone(VoiceMode.from_int(6))
         self.assertIsNone(VoiceMode.from_int(99))
 
     def test_string_returns_none(self):
@@ -95,6 +106,11 @@ class VoiceModeSingleTierPredicatesTests(unittest.TestCase):
             with self.subTest(mode=vm.name):
                 self.assertEqual(vm.is_onboard(), vm == VoiceMode.ONBOARD)
 
+    def test_is_solo_only_solo(self):
+        for vm in VoiceMode:
+            with self.subTest(mode=vm.name):
+                self.assertEqual(vm.is_solo(), vm == VoiceMode.SOLO)
+
 
 class VoiceModeSemanticGroupingTests(unittest.TestCase):
     """The semantic groupings encode policy.  These tests pin which
@@ -113,9 +129,9 @@ class VoiceModeSemanticGroupingTests(unittest.TestCase):
             with self.subTest(mode=vm.name):
                 self.assertEqual(vm.needs_openrouter_key(), vm.needs_cloud_stt_tts())
 
-    def test_dragon_managed_pipeline_excludes_tc_and_onboard(self):
-        # TinkerClaw bypasses to the gateway; Onboard is Tab5-side-only.
-        # Dragon never sees mode 4 in practice.
+    def test_dragon_managed_pipeline_excludes_tc_onboard_solo(self):
+        # TinkerClaw bypasses to the gateway; Onboard runs on the
+        # K144 stacked module; Solo routes Tab5 → OpenRouter direct.
         expected = {VoiceMode.LOCAL, VoiceMode.HYBRID, VoiceMode.CLOUD}
         actual = {vm for vm in VoiceMode if vm.is_dragon_managed_pipeline()}
         self.assertEqual(actual, expected)
@@ -125,8 +141,19 @@ class VoiceModeSemanticGroupingTests(unittest.TestCase):
         self.assertFalse(VoiceMode.TINKERCLAW.is_dragon_managed_pipeline())
 
     def test_onboard_is_not_dragon_managed(self):
-        # Onboard is Tab5-side-only — Tab5 maps it to LOCAL on the wire.
+        # Onboard runs on the K144 stacked LLM module — Tab5-side only.
         self.assertFalse(VoiceMode.ONBOARD.is_dragon_managed_pipeline())
+
+    def test_solo_is_not_dragon_managed(self):
+        # Solo routes Tab5 directly to OpenRouter — Dragon never sees
+        # the audio or text of the turn.
+        self.assertFalse(VoiceMode.SOLO.is_dragon_managed_pipeline())
+
+    def test_solo_does_not_need_openrouter_key_in_dragon_config(self):
+        # Solo runs Tab5's OWN OpenRouter key (NVS 'or_key'); Dragon's
+        # llm.openrouter_api_key is irrelevant to a SOLO turn.  Keep
+        # needs_openrouter_key tied to Dragon-side cloud STT/TTS only.
+        self.assertFalse(VoiceMode.SOLO.needs_openrouter_key())
 
 
 class VoiceModeIntCompatTests(unittest.TestCase):

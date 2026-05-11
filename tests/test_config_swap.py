@@ -179,6 +179,33 @@ class SelectBackendsTests(unittest.TestCase):
         self.assertEqual(cfg.llm.system_prompt, SYSTEM_PROMPT_CLOUD)
         self.assertEqual(cfg.llm.max_tokens, MAX_TOKENS_CLOUD)
 
+    # ── SOLO (W3-A) ──────────────────────────────────────────────
+
+    def test_solo_mirrors_local_backend_choice(self):
+        """Mode 5 (Solo) routes Tab5 directly to OpenRouter — Dragon's
+        backends are never invoked.  But we still want sensible
+        defaults so a user flipping back to Local mid-session doesn't
+        end up with cloud-shaped placeholders.  Mirrors LOCAL on
+        STT/TTS/LLM; system_prompt + max_tokens left untouched (Tab5's
+        openrouter_client owns the SOLO prompt)."""
+        cfg = _StubVoiceCfg()
+        sel = select_backends_for_mode(VoiceMode.SOLO, cfg)
+        self.assertEqual(sel.stt_backend, "moonshine")
+        self.assertEqual(sel.tts_backend, "piper")
+        self.assertEqual(sel.llm_backend, "ollama")
+        # Dragon's system_prompt/max_tokens untouched — SOLO branch
+        # is `pass` (Tab5 owns prompts for its direct OpenRouter calls).
+        self.assertEqual(cfg.llm.system_prompt, "(initial)")
+        self.assertEqual(cfg.llm.max_tokens, 0)
+
+    def test_solo_with_local_backend_override(self):
+        """SOLO still respects local_backend so a Dragon configured
+        for npu_genie keeps its placeholder LLM choice."""
+        cfg = _StubVoiceCfg()
+        cfg.llm.local_backend = "npu_genie"
+        sel = select_backends_for_mode(VoiceMode.SOLO, cfg)
+        self.assertEqual(sel.llm_backend, "npu_genie")
+
 
 if __name__ == "__main__":
     unittest.main()

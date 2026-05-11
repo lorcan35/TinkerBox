@@ -109,7 +109,12 @@ def select_backends_for_mode(
         BackendSelection with the three chosen backend names.
     """
     # ── STT + TTS ───────────────────────────────────────────────
-    if vmode.is_local():
+    # Wave 3-A: SOLO mirrors LOCAL placeholders.  Dragon's pipeline is
+    # idle during a SOLO turn (Tab5 → OpenRouter direct) so the
+    # backends are never invoked — but if the user flips back to mode
+    # 0 after a SOLO session we want LOCAL-shaped backends already
+    # selected rather than CLOUD-shaped ones from a stale prior swap.
+    if vmode.is_local() or vmode.is_solo():
         stt_be, tts_be = "moonshine", "piper"
     elif vmode.is_tinkerclaw():
         # TinkerClaw mode: default local STT/TTS.
@@ -132,6 +137,10 @@ def select_backends_for_mode(
         if llm_model:
             conn_config.llm.openrouter_model = llm_model
     else:
+        # Local / Hybrid / Onboard / Solo all fall here.  For Solo
+        # the LLM backend is never invoked by Dragon (Tab5 calls
+        # OpenRouter directly) — same idle-but-sensible-default
+        # rationale as STT/TTS above.
         llm_be = conn_config.llm.local_backend or "ollama"
         if llm_model and llm_be == "ollama" and "/" not in llm_model:
             conn_config.llm.ollama_model = llm_model
@@ -139,7 +148,11 @@ def select_backends_for_mode(
 
     # ── Mode-aware system prompt + max_tokens ───────────────────
     # TINKERCLAW: skip — TinkerClaw owns personality + token budget.
-    if vmode.is_tinkerclaw():
+    # SOLO: skip — Tab5's openrouter_client owns the system prompt for
+    # its direct calls; Dragon's conn_config.llm.system_prompt would
+    # only matter if the user flipped out of SOLO mid-session, in
+    # which case the next mode change re-applies its own prompt.
+    if vmode.is_tinkerclaw() or vmode.is_solo():
         pass
     elif vmode.is_local():
         conn_config.llm.system_prompt = SYSTEM_PROMPT_LOCAL

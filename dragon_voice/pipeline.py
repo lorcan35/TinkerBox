@@ -315,17 +315,23 @@ class VoicePipeline:
             self._llm.name, " (pooled)" if self._pooled_llm else "",
         )
 
-        # W7-A (audit 2026-05-11): if the LLM is the TinkerClaw agent
-        # gateway backend, hand it the connection's on_tool_call hook so
-        # gateway-emitted tool_calls become visible Tab5 events (Wave 12
-        # agent_log feed already renders these).  Pre-W7-A the deltas
+        # W7-A / W7-A.2 (audit 2026-05-11): if the LLM is the TinkerClaw
+        # agent gateway backend, hand it both connection tool-event hooks
+        # so gateway-emitted tool_calls AND synthesized tool_results
+        # become visible Tab5 events (Wave 12 agent_log + the chat-UI
+        # spinning indicator both depend on these).  Pre-W7-A the deltas
         # were silently skipped because mode 3 bypassed Dragon's local
-        # ToolRegistry entirely.  Guarded by `hasattr` so other backends
+        # ToolRegistry entirely; pre-W7-A.2 the call indicator never
+        # flipped to "done" because /v1/chat/completions doesn't emit
+        # tool_result events.  Guarded by `hasattr` so other backends
         # (which don't have the setter) keep working unchanged.
-        if self._on_tool_call is not None and hasattr(
-            self._llm, "set_tool_event_handler"
+        if (
+            self._on_tool_call is not None
+            and hasattr(self._llm, "set_tool_event_handler")
         ):
-            self._llm.set_tool_event_handler(self._on_tool_call)
+            self._llm.set_tool_event_handler(
+                self._on_tool_call, self._on_tool_result,
+            )
 
     def set_uplink_codec(self, codec: str) -> str:
         """Switch the uplink decoder.  Returns the codec actually applied.

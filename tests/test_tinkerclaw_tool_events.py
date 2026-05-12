@@ -41,6 +41,7 @@ class _NoInitBackend(TinkerClawBackend):
 
     def __init__(self):  # type: ignore[override]
         self._on_tool_call = None
+        self._on_tool_result = None
 
 
 def _delta(index: int, *, id_: str = "", name: str = "", args: str = "") -> dict:
@@ -200,6 +201,140 @@ class TestSetToolEventHandler(unittest.TestCase):
         self.assertIs(be._on_tool_call, h)
         be.set_tool_event_handler(None)
         self.assertIsNone(be._on_tool_call)
+
+    def test_setter_stores_both_handlers(self):
+        """W7-A.2: setter accepts both on_tool_call and on_tool_result."""
+        be = _NoInitBackend()
+
+        async def call_h(_p: dict) -> None:
+            pass
+
+        async def result_h(_p: dict) -> None:
+            pass
+
+        be.set_tool_event_handler(call_h, result_h)
+        self.assertIs(be._on_tool_call, call_h)
+        self.assertIs(be._on_tool_result, result_h)
+
+        # Clearing both via None
+        be.set_tool_event_handler(None, None)
+        self.assertIsNone(be._on_tool_call)
+        self.assertIsNone(be._on_tool_result)
+
+
+class TestSyntheticToolResult(unittest.IsolatedAsyncioTestCase):
+    """W7-A.2: synthetic tool_result emission.
+
+    Pre-W7-A.2 mode 3's Tab5 chat UI showed a perpetually-spinning
+    tool indicator because /v1/chat/completions doesn't natively
+    surface tool_result events.  The fix infers completion from the
+    "next content burst after a tool_call" boundary."""
+
+    async def asyncSetUp(self):
+        # Quarantine the agent_log ring (same pattern as other tests).
+        from dragon_voice.api import agent_log as _alog
+        self._alog = _alog
+        with _alog._lock:
+            self._saved_ring = list(_alog._ring)
+            self._saved_next = _alog._next_id
+            _alog._ring.clear()
+            _alog._next_id = 1
+
+    async def asyncTearDown(self):
+        with self._alog._lock:
+            self._alog._ring.clear()
+            for item in self._saved_ring:
+                self._alog._ring.append(item)
+            self._alog._next_id = self._saved_next
+
+    async def test_flush_populates_pending_results(self):
+        be = _NoInitBackend()
+        buf = {0: {"id": "x", "name": "search", "arguments": "{}"}}
+        pending: list[str] = []
+        await be._flush_tool_calls(buf, set(), pending_results=pending)
+        self.assertEqual(pending, ["search"])
+
+    async def test_emit_drains_pending_and_fires_callback(self):
+        captured: list[dict] = []
+
+        async def cb(payload: dict) -> None:
+            captured.append(payload)
+
+        be = _NoInitBackend()
+        be._on_tool_result = cb
+        pending = ["web_search", "bash"]
+        await be._emit_synthetic_results(pending)
+        self.assertEqual(pending, [])  # drained
+        self.assertEqual(len(captured), 2)
+        self.assertEqual(captured[0]["tool"], "web_search")
+        self.assertEqual(captured[1]["tool"], "bash")
+        # Payload is the minimal "completed" signal — no actual data.
+        self.assertIsNone(captured[0]["result"])
+        self.assertIsNone(captured[0]["execution_ms"])
+
+    async def test_emit_marks_agent_log_done(self):
+        """Synthetic result must flip the corresponding agent_log
+        ring entry from running → done so /api/v1/agent_log is
+        accurate post-completion."""
+        # Record a running call manually
+        self._alog.record_call("search", {"q": "weather"})
+        with self._alog._lock:
+            initial = list(self._alog._ring)
+        self.assertEqual(initial[0]["status"], "running")
+
+        be = _NoInitBackend()
+        await be._emit_synthetic_results(["search"])
+
+        with self._alog._lock:
+            after = list(self._alog._ring)
+        self.assertEqual(after[0]["status"], "done")
+
+    async def test_empty_pending_is_noop(self):
+        # No callback, no pending → must not raise + must not emit
+        captured: list[dict] = []
+
+        async def cb(payload: dict) -> None:
+            captured.append(payload)
+
+        be = _NoInitBackend()
+        be._on_tool_result = cb
+        await be._emit_synthetic_results([])
+        self.assertEqual(captured, [])
+
+    async def test_no_handler_still_records_to_agent_log(self):
+        """The agent_log surface should work even when the WS callback
+        isn't wired (e.g., transient handler clear during backend swap)."""
+        self._alog.record_call("search", {"q": "weather"})
+        be = _NoInitBackend()
+        self.assertIsNone(be._on_tool_result)
+        await be._emit_synthetic_results(["search"])
+        with self._alog._lock:
+            after = list(self._alog._ring)
+        self.assertEqual(after[0]["status"], "done")
+
+    async def test_callback_exception_swallowed(self):
+        async def boom(_p: dict) -> None:
+            raise RuntimeError("buggy handler")
+
+        be = _NoInitBackend()
+        be._on_tool_result = boom
+        # Must not raise — buggy handlers can't tear down the LLM stream.
+        await be._emit_synthetic_results(["search"])
+
+    async def test_double_emit_does_not_double_fire(self):
+        """Idempotency: a list emptied by one call must produce no
+        callbacks on a second call."""
+        captured: list[dict] = []
+
+        async def cb(payload: dict) -> None:
+            captured.append(payload)
+
+        be = _NoInitBackend()
+        be._on_tool_result = cb
+        pending = ["search"]
+        await be._emit_synthetic_results(pending)
+        await be._emit_synthetic_results(pending)
+        self.assertEqual(len(captured), 1)
 
 
 class TestAgentLogBridge(unittest.IsolatedAsyncioTestCase):

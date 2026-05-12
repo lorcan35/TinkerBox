@@ -151,6 +151,18 @@ class TinkerClawBackend(LLMBackend):
         # (Wave 12 agent_log feed).  Pre-W7-A the deltas were silently
         # skipped because the parser only looked at `delta.content`.
         self._on_tool_call: Optional[Callable[[dict], Awaitable[None]]] = None
+        # W7-A.2: companion callback fired when we synthesize a
+        # tool_result event.  /v1/chat/completions doesn't emit
+        # tool_result natively, so we infer "tool completed" from the
+        # SSE pattern: after a tool_call emits, the next assistant
+        # content delta in the same stream is the user-visible answer
+        # — meaning the tool has finished.  We then emit one
+        # tool_result per pending tool_call so Tab5's UI can flip the
+        # spinning indicator to "done" instead of leaving it spinning
+        # forever.  Result payload is intentionally minimal — the
+        # agent's text reply IS the user-visible answer; this event
+        # only carries the "completed" signal.
+        self._on_tool_result: Optional[Callable[[dict], Awaitable[None]]] = None
 
     async def initialize(self) -> None:
         headers = {"Content-Type": "application/json"}
@@ -244,29 +256,38 @@ class TinkerClawBackend(LLMBackend):
     def set_tool_event_handler(
         self,
         on_tool_call: Optional[Callable[[dict], Awaitable[None]]],
+        on_tool_result: Optional[Callable[[dict], Awaitable[None]]] = None,
     ) -> None:
-        """W7-A: register a callback fired once per gateway tool call.
+        """W7-A / W7-A.2: register the gateway tool-event callbacks.
 
-        The callback receives a dict shaped like Dragon's own ToolRegistry
-        emit payload — `{"tool": "<name>", "args": <parsed dict>}` — so
-        Tab5's existing Wave 12 agent_log feed renders it without changes.
+        `on_tool_call(payload)` is invoked once per fully-assembled
+        tool call detected in the SSE stream.  Payload shape matches
+        Dragon's own ToolRegistry emit:
+            {"tool": "<name>", "args": <parsed dict>}
+        so Tab5's existing Wave 12 agent_log feed renders it unchanged.
 
-        Pass `None` to clear the handler (e.g. on backend swap).
+        `on_tool_result(payload)` is invoked once per **synthesized**
+        completion — when the SSE stream emits an assistant content
+        delta AFTER a pending tool_call, we infer the tool finished
+        and fire a result event so Tab5's chat UI can flip the
+        spinning indicator to "done."  Payload shape:
+            {"tool": "<name>", "result": None, "execution_ms": None}
+        The agent's text reply IS the user-visible answer; this
+        callback only carries the "completed" signal, since
+        /v1/chat/completions doesn't expose the tool's actual return
+        value to the client.
 
-        The callback is awaited inside the SSE parse loop, so failure
-        modes:
+        Pass `None` to clear either handler (e.g. on backend swap).
+
+        Failure modes for both callbacks:
           * raises an exception → logged + swallowed (a buggy callback
             must NOT tear down the LLM stream)
           * blocks for more than the sock_read budget → can stall the
             stream; keep callbacks fast (the existing ToolEventEmitter
             already does fire-and-forget WS sends).
-
-        Tool result events from the gateway are NOT surfaced via this
-        callback yet — `/v1/chat/completions` doesn't emit them natively;
-        the OpenAI Responses-API path (event-typed SSE) is the next
-        slice (W7-A.2).
         """
         self._on_tool_call = on_tool_call
+        self._on_tool_result = on_tool_result
 
     async def generate_stream(
         self, prompt: str, system_prompt: str = ""
@@ -375,6 +396,12 @@ class TinkerClawBackend(LLMBackend):
                 # are complete).  Flushed entries fire `_on_tool_call`.
                 tool_call_buffer: dict[int, dict[str, Any]] = {}
                 _flushed_tool_indices: set[int] = set()
+                # W7-A.2: pending tool calls awaiting a synthesized
+                # result.  Populated by _flush_tool_calls; drained by
+                # _emit_synthetic_results when the next assistant
+                # content burst arrives (the natural "tool finished"
+                # boundary on /v1/chat/completions).
+                _pending_results: list[str] = []
 
                 # W14-M07: use readline with explicit byte cap so one
                 # pathologically long SSE frame can't blow memory.
@@ -447,9 +474,15 @@ class TinkerClawBackend(LLMBackend):
                     if finish_reason in ("tool_calls", "stop") and tool_call_buffer:
                         await self._flush_tool_calls(
                             tool_call_buffer, _flushed_tool_indices,
+                            pending_results=_pending_results,
                         )
 
                     token = delta.get("content", "")
+                    # W7-A.2: first content burst after pending tool
+                    # calls means those tools finished.  Fire one
+                    # synthesized tool_result event per pending tool.
+                    if token and _pending_results:
+                        await self._emit_synthetic_results(_pending_results)
                     if token:
                         token_count += 1
                         if token_count > _SSE_MAX_TOKENS:
@@ -520,7 +553,13 @@ class TinkerClawBackend(LLMBackend):
                 if tool_call_buffer:
                     await self._flush_tool_calls(
                         tool_call_buffer, _flushed_tool_indices,
+                        pending_results=_pending_results,
                     )
+                # W7-A.2: any pending tool calls without a subsequent
+                # content burst still completed (the stream ended).
+                # Fire results so Tab5's UI doesn't strand the spinner.
+                if _pending_results:
+                    await self._emit_synthetic_results(_pending_results)
 
                 # A07: Truncation detection — stream ended without [DONE]
                 if not saw_done:
@@ -606,9 +645,15 @@ class TinkerClawBackend(LLMBackend):
         self,
         buffer: dict[int, dict[str, Any]],
         flushed: set[int],
+        pending_results: Optional[list[str]] = None,
     ) -> None:
         """Emit accumulated tool calls via the registered callback +
         record into the cross-session agent_log ring (Wave 12 surface).
+
+        Each flushed tool name is appended to `pending_results` (if
+        provided) so W7-A.2's synthetic tool_result emitter knows which
+        tools still need a "completed" signal sent when the next
+        assistant content burst arrives.
 
         Each buffer entry is rendered as Dragon's standard tool_call
         shape (`{"tool": "<name>", "args": <parsed dict>}`) and passed
@@ -669,7 +714,55 @@ class TinkerClawBackend(LLMBackend):
                     "agent_log record_call suppressed for gateway tool %s",
                     name, exc_info=True,
                 )
+            if pending_results is not None:
+                pending_results.append(name)
             flushed.add(idx)
+
+    async def _emit_synthetic_results(self, pending: list[str]) -> None:
+        """W7-A.2: emit a synthetic tool_result per pending tool name.
+
+        `/v1/chat/completions` doesn't carry the tool's actual return
+        value to the client (it executes server-side and feeds the
+        text reply directly).  The user-visible answer arrives in the
+        next content burst, which is also the natural "tool finished"
+        boundary.  We fire one tool_result per pending tool so Tab5's
+        UI can flip the spinner to "done" — the result payload is
+        minimal (no actual data) because the agent's prose answer IS
+        the data the user wanted.
+
+        Also feeds the cross-session agent_log ring so
+        `/api/v1/agent_log` flips each call's status from "running"
+        to "done" (matches Wave 12 contract).
+
+        Idempotent: `pending` is drained as we emit, so a second call
+        is a no-op.  Empty list → no-op.  Failures in either the
+        WS callback or the agent_log write are best-effort.
+        """
+        # Drain to a local copy so a callback that re-enters the
+        # parser can't double-emit.
+        names = list(pending)
+        pending.clear()
+        if not names:
+            return
+        for name in names:
+            payload = {"tool": name, "result": None, "execution_ms": None}
+            if self._on_tool_result is not None:
+                try:
+                    await self._on_tool_result(payload)
+                except Exception:
+                    logger.exception(
+                        "W7-A.2: on_tool_result callback raised — swallowed "
+                        "to keep LLM stream alive (tool=%s)",
+                        name,
+                    )
+            try:
+                from dragon_voice.api.agent_log import record_result as _alog_res
+                _alog_res(name, result=None, execution_ms=None)
+            except Exception:
+                logger.debug(
+                    "agent_log record_result suppressed for gateway tool %s",
+                    name, exc_info=True,
+                )
 
     @property
     def name(self) -> str:

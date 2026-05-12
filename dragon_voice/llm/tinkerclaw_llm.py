@@ -607,12 +607,22 @@ class TinkerClawBackend(LLMBackend):
         buffer: dict[int, dict[str, Any]],
         flushed: set[int],
     ) -> None:
-        """Emit accumulated tool calls via the registered callback.
+        """Emit accumulated tool calls via the registered callback +
+        record into the cross-session agent_log ring (Wave 12 surface).
 
         Each buffer entry is rendered as Dragon's standard tool_call
         shape (`{"tool": "<name>", "args": <parsed dict>}`) and passed
         to `self._on_tool_call`.  Failures are logged + swallowed so a
         buggy callback can never tear down the LLM stream.
+
+        After the WS-side emit, the same call is appended to the
+        agent_log ring buffer (`dragon_voice.api.agent_log.record_call`)
+        so the `/api/v1/agent_log` feed surfaces gateway-routed calls
+        alongside the local-ToolRegistry ones — without the gateway
+        having to expose a separate skill-discovery endpoint.  This
+        closes the Wave 12 visibility gap mode 3 had:  ToolRegistry's
+        own chokepoint is bypassed when the LLM is `tinkerclaw`, so
+        agent_log was previously dark for mode-3 sessions.
 
         Idempotent: indexes already in `flushed` are skipped, so we can
         be called at finish_reason and again at EOS without duplicate
@@ -620,11 +630,6 @@ class TinkerClawBackend(LLMBackend):
         lets future runs in the same stream (rare) accumulate further
         argument fragments correctly.
         """
-        if not self._on_tool_call:
-            # No handler registered → nothing to surface.  Still mark
-            # entries flushed so we don't churn re-checking them.
-            flushed.update(buffer.keys())
-            return
         for idx, call in buffer.items():
             if idx in flushed:
                 continue
@@ -642,13 +647,27 @@ class TinkerClawBackend(LLMBackend):
                 # *something* useful for debugging.
                 args_obj = {"_raw": args_str[:512]}
             payload = {"tool": name, "args": args_obj}
+            if self._on_tool_call is not None:
+                try:
+                    await self._on_tool_call(payload)
+                except Exception:
+                    logger.exception(
+                        "W7-A: on_tool_call callback raised — swallowed "
+                        "to keep LLM stream alive (tool=%s)",
+                        name,
+                    )
+            # W7-A.b: record into the agent_log ring so /api/v1/agent_log
+            # surfaces gateway-routed calls.  Lazy-import to keep this
+            # module standalone if the API layer is ever broken out.
+            # Failures are best-effort — the ring buffer should never
+            # tear down LLM streaming.
             try:
-                await self._on_tool_call(payload)
+                from dragon_voice.api.agent_log import record_call as _alog
+                _alog(name, args_obj if isinstance(args_obj, dict) else {})
             except Exception:
-                logger.exception(
-                    "W7-A: on_tool_call callback raised — swallowed "
-                    "to keep LLM stream alive (tool=%s)",
-                    name,
+                logger.debug(
+                    "agent_log record_call suppressed for gateway tool %s",
+                    name, exc_info=True,
                 )
             flushed.add(idx)
 

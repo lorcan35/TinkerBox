@@ -128,4 +128,5 @@ jobs:
             tests/test_config_swap.py \
             tests/test_api_messages_post.py \
             tests/test_spend_tracker.py \
-            tests/test_start_handler.py
+            tests/test_start_handler.py \
+            tests/test_protocol_contract.py

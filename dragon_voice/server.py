@@ -51,6 +51,7 @@ from dragon_voice.ws_voice_admission import check_ws_voice_admission
 from dragon_voice.ws_keepalive import run_ws_keepalive
 from dragon_voice.binary_frame_dispatch import dispatch_binary_frame
 from dragon_voice.cancel_handler import handle_cancel_command
+from dragon_voice.start_handler import handle_start_command  # W6-A
 from dragon_voice.clear_handler import handle_clear_command
 from dragon_voice.stop_handler import handle_stop_command
 from dragon_voice.pipeline_init import build_and_initialize_pipeline
@@ -685,26 +686,11 @@ class VoiceServer:
                         await self._handle_register(ws, conn_state, cmd, on_audio, on_event, conn_config)
 
                     elif cmd_type == "start":
-                        pipeline = conn_state.get("pipeline")
-                        if pipeline:
-                            mode = cmd.get("mode", "ask")
-                            conn_state["mode"] = mode
-                            # W4-B (cross-stack audit 2026-05-11): Tab5 stamps a
-                            # 12-hex turn_id on every start/text frame so a
-                            # turn's Tab5 obs events correlate with Dragon's
-                            # log lines.  Store on conn_state for downstream
-                            # emit echo + log alongside session_id.
-                            turn_id = cmd.get("turn_id") or "-"
-                            conn_state["turn_id"] = turn_id
-                            pipeline._audio_buffer.clear()
-                            pipeline._dictation_mode = (mode == "dictate")
-                            if mode == "dictate":
-                                pipeline._segment_buffer.clear()
-                                pipeline._dictation_segments.clear()
-                            logger.info(
-                                "Connection %s: start (mode=%s, turn_id=%s, audio buffer cleared)",
-                                ws_id, mode, turn_id,
-                            )
+                        # W6-A (audit 2026-05-11): inline branch extracted to
+                        # start_handler.handle_start_command.  Owns: mode +
+                        # turn_id stash on conn_state, audio buffer clear,
+                        # dictation segment buffer reset, log line.
+                        await handle_start_command(ws_id, conn_state, cmd)
 
                     elif cmd_type == "segment":
                         pipeline = conn_state.get("pipeline")

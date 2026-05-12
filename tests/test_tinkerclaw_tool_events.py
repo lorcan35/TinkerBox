@@ -275,12 +275,15 @@ class TestSyntheticToolResult(unittest.IsolatedAsyncioTestCase):
     async def test_emit_marks_agent_log_done(self):
         """Synthetic result must flip the corresponding agent_log
         ring entry from running → done so /api/v1/agent_log is
-        accurate post-completion."""
-        # Record a running call manually
-        self._alog.record_call("search", {"q": "weather"})
+        accurate post-completion.  W7-A.3: source must match — a
+        gateway-side flush only closes gateway-source entries."""
+        # Record a running call from the gateway surface (mirroring
+        # what W7-A.b's bridge does).
+        self._alog.record_call("search", {"q": "weather"}, source="gateway")
         with self._alog._lock:
             initial = list(self._alog._ring)
         self.assertEqual(initial[0]["status"], "running")
+        self.assertEqual(initial[0]["source"], "gateway")
 
         be = _NoInitBackend()
         await be._emit_synthetic_results(["search"])
@@ -288,6 +291,7 @@ class TestSyntheticToolResult(unittest.IsolatedAsyncioTestCase):
         with self._alog._lock:
             after = list(self._alog._ring)
         self.assertEqual(after[0]["status"], "done")
+        self.assertEqual(after[0]["source"], "gateway")
 
     async def test_empty_pending_is_noop(self):
         # No callback, no pending → must not raise + must not emit
@@ -303,8 +307,9 @@ class TestSyntheticToolResult(unittest.IsolatedAsyncioTestCase):
 
     async def test_no_handler_still_records_to_agent_log(self):
         """The agent_log surface should work even when the WS callback
-        isn't wired (e.g., transient handler clear during backend swap)."""
-        self._alog.record_call("search", {"q": "weather"})
+        isn't wired (e.g., transient handler clear during backend swap).
+        W7-A.3: gateway-source matching."""
+        self._alog.record_call("search", {"q": "weather"}, source="gateway")
         be = _NoInitBackend()
         self.assertIsNone(be._on_tool_result)
         await be._emit_synthetic_results(["search"])

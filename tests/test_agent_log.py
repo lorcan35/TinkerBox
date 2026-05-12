@@ -177,5 +177,75 @@ class TestEndpoint(unittest.TestCase):
         self._run(go())
 
 
+class TestSourceField(unittest.TestCase):
+    """W7-A.3: every entry carries a source field so consumers can
+    distinguish Dragon-side tools from gateway-routed ones."""
+
+    def setUp(self) -> None:
+        agent_log.reset_for_tests()
+
+    def test_record_call_defaults_to_dragon(self):
+        agent_log.record_call("web_search", {"q": "esp32"})
+        items = agent_log.snapshot()
+        self.assertEqual(items[0]["source"], "dragon")
+
+    def test_record_call_accepts_gateway_source(self):
+        agent_log.record_call("bash", {"cmd": "ls"}, source="gateway")
+        items = agent_log.snapshot()
+        self.assertEqual(items[0]["source"], "gateway")
+
+    def test_empty_source_defaults_to_dragon(self):
+        agent_log.record_call("x", source="")
+        items = agent_log.snapshot()
+        self.assertEqual(items[0]["source"], "dragon")
+
+    def test_result_matches_within_source_scope(self):
+        """Same tool name from different sources must not collide on
+        result match.  Dragon's web_search and gateway's web_search
+        are independent entries even if firing in the same window."""
+        agent_log.record_call("web_search", {"q": "a"}, source="dragon")
+        agent_log.record_call("web_search", {"q": "b"}, source="gateway")
+        agent_log.record_result("web_search", "dragon-done", source="dragon")
+        items = agent_log.snapshot()
+        # newest-first, so [0] = gateway (still running), [1] = dragon (done)
+        self.assertEqual(items[0]["source"], "gateway")
+        self.assertEqual(items[0]["status"], "running")
+        self.assertEqual(items[1]["source"], "dragon")
+        self.assertEqual(items[1]["status"], "done")
+        self.assertEqual(items[1]["result"], "dragon-done")
+
+    def test_unknown_source_preserved(self):
+        """API doesn't gatekeep source values — a future surface like
+        'mcp' or 'skill_bridge' can self-identify without a code
+        change."""
+        agent_log.record_call("x", source="mcp")
+        items = agent_log.snapshot()
+        self.assertEqual(items[0]["source"], "mcp")
+
+    def test_endpoint_returns_source_bucket_counts(self):
+        """GET /api/v1/agent_log returns a `sources` dict with per-
+        source counts (Dragon vs gateway vs others)."""
+        agent_log.record_call("a", source="dragon")
+        agent_log.record_call("b", source="dragon")
+        agent_log.record_call("c", source="gateway")
+
+        async def go():
+            app = web.Application()
+            agent_log.AgentLogRoutes().register(app)
+            async with TestClient(TestServer(app)) as client:
+                resp = await client.get("/api/v1/agent_log")
+                self.assertEqual(resp.status, 200)
+                body = await resp.json()
+                self.assertIn("sources", body)
+                self.assertEqual(body["sources"].get("dragon"), 2)
+                self.assertEqual(body["sources"].get("gateway"), 1)
+
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(go())
+        finally:
+            loop.close()
+
+
 if __name__ == "__main__":
     unittest.main()

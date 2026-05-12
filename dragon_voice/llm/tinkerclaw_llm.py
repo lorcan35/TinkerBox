@@ -708,7 +708,11 @@ class TinkerClawBackend(LLMBackend):
             # tear down LLM streaming.
             try:
                 from dragon_voice.api.agent_log import record_call as _alog
-                _alog(name, args_obj if isinstance(args_obj, dict) else {})
+                _alog(
+                    name,
+                    args_obj if isinstance(args_obj, dict) else {},
+                    source="gateway",
+                )
             except Exception:
                 logger.debug(
                     "agent_log record_call suppressed for gateway tool %s",
@@ -757,7 +761,7 @@ class TinkerClawBackend(LLMBackend):
                     )
             try:
                 from dragon_voice.api.agent_log import record_result as _alog_res
-                _alog_res(name, result=None, execution_ms=None)
+                _alog_res(name, result=None, execution_ms=None, source="gateway")
             except Exception:
                 logger.debug(
                     "agent_log record_result suppressed for gateway tool %s",

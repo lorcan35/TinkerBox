@@ -73,9 +73,26 @@ def _preview(result: Any) -> Optional[str]:
    return s
 
 
-def record_call(tool: str, args: Optional[dict] = None) -> int:
-   """Append a "running" entry to the ring.  Returns the assigned id."""
+def record_call(
+    tool: str,
+    args: Optional[dict] = None,
+    source: str = "dragon",
+) -> int:
+   """Append a "running" entry to the ring.  Returns the assigned id.
+
+   `source` distinguishes the call's surface (added W7-A.3,
+   2026-05-12):
+     * "dragon"  — invoked by Dragon's own ToolRegistry (default;
+                   preserves the pre-W7-A.3 behaviour for the
+                   ToolRegistry chokepoint in tools/registry.py)
+     * "gateway" — invoked by the TinkerClaw agent gateway,
+                   surfaced via the W7-A SSE tool_call delta path
+                   in dragon_voice/llm/tinkerclaw_llm.py
+   Unknown sources are stored as-is so a future surface (e.g. MCP
+   skill bridge) can name itself without an API change.
+   """
    global _next_id
+   src = str(source or "dragon").strip() or "dragon"
    with _lock:
       entry_id = _next_id
       _next_id += 1
@@ -85,6 +102,7 @@ def record_call(tool: str, args: Optional[dict] = None) -> int:
               "ts": int(time.time()),
               "tool": str(tool or "unknown"),
               "args": dict(args or {}),
+              "source": src,
               "status": "running",
               "result": None,
               "execution_ms": None,
@@ -97,19 +115,27 @@ def record_result(
     tool: str,
     result: Any = None,
     execution_ms: Optional[int] = None,
+    source: str = "dragon",
 ) -> None:
    """Mark the most-recent matching `running` entry done.
 
    Walks newest-first so same-tool-twice-in-one-turn still maps 1:1 to
-   the calls.  If no running entry matches (e.g., the call hook never
-   fired because of an early-error path), append a synthetic done entry
-   so the result still surfaces.
+   the calls.  Matching considers both `tool` and `source` — a
+   gateway-side `web_search` and a Dragon-side `web_search` don't
+   collide.  If no matching running entry exists (e.g., the call hook
+   never fired because of an early-error path), append a synthetic
+   done entry tagged with the same source so the result still surfaces.
    """
    global _next_id
    preview = _preview(result)
+   src = str(source or "dragon").strip() or "dragon"
    with _lock:
       for rec in reversed(_ring):
-         if rec.get("status") == "running" and rec.get("tool") == tool:
+         if (
+             rec.get("status") == "running"
+             and rec.get("tool") == tool
+             and rec.get("source", "dragon") == src
+         ):
             rec["status"] = "done"
             rec["result"] = preview
             rec["execution_ms"] = execution_ms
@@ -123,6 +149,7 @@ def record_result(
               "ts": int(time.time()),
               "tool": str(tool or "unknown"),
               "args": {},
+              "source": src,
               "status": "done",
               "result": preview,
               "execution_ms": execution_ms,
@@ -178,6 +205,16 @@ class AgentLogRoutes:
       limit = max(1, min(limit, _RING_SIZE))
 
       items = snapshot(since_id=since_id, limit=limit)
+      # W7-A.3: pre-bucketed source counts for clients that want to
+      # render Dragon vs gateway activity separately without re-
+      # walking `items` themselves.  Walks the live ring (not the
+      # paginated snapshot) so the totals are stable across calls.
+      with _lock:
+         all_items = list(_ring)
+      sources: dict[str, int] = {}
+      for rec in all_items:
+         s = str(rec.get("source") or "dragon")
+         sources[s] = sources.get(s, 0) + 1
       return web.json_response(
           {
               "items": items,
@@ -185,5 +222,6 @@ class AgentLogRoutes:
               "head_id": head_id(),
               "tail_id": tail_id(),
               "ring_size": _RING_SIZE,
+              "sources": sources,
           }
       )

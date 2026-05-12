@@ -129,4 +129,5 @@ jobs:
             tests/test_api_messages_post.py \
             tests/test_spend_tracker.py \
             tests/test_start_handler.py \
-            tests/test_protocol_contract.py
+            tests/test_protocol_contract.py \
+            tests/test_tinkerclaw_tool_events.py

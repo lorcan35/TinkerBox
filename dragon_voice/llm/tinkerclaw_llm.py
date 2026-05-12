@@ -11,7 +11,7 @@ import json
 import logging
 import re
 import time
-from typing import AsyncIterator, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 
 import aiohttp
 
@@ -143,6 +143,14 @@ class TinkerClawBackend(LLMBackend):
         # by is_healthy() and seeded by initialize().
         self._health_cache_ok: bool = False
         self._health_cache_until: float = 0.0
+        # W7-A (audit 2026-05-11): optional callback fired once per
+        # full tool call detected in the gateway's SSE stream.  When
+        # set, the SSE parser surfaces `delta.tool_calls` deltas from
+        # the OpenAI-compatible /v1/chat/completions response as
+        # complete tool_call events — Tab5 already renders these
+        # (Wave 12 agent_log feed).  Pre-W7-A the deltas were silently
+        # skipped because the parser only looked at `delta.content`.
+        self._on_tool_call: Optional[Callable[[dict], Awaitable[None]]] = None
 
     async def initialize(self) -> None:
         headers = {"Content-Type": "application/json"}
@@ -232,6 +240,33 @@ class TinkerClawBackend(LLMBackend):
         to maintain per-session conversation history internally.
         """
         self._session_key = session_key
+
+    def set_tool_event_handler(
+        self,
+        on_tool_call: Optional[Callable[[dict], Awaitable[None]]],
+    ) -> None:
+        """W7-A: register a callback fired once per gateway tool call.
+
+        The callback receives a dict shaped like Dragon's own ToolRegistry
+        emit payload — `{"tool": "<name>", "args": <parsed dict>}` — so
+        Tab5's existing Wave 12 agent_log feed renders it without changes.
+
+        Pass `None` to clear the handler (e.g. on backend swap).
+
+        The callback is awaited inside the SSE parse loop, so failure
+        modes:
+          * raises an exception → logged + swallowed (a buggy callback
+            must NOT tear down the LLM stream)
+          * blocks for more than the sock_read budget → can stall the
+            stream; keep callbacks fast (the existing ToolEventEmitter
+            already does fire-and-forget WS sends).
+
+        Tool result events from the gateway are NOT surfaced via this
+        callback yet — `/v1/chat/completions` doesn't emit them natively;
+        the OpenAI Responses-API path (event-typed SSE) is the next
+        slice (W7-A.2).
+        """
+        self._on_tool_call = on_tool_call
 
     async def generate_stream(
         self, prompt: str, system_prompt: str = ""
@@ -332,6 +367,15 @@ class TinkerClawBackend(LLMBackend):
                 _A5_PARAGRAPH_BREAK = "\n\n"
                 _A5_SENTENCE_END_CHARS = (".", "!", "?")
 
+                # W7-A: tool-call accumulator keyed by OpenAI's delta
+                # `tool_calls[*].index`.  OpenAI streams function name +
+                # arguments incrementally; we buffer per-index and flush
+                # when the index closes (next-chunk's tool_calls has a
+                # different index, or [DONE]/text-delta indicates calls
+                # are complete).  Flushed entries fire `_on_tool_call`.
+                tool_call_buffer: dict[int, dict[str, Any]] = {}
+                _flushed_tool_indices: set[int] = set()
+
                 # W14-M07: use readline with explicit byte cap so one
                 # pathologically long SSE frame can't blow memory.
                 while True:
@@ -382,6 +426,29 @@ class TinkerClawBackend(LLMBackend):
                         continue
 
                     delta = choices[0].get("delta", {})
+
+                    # W7-A: accumulate any incremental tool_calls deltas
+                    # by index before reading the text-content delta.
+                    # OpenAI's chat-completions streams tool_calls
+                    # incrementally — `function.name` arrives in one
+                    # chunk, `function.arguments` is split character by
+                    # character across many chunks.  We rebuild each
+                    # call here; the actual flush happens when we see
+                    # a finish_reason of "tool_calls" / "stop" or when
+                    # the stream ends.
+                    self._accumulate_tool_call_deltas(
+                        delta.get("tool_calls"), tool_call_buffer,
+                    )
+
+                    # If the upstream signals "tool_calls finished",
+                    # flush buffered calls immediately so Tab5 sees
+                    # them before the tool execution latency starts.
+                    finish_reason = choices[0].get("finish_reason")
+                    if finish_reason in ("tool_calls", "stop") and tool_call_buffer:
+                        await self._flush_tool_calls(
+                            tool_call_buffer, _flushed_tool_indices,
+                        )
+
                     token = delta.get("content", "")
                     if token:
                         token_count += 1
@@ -446,6 +513,15 @@ class TinkerClawBackend(LLMBackend):
                                 accumulated.clear()
                                 passthrough = True
 
+                # W7-A: end-of-stream flush — any tool calls that the
+                # upstream never gave a finish_reason for (some servers
+                # only emit finish_reason on the assistant-text path, not
+                # on tool-only chunks) still need to surface to Tab5.
+                if tool_call_buffer:
+                    await self._flush_tool_calls(
+                        tool_call_buffer, _flushed_tool_indices,
+                    )
+
                 # A07: Truncation detection — stream ended without [DONE]
                 if not saw_done:
                     if token_count > 0:
@@ -482,6 +558,99 @@ class TinkerClawBackend(LLMBackend):
             await self._session.close()
         self._session = None
         logger.info("TinkerClaw backend shut down")
+
+    # ── W7-A: gateway tool-event surfacing ─────────────────────────────
+
+    @staticmethod
+    def _accumulate_tool_call_deltas(
+        deltas: Optional[list[dict]],
+        buffer: dict[int, dict[str, Any]],
+    ) -> None:
+        """Merge incremental OpenAI tool_calls deltas into the buffer.
+
+        OpenAI streams tool calls in pieces — a chunk may carry just
+        `{"index": 0, "id": "call_abc"}`, the next `{"index": 0,
+        "function": {"name": "search"}}`, then a long tail of
+        `{"index": 0, "function": {"arguments": "{\"q\""}}` etc.  We
+        rebuild the full call in `buffer[index]`.
+
+        No callback is fired here — flush is the caller's job, since
+        the right moment depends on context (finish_reason / EOS).
+        """
+        if not deltas:
+            return
+        for d in deltas:
+            try:
+                idx = int(d.get("index", 0))
+            except (TypeError, ValueError):
+                idx = 0
+            slot = buffer.setdefault(
+                idx, {"id": "", "name": "", "arguments": ""},
+            )
+            call_id = d.get("id")
+            if call_id:
+                slot["id"] = str(call_id)
+            fn = d.get("function") or {}
+            name = fn.get("name")
+            if name:
+                # Some servers stream name in fragments too; concat
+                # rather than replace to be defensive.
+                slot["name"] += str(name) if not slot["name"] else ""
+                if not slot["name"]:
+                    slot["name"] = str(name)
+            arg_frag = fn.get("arguments")
+            if arg_frag:
+                slot["arguments"] += str(arg_frag)
+
+    async def _flush_tool_calls(
+        self,
+        buffer: dict[int, dict[str, Any]],
+        flushed: set[int],
+    ) -> None:
+        """Emit accumulated tool calls via the registered callback.
+
+        Each buffer entry is rendered as Dragon's standard tool_call
+        shape (`{"tool": "<name>", "args": <parsed dict>}`) and passed
+        to `self._on_tool_call`.  Failures are logged + swallowed so a
+        buggy callback can never tear down the LLM stream.
+
+        Idempotent: indexes already in `flushed` are skipped, so we can
+        be called at finish_reason and again at EOS without duplicate
+        emits.  The buffer itself is not cleared — keeping the records
+        lets future runs in the same stream (rare) accumulate further
+        argument fragments correctly.
+        """
+        if not self._on_tool_call:
+            # No handler registered → nothing to surface.  Still mark
+            # entries flushed so we don't churn re-checking them.
+            flushed.update(buffer.keys())
+            return
+        for idx, call in buffer.items():
+            if idx in flushed:
+                continue
+            name = call.get("name", "").strip()
+            if not name:
+                # Tool calls with no function name are gateway bugs;
+                # surface nothing rather than emit a malformed event.
+                continue
+            args_str = call.get("arguments") or "{}"
+            try:
+                args_obj: Any = json.loads(args_str) if args_str else {}
+            except json.JSONDecodeError:
+                # Streaming may have ended mid-JSON if the upstream
+                # crashed; surface the raw string so the obs ring shows
+                # *something* useful for debugging.
+                args_obj = {"_raw": args_str[:512]}
+            payload = {"tool": name, "args": args_obj}
+            try:
+                await self._on_tool_call(payload)
+            except Exception:
+                logger.exception(
+                    "W7-A: on_tool_call callback raised — swallowed "
+                    "to keep LLM stream alive (tool=%s)",
+                    name,
+                )
+            flushed.add(idx)
 
     @property
     def name(self) -> str:

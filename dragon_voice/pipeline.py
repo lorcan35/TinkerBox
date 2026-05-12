@@ -315,6 +315,18 @@ class VoicePipeline:
             self._llm.name, " (pooled)" if self._pooled_llm else "",
         )
 
+        # W7-A (audit 2026-05-11): if the LLM is the TinkerClaw agent
+        # gateway backend, hand it the connection's on_tool_call hook so
+        # gateway-emitted tool_calls become visible Tab5 events (Wave 12
+        # agent_log feed already renders these).  Pre-W7-A the deltas
+        # were silently skipped because mode 3 bypassed Dragon's local
+        # ToolRegistry entirely.  Guarded by `hasattr` so other backends
+        # (which don't have the setter) keep working unchanged.
+        if self._on_tool_call is not None and hasattr(
+            self._llm, "set_tool_event_handler"
+        ):
+            self._llm.set_tool_event_handler(self._on_tool_call)
+
     def set_uplink_codec(self, codec: str) -> str:
         """Switch the uplink decoder.  Returns the codec actually applied.
 

@@ -202,5 +202,65 @@ class TestSetToolEventHandler(unittest.TestCase):
         self.assertIsNone(be._on_tool_call)
 
 
+class TestAgentLogBridge(unittest.IsolatedAsyncioTestCase):
+    """W7-A.b: gateway tool calls land in the cross-session agent_log
+    ring (the /api/v1/agent_log feed Tab5 reads in Wave 12).  Pre-W7-A.b
+    the ToolRegistry.execute chokepoint was the only writer, so mode 3
+    was dark for the agent_log surface."""
+
+    async def asyncSetUp(self):
+        # The ring is process-global; snapshot + restore so tests don't
+        # cross-contaminate one another.
+        from dragon_voice.api import agent_log as _alog
+        self._alog = _alog
+        # Save state
+        with _alog._lock:
+            self._saved_ring = list(_alog._ring)
+            self._saved_next = _alog._next_id
+            _alog._ring.clear()
+            _alog._next_id = 1
+
+    async def asyncTearDown(self):
+        with self._alog._lock:
+            self._alog._ring.clear()
+            for item in self._saved_ring:
+                self._alog._ring.append(item)
+            self._alog._next_id = self._saved_next
+
+    async def test_flush_records_to_agent_log(self):
+        be = _NoInitBackend()
+        buf = {0: {"id": "x", "name": "web_search", "arguments": '{"q":"hi"}'}}
+        await be._flush_tool_calls(buf, set())
+        with self._alog._lock:
+            entries = list(self._alog._ring)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["tool"], "web_search")
+        self.assertEqual(entries[0]["args"], {"q": "hi"})
+        self.assertEqual(entries[0]["status"], "running")
+
+    async def test_records_even_without_handler(self):
+        # The W7-A.b agent_log write must NOT depend on a handler being
+        # registered — it should fire regardless so /api/v1/agent_log is
+        # useful even when no WS-emit callback is wired.
+        be = _NoInitBackend()
+        self.assertIsNone(be._on_tool_call)
+        buf = {0: {"id": "x", "name": "remember", "arguments": '{"fact":"y"}'}}
+        await be._flush_tool_calls(buf, set())
+        with self._alog._lock:
+            entries = list(self._alog._ring)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["tool"], "remember")
+
+    async def test_double_flush_records_once(self):
+        be = _NoInitBackend()
+        buf = {0: {"id": "x", "name": "t", "arguments": "{}"}}
+        flushed: set = set()
+        await be._flush_tool_calls(buf, flushed)
+        await be._flush_tool_calls(buf, flushed)
+        with self._alog._lock:
+            entries = list(self._alog._ring)
+        self.assertEqual(len(entries), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -46,6 +46,11 @@ from typing import Any, Optional
 import aiohttp
 
 from dragon_voice.channels.base import ChannelReplyResult
+from dragon_voice.channels.device_identity import (
+    DeviceIdentity,
+    build_v3_payload,
+    load_or_create_identity,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +120,7 @@ class GatewayConnector:
         client_version: str = "0.1.0",
         rpc_timeout_s: float = DEFAULT_RPC_TIMEOUT_S,
         session: Optional[aiohttp.ClientSession] = None,
+        identity: Optional[DeviceIdentity] = None,
     ) -> None:
         if not token:
             raise ValueError(
@@ -127,6 +133,13 @@ class GatewayConnector:
         self._client_id = client_id
         self._client_version = client_version
         self._rpc_timeout_s = rpc_timeout_s
+        # W7-F.4: ed25519 device identity that lets the gateway grant the
+        # requested scopes without a manual pairing approval (loopback
+        # backend-self-pairing path — see device_identity.py docstring).
+        # Tests may inject a pre-built identity to avoid filesystem
+        # writes; production callers pass None and we load (or generate)
+        # the persistent ``~/.dragon/identity/device.json`` keypair.
+        self._identity = identity if identity is not None else load_or_create_identity()
 
         # Allow tests to inject a shared aiohttp session so they don't
         # have to spin up a real TCP listener.  Production callers
@@ -138,6 +151,13 @@ class GatewayConnector:
         self._pending: dict[str, _PendingCall] = {}
         self._connect_lock = asyncio.Lock()
         self._connected = False
+        # W7-F.4: gateway sends ``event: connect.challenge`` with a nonce
+        # immediately after the WS opens; the device.nonce field in our
+        # connect-req must echo that exact nonce or the gateway rejects
+        # the handshake with "device nonce mismatch".  The reader loop
+        # fulfills this future when the challenge arrives; the handshake
+        # waits on it before signing the v3 payload.
+        self._connect_challenge_nonce: Optional[asyncio.Future[str]] = None
 
     # ── public API ──────────────────────────────────────────────────
 
@@ -226,11 +246,17 @@ class GatewayConnector:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
             self._owned_session = True
+        # W7-F.4: prepare the connect-challenge future BEFORE opening the
+        # WS so the reader's dispatch path can always fulfill it without
+        # racing with our `await` below.
+        loop = asyncio.get_event_loop()
+        self._connect_challenge_nonce = loop.create_future()
         self._ws = await self._session.ws_connect(
             self._url, heartbeat=WS_HEARTBEAT_S,
         )
         # Start the reader BEFORE the handshake so the connect response
-        # has a future waiting for it.
+        # — and the connect.challenge event that PRECEDES it — has a
+        # future waiting for it.
         self._reader_task = asyncio.create_task(self._reader_loop())
         try:
             await self._handshake()
@@ -246,34 +272,71 @@ class GatewayConnector:
         )
 
     async def _handshake(self) -> None:
-        # W7-F.3: role + client.id + scopes must satisfy the OpenClaw gateway
-        # validators (see openclaw src/gateway/protocol/client-info.ts +
-        # role-policy.ts + method-scopes.ts).
-        #   * role     ∈ {"operator", "node"}.  "operator" is the right
-        #                role for a backend that invokes operator-tier
-        #                methods like `send`.
-        #   * client.id ∈ GATEWAY_CLIENT_IDS enum.  "gateway-client" is
-        #                the generic backend id — matches what the OpenClaw
-        #                TypeScript reference client (gateway/client.ts:447)
-        #                uses by default for backend-mode connections.
-        #   * scopes   — `send` is gated on `operator.write`; include `read`
-        #                + `admin` too so future health / status probes don't
-        #                fail the gate.  (`operator.admin` does NOT
-        #                transitively grant `write` — they're independent
-        #                bags in METHOD_SCOPE_GROUPS.)
+        # W7-F.3 + W7-F.4: connect-param contract for the OpenClaw gateway.
+        #   * role / client.id / scopes / protocol — covered in W7-F.3.
+        #   * device — W7-F.4: the ed25519 identity binds the connect frame
+        #                so the gateway's scope-grant rule
+        #                (``message-handler.ts:L510-512``) doesn't clear
+        #                the self-declared scopes.  Loopback + gateway-client
+        #                + backend mode + token auth additionally satisfies
+        #                ``shouldSkipBackendSelfPairing`` in
+        #                handshake-auth-helpers.ts, so no manual pairing
+        #                approval is needed for a fresh keypair.
+        #   * nonce  — W7-F.4: gateway sends a connect.challenge event
+        #                immediately after WS open with a server-issued
+        #                nonce; the device.nonce field MUST echo that
+        #                value (``message-handler.ts:L611``) or the gateway
+        #                rejects with "device nonce mismatch".
+        scopes = ["operator.read", "operator.write", "operator.admin"]
+        role = "operator"
+        client_mode = "backend"
+        platform = "linux"
+        device_family: str = ""
+        signed_at_ms = int(time.time() * 1000)
+        # Wait up to half the RPC budget for the connect.challenge event —
+        # cheap event from the server, but bound the wait so a silent or
+        # broken gateway doesn't hang send_reply forever.
+        assert self._connect_challenge_nonce is not None
+        try:
+            nonce = await asyncio.wait_for(
+                self._connect_challenge_nonce,
+                timeout=max(2.0, self._rpc_timeout_s / 2),
+            )
+        except asyncio.TimeoutError as e:
+            raise RuntimeError("gateway never sent connect.challenge") from e
+        payload = build_v3_payload(
+            device_id=self._identity.device_id,
+            client_id=self._client_id,
+            client_mode=client_mode,
+            role=role,
+            scopes=scopes,
+            signed_at_ms=signed_at_ms,
+            token=self._token,
+            nonce=nonce,
+            platform=platform,
+            device_family=device_family,
+        )
+        signature = self._identity.sign(payload)
         connect_params = {
             "minProtocol": GATEWAY_PROTOCOL_MIN,
             "maxProtocol": GATEWAY_PROTOCOL_MAX,
             "client": {
                 "id": self._client_id,
                 "version": self._client_version,
-                "platform": "linux",
-                "mode": "backend",
+                "platform": platform,
+                "mode": client_mode,
             },
-            "role": "operator",
-            "scopes": ["operator.read", "operator.write", "operator.admin"],
+            "role": role,
+            "scopes": scopes,
             "auth": {"token": self._token},
             "caps": [],
+            "device": {
+                "id": self._identity.device_id,
+                "publicKey": self._identity.public_key_b64url(),
+                "signature": signature,
+                "signedAt": signed_at_ms,
+                "nonce": nonce,
+            },
         }
         result = await self._rpc("connect", connect_params, ensure_connected=False)
         if not result.ok:
@@ -365,6 +428,21 @@ class GatewayConnector:
         if frame_type == "res":
             self._dispatch_response(frame)
         elif frame_type == "event":
+            # W7-F.4: the very first event after WS open is
+            # ``connect.challenge`` carrying the server-issued nonce
+            # that our device.nonce field must echo.  Hand it to the
+            # handshake's pending future.
+            if frame.get("event") == "connect.challenge":
+                payload = frame.get("payload") or {}
+                challenge_nonce = payload.get("nonce")
+                if (
+                    isinstance(challenge_nonce, str)
+                    and challenge_nonce
+                    and self._connect_challenge_nonce is not None
+                    and not self._connect_challenge_nonce.done()
+                ):
+                    self._connect_challenge_nonce.set_result(challenge_nonce.strip())
+                return
             # W7-G will handle inbound platform messages.  For now,
             # log + drop so the WS stays healthy.
             logger.debug(

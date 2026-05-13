@@ -33,12 +33,50 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase
 
+from dragon_voice.channels.device_identity import (
+    DeviceIdentity,
+    _b64url_encode,
+    _derive_raw_public_key,
+    _fingerprint_public_key,
+    _normalize_metadata,
+    build_v3_payload,
+    load_or_create_identity,
+)
 from dragon_voice.channels.gateway import (
     GatewayConnector,
     _extract_platform_id,
     _extract_recipient,
     _idem_key,
 )
+
+
+def _make_test_identity() -> DeviceIdentity:
+    """Generate a throwaway identity without touching disk.
+
+    Re-using ``load_or_create_identity`` here would persist to
+    ``~/.dragon/identity/`` on the test runner, which is hostile to CI
+    isolation and slow.  Generating in-memory keeps each test self-
+    contained.
+    """
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+    )
+    priv = Ed25519PrivateKey.generate()
+    pub_pem = priv.public_key().public_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    ).decode("ascii")
+    priv_pem = priv.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("ascii")
+    return DeviceIdentity(
+        device_id=_fingerprint_public_key(pub_pem),
+        public_key_pem=pub_pem,
+        private_key_pem=priv_pem,
+    )
 
 
 # ── Fake gateway WS handler ─────────────────────────────────────────
@@ -69,6 +107,7 @@ class FakeGateway:
         # Captured for assertions.
         self.last_connect_params: Optional[dict] = None
         self.last_send_params: Optional[dict] = None
+        self.last_challenge_nonce: str = ""
         self.connect_count: int = 0
         self.send_count: int = 0
 
@@ -80,6 +119,15 @@ class FakeGateway:
     async def handle(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse()
         await ws.prepare(request)
+        # W7-F.4: gateway sends connect.challenge immediately after WS
+        # open — the client uses that nonce in its device.nonce field.
+        # Record what we issued so tests can check the connector echoed it.
+        self.last_challenge_nonce = f"test-nonce-{uuid.uuid4().hex[:8]}"
+        await ws.send_json({
+            "type": "event",
+            "event": "connect.challenge",
+            "payload": {"nonce": self.last_challenge_nonce, "ts": 0},
+        })
         async for msg in ws:
             if msg.type != web.WSMsgType.TEXT:
                 continue
@@ -170,6 +218,9 @@ class TestGatewayConnectorIntegration(AioHTTPTestCase):
             token=token,
             client_id="test-client",
             rpc_timeout_s=timeout,
+            # Injected throwaway identity — keeps the test from writing
+            # to ``~/.dragon/identity/``.
+            identity=_make_test_identity(),
         )
 
     async def test_send_reply_happy_path(self) -> None:
@@ -206,6 +257,16 @@ class TestGatewayConnectorIntegration(AioHTTPTestCase):
             # client.id must be one of the OpenClaw enum values; the
             # generic backend default is "gateway-client".
             assert cp["client"]["id"] == "test-client"  # set in _make_connector
+            # W7-F.4 device identity present + signature shape sane.
+            dev = cp["device"]
+            assert isinstance(dev["id"], str) and len(dev["id"]) == 64  # sha256 hex
+            assert isinstance(dev["publicKey"], str) and len(dev["publicKey"]) > 30
+            assert isinstance(dev["signature"], str) and len(dev["signature"]) > 60
+            assert isinstance(dev["signedAt"], int) and dev["signedAt"] > 0
+            # The nonce MUST echo the server-issued connect.challenge nonce,
+            # not a client-generated one.  Pre-W7-F.4 the connector
+            # generated its own nonce → gateway rejected "device nonce mismatch".
+            assert dev["nonce"] == self.gateway.last_challenge_nonce
         finally:
             await connector.close()
 
@@ -344,14 +405,148 @@ class TestRequiresToken:
 
     def test_blank_token_raises(self) -> None:
         with pytest.raises(ValueError) as exc:
-            GatewayConnector(token="")
+            GatewayConnector(token="", identity=_make_test_identity())
         assert "token" in str(exc.value).lower()
 
     def test_whitespace_token_accepted_then_strips(self) -> None:
         # The constructor itself doesn't strip — that's the operator's
         # job in config wiring.  Make sure we at least don't crash on
         # an unusual but technically non-empty token.
-        connector = GatewayConnector(token="  abc  ")
+        connector = GatewayConnector(
+            token="  abc  ", identity=_make_test_identity(),
+        )
         assert connector is not None
+
+
+# ── W7-F.4: device_identity helpers ─────────────────────────────────
+
+
+class TestBuildV3Payload:
+    """Canonical pipe-delimited payload — must match OpenClaw byte-for-byte."""
+
+    def test_basic_shape(self) -> None:
+        out = build_v3_payload(
+            device_id="abc123",
+            client_id="gateway-client",
+            client_mode="backend",
+            role="operator",
+            scopes=["operator.read", "operator.write"],
+            signed_at_ms=1700000000000,
+            token="tok",
+            nonce="n1",
+            platform="linux",
+            device_family="",
+        )
+        assert out == (
+            "v3|abc123|gateway-client|backend|operator|"
+            "operator.read,operator.write|1700000000000|tok|n1|linux|"
+        )
+
+    def test_token_none_becomes_empty(self) -> None:
+        out = build_v3_payload(
+            device_id="d", client_id="c", client_mode="m", role="r",
+            scopes=[], signed_at_ms=0, token=None, nonce="n",
+            platform=None, device_family=None,
+        )
+        # Empty scopes -> empty segment; None token -> empty.
+        assert "||" in out  # token segment is empty
+
+    def test_scopes_comma_joined_no_spaces(self) -> None:
+        out = build_v3_payload(
+            device_id="d", client_id="c", client_mode="m", role="r",
+            scopes=["a", "b", "c"], signed_at_ms=1, token="t", nonce="n",
+        )
+        assert "|a,b,c|" in out
+
+    def test_metadata_lowercased(self) -> None:
+        out = build_v3_payload(
+            device_id="d", client_id="c", client_mode="m", role="r",
+            scopes=[], signed_at_ms=1, token="t", nonce="n",
+            platform="LINUX", device_family="X86_64",
+        )
+        # Trailing fields: platform + device_family, both lowercased.
+        parts = out.rsplit("|", 2)
+        assert parts[-2] == "linux"
+        assert parts[-1] == "x86_64"
+
+
+class TestDeviceIdentityHelpers:
+    """Identity round-trip + crypto helpers match OpenClaw's TS encoding."""
+
+    def test_device_id_is_sha256_hex_of_raw_public_key(self) -> None:
+        ident = _make_test_identity()
+        import hashlib
+        raw = _derive_raw_public_key(ident.public_key_pem)
+        assert len(raw) == 32  # ed25519 public key is 32 bytes
+        assert ident.device_id == hashlib.sha256(raw).hexdigest()
+
+    def test_public_key_b64url_strips_padding(self) -> None:
+        ident = _make_test_identity()
+        encoded = ident.public_key_b64url()
+        assert "=" not in encoded
+        assert "+" not in encoded
+        assert "/" not in encoded
+        # 32 raw bytes → 43-char base64url (no padding)
+        assert len(encoded) == 43
+
+    def test_signature_verifies_against_payload(self) -> None:
+        """Round-trip: sign with our DeviceIdentity, verify with cryptography."""
+        from cryptography.hazmat.primitives import serialization
+        ident = _make_test_identity()
+        payload = "v3|fake|fake|backend|operator|x|1|tok|n||"
+        sig_b64u = ident.sign(payload)
+        # Decode signature (add padding for stdlib decoder)
+        import base64
+        pad = "=" * ((4 - len(sig_b64u) % 4) % 4)
+        sig = base64.urlsafe_b64decode(sig_b64u + pad)
+        assert len(sig) == 64  # ed25519 signatures are 64 bytes
+        # Verify with the public key (mirrors gateway's verifyDeviceSignature).
+        pub = serialization.load_pem_public_key(ident.public_key_pem.encode())
+        pub.verify(sig, payload.encode("utf-8"))  # raises if bad
+
+    def test_b64url_encoder_matches_known_vector(self) -> None:
+        # Known test vector from RFC 4648 §10 examples (URL-safe variant).
+        assert _b64url_encode(b"") == ""
+        assert _b64url_encode(b"f") == "Zg"
+        assert _b64url_encode(b"foobar") == "Zm9vYmFy"
+
+    def test_normalize_metadata_handles_none_and_whitespace(self) -> None:
+        assert _normalize_metadata(None) == ""
+        assert _normalize_metadata("") == ""
+        assert _normalize_metadata("   ") == ""
+        assert _normalize_metadata("  Linux  ") == "linux"
+
+
+class TestLoadOrCreateIdentityPersistence:
+    """Persisted identity survives a process restart at the same path."""
+
+    def test_first_call_creates_file(self, tmp_path: Any) -> None:
+        path = str(tmp_path / "device.json")
+        ident = load_or_create_identity(path=path)
+        import os
+        assert os.path.exists(path)
+        # File permissions are 0o600 (best-effort).
+        mode = os.stat(path).st_mode & 0o777
+        assert mode == 0o600
+        assert len(ident.device_id) == 64
+        assert "BEGIN PRIVATE KEY" in ident.private_key_pem
+        assert "BEGIN PUBLIC KEY" in ident.public_key_pem
+
+    def test_second_call_returns_same_identity(self, tmp_path: Any) -> None:
+        path = str(tmp_path / "device.json")
+        a = load_or_create_identity(path=path)
+        b = load_or_create_identity(path=path)
+        assert a.device_id == b.device_id
+        assert a.public_key_pem == b.public_key_pem
+        assert a.private_key_pem == b.private_key_pem
+
+    def test_corrupt_file_regenerates(self, tmp_path: Any) -> None:
+        path = str(tmp_path / "device.json")
+        # Write garbage that's neither valid JSON nor matches schema.
+        with open(path, "w") as f:
+            f.write("{this is not JSON")
+        ident = load_or_create_identity(path=path)
+        # Should succeed by regenerating, not raise.
+        assert len(ident.device_id) == 64
 
 

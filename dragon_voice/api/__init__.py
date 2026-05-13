@@ -23,6 +23,7 @@ from dragon_voice.api.system import SystemRoutes
 from dragon_voice.api.debug_channel import DebugChannelRoutes
 from dragon_voice.api.video_inject import VideoInjectRoutes
 from dragon_voice.api.coredumps import CoredumpRoutes  # W4-D
+from dragon_voice.api.logs_tail import LogsTailRoutes  # W4-C
 
 logger = logging.getLogger(__name__)
 
@@ -72,6 +73,11 @@ def setup_all_routes(
     AgentSkillsRoutes(connector_getter=get_gateway_connector).register(app)
     # W5-A: daily spend rollup from api_usage events
     SpendRoutes(db).register(app)
+    # W4-C: journald log-tail (closes the audit's "Dashboard 'Logs' tab
+    # shows event store only, not journald" finding).  Allowlisted unit
+    # set lives in the module so ops can tail any of the tinkerclaw-*
+    # services + ollama without giving a generic systemctl surface.
+    LogsTailRoutes().register(app)
     # W4-D: Dragon-side coredump archive (populated by the scraper task).
     # Registered unconditionally so the empty-list shape is queryable even
     # when the scraper is disabled — operators can poke /api/v1/coredumps

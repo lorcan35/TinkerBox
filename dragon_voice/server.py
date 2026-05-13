@@ -58,6 +58,7 @@ from dragon_voice.pipeline_init import build_and_initialize_pipeline
 from dragon_voice.widget_capabilities_init import init_widget_capabilities
 from dragon_voice.disconnect_handler import handle_disconnect as _disconnect_chain
 from dragon_voice.handler_task_spawn import spawn_handler_task
+from dragon_voice.channel_reply_handler import handle_channel_reply
 from dragon_voice.widget_action_handler import handle_widget_action
 from dragon_voice.text_turn_gate import invoke_with_text_turn_gate
 from dragon_voice.pipeline_callbacks import PipelineCallbacks
@@ -816,57 +817,14 @@ class VoiceServer:
                         logger.debug("Connection %s: config_ack %s", ws_id, cmd.get("applied"))
 
                     elif cmd_type == "channel_reply":
-                        # W7-F stub (TT #471 round-trip closure): Tab5 sends real
-                        # channel_reply frames via voice_send_channel_reply.  Real
-                        # gateway forwarding lives in W7-F.2 (Python WS-RPC client
-                        # to OpenClaw); for now ACK with ok=true so Tab5's
-                        # "Replied via X" toast fires naturally without needing
-                        # a Tab5-side debug-inject simulation.  Logs to events
-                        # table when a session is attached so the dashboard can
-                        # show channel-reply history.
-                        ch = cmd.get("channel", "")
-                        thread = cmd.get("thread_id", "")
-                        text = cmd.get("text", "")
-                        in_reply_to = cmd.get("in_reply_to", "")
-                        logger.info(
-                            "channel_reply RX: ws=%s ch=%s thread=%s text=%.60s in_reply_to=%s",
-                            ws_id, ch, thread, text, in_reply_to,
-                        )
-                        # W7-F follow-up: record the reply in the cross-session
-                        # agent_log feed so it surfaces in Tab5's Agents overlay
-                        # alongside Dragon + gateway tool calls.  source="user_reply"
-                        # bucket separates these from auto-fired tool calls so
-                        # the dashboard can render them differently if it wants
-                        # (Tab5 already has the dragon/gateway/other source
-                        # counter from W7-A.3 + W7-A.3-Tab5).
-                        from dragon_voice.api import agent_log
-                        platform_msg_id = f"stub:{__import__('secrets').token_hex(6)}"
-                        agent_log.record_call(
-                            "channel_reply",
-                            {
-                                "channel": ch,
-                                "thread_id": thread,
-                                "text_preview": text[:80],
-                            },
-                            source="user_reply",
-                        )
-                        agent_log.record_result(
-                            "channel_reply",
-                            {
-                                "ok": True,
-                                "platform_message_id": platform_msg_id,
-                            },
-                            execution_ms=0,
-                            source="user_reply",
-                        )
-                        ack = {
-                            "type": "channel_reply_ack",
-                            "channel": ch,
-                            "thread_id": thread,
-                            "ok": True,
-                            "platform_message_id": platform_msg_id,
-                        }
-                        await ws.send_json(ack)
+                        # W7-F stub (TT #471 round-trip closure).  Handler
+                        # extracted to channel_reply_handler.py for standalone
+                        # unit testing (see tests/test_channel_reply_handler.py).
+                        # That module owns: agent_log.record_call/_result with
+                        # source="user_reply", stub platform_message_id minting,
+                        # and the ACK send.  Real gateway forwarding (W7-F.2)
+                        # will swap the stub for a real WS-RPC dispatch.
+                        await handle_channel_reply(cmd, ws, ws_id, logger)
 
                     else:
                         logger.warning("Unknown command from %s: %s", ws_id, cmd_type)

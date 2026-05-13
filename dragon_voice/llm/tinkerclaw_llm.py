@@ -110,6 +110,26 @@ def sanitize_tinkerclaw_reply(text: str) -> str:
     return work
 
 
+def _classify_gateway_source(tool_name: str) -> str:
+    """W7-G: bucket gateway-routed tool calls so /api/v1/agent_log can
+    surface browser activity separately from generic gateway work.
+
+    OpenClaw exposes `browser` as its web-control tool (see
+    `openclaw/src/agents/tool-catalog.ts`), and the wider ecosystem
+    has variants (`browser_actions`, `browser.click`, etc.).  Treat
+    all of them as one bucket — `gateway_browser` — so operators see
+    a distinct counter for "the agent is on the web right now" vs
+    "the agent ran a shell command or RAG lookup."  Everything else
+    stays at the legacy `gateway` source.
+    """
+    name = (tool_name or "").strip().lower()
+    if not name:
+        return "gateway"
+    if name == "browser" or name.startswith("browser_") or name.startswith("browser."):
+        return "gateway_browser"
+    return "gateway"
+
+
 class TinkerClawBackend(LLMBackend):
     """LLM backend that proxies to a local TinkerClaw agent gateway."""
 
@@ -711,7 +731,7 @@ class TinkerClawBackend(LLMBackend):
                 _alog(
                     name,
                     args_obj if isinstance(args_obj, dict) else {},
-                    source="gateway",
+                    source=_classify_gateway_source(name),
                 )
             except Exception:
                 logger.debug(
@@ -761,7 +781,12 @@ class TinkerClawBackend(LLMBackend):
                     )
             try:
                 from dragon_voice.api.agent_log import record_result as _alog_res
-                _alog_res(name, result=None, execution_ms=None, source="gateway")
+                _alog_res(
+                    name,
+                    result=None,
+                    execution_ms=None,
+                    source=_classify_gateway_source(name),
+                )
             except Exception:
                 logger.debug(
                     "agent_log record_result suppressed for gateway tool %s",

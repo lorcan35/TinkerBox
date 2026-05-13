@@ -76,6 +76,27 @@ DEFAULT_RPC_TIMEOUT_S = 15.0
 # gateway's own tick interval.
 WS_HEARTBEAT_S = 30.0
 
+# W7-F.5: Tab5 emits two-letter channel ids (the same short names that
+# show up in NVS keys + UI labels: ch_tg_on, "[tg] Alice", …).  The
+# OpenClaw gateway plugin registry resolves channels by their
+# canonical plugin id (``telegram``, ``whatsapp``, …) with no built-in
+# aliases for the two-letter forms.  Map at the connector boundary so
+# Tab5's short names work end-to-end without firmware churn.
+#
+# Unknown ids fall through unchanged — keeps "telegram" or "wa-foo" or
+# any future plugin id callers might pass working without a code
+# change, while still translating the common Tab5 vocabulary.
+_TAB5_CHANNEL_ALIASES = {
+    "tg": "telegram",
+    "wa": "whatsapp",
+    "dc": "discord",
+    "sl": "slack",
+    "sg": "signal",
+    "im": "imessage",
+    "ma": "matrix",
+    "em": "email",
+}
+
 
 @dataclass
 class _RpcResult:
@@ -187,9 +208,14 @@ class GatewayConnector:
                 error=f"unparseable_thread_id: {thread_id!r}",
             )
 
+        # W7-F.5: Tab5 sends two-letter short ids; gateway expects the
+        # canonical plugin id (telegram/whatsapp/...).  Translate at
+        # the connector boundary; unknown ids pass through unchanged.
+        gateway_channel = _TAB5_CHANNEL_ALIASES.get(channel.strip().lower(), channel)
+
         params: dict[str, Any] = {
             "to": to,
-            "channel": channel,
+            "channel": gateway_channel,
             "message": text,
             "idempotencyKey": _idem_key(),
         }

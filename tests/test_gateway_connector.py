@@ -43,6 +43,7 @@ from dragon_voice.channels.device_identity import (
     load_or_create_identity,
 )
 from dragon_voice.channels.gateway import (
+    _TAB5_CHANNEL_ALIASES,
     GatewayConnector,
     _extract_platform_id,
     _extract_recipient,
@@ -238,7 +239,9 @@ class TestGatewayConnectorIntegration(AioHTTPTestCase):
             params = self.gateway.last_send_params
             assert params is not None
             assert params["to"] == "42"
-            assert params["channel"] == "tg"
+            # W7-F.5: connector translates Tab5's "tg" → OpenClaw's "telegram"
+            # (the gateway's channel registry resolves by canonical plugin id).
+            assert params["channel"] == "telegram"
             assert params["message"] == "hello world"
             assert params["threadId"] == "tg:thread:42"
             assert params["idempotencyKey"].startswith("dragon:")
@@ -515,6 +518,27 @@ class TestDeviceIdentityHelpers:
         assert _normalize_metadata("") == ""
         assert _normalize_metadata("   ") == ""
         assert _normalize_metadata("  Linux  ") == "linux"
+
+
+class TestTab5ChannelAliases:
+    """W7-F.5: Tab5 short ids map to OpenClaw canonical plugin ids."""
+
+    def test_all_eight_short_names_covered(self) -> None:
+        # Match the eight ch_*_on NVS keys Tab5 ships today.  When a new
+        # channel lights up on the Tab5 side, the alias must be added
+        # here so the connector forwards to the correct plugin.
+        expected = {"tg", "wa", "dc", "sl", "sg", "im", "ma", "em"}
+        assert expected.issubset(set(_TAB5_CHANNEL_ALIASES.keys()))
+
+    def test_tg_maps_to_telegram(self) -> None:
+        assert _TAB5_CHANNEL_ALIASES["tg"] == "telegram"
+
+    def test_canonical_passthrough_via_send_reply(self) -> None:
+        """If a caller passes the canonical id, it must not be re-mapped."""
+        # The mapping is performed via dict.get(key, default); when the
+        # key isn't in the alias table the original channel falls through.
+        for canonical in ("telegram", "whatsapp", "discord"):
+            assert _TAB5_CHANNEL_ALIASES.get(canonical, canonical) == canonical
 
 
 class TestLoadOrCreateIdentityPersistence:

@@ -22,6 +22,7 @@ from dragon_voice.api.completions import CompletionRoutes
 from dragon_voice.api.system import SystemRoutes
 from dragon_voice.api.debug_channel import DebugChannelRoutes
 from dragon_voice.api.video_inject import VideoInjectRoutes
+from dragon_voice.api.coredumps import CoredumpRoutes  # W4-D
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,7 @@ def setup_all_routes(
     scheduler_mgr: Any = None,
     get_active_conn_dict: Callable[[], dict[str, Any]] | None = None,  # #177
     get_gateway_connector: Callable[[], Any] | None = None,  # W7-B.2
+    server: Any = None,  # W4-D: coredump scraper config + LAST_RESULTS lookup
 ) -> None:
     """Register all API route modules on the aiohttp app.
 
@@ -70,6 +72,12 @@ def setup_all_routes(
     AgentSkillsRoutes(connector_getter=get_gateway_connector).register(app)
     # W5-A: daily spend rollup from api_usage events
     SpendRoutes(db).register(app)
+    # W4-D: Dragon-side coredump archive (populated by the scraper task).
+    # Registered unconditionally so the empty-list shape is queryable even
+    # when the scraper is disabled — operators can poke /api/v1/coredumps
+    # to confirm the route exists before flipping `coredump_scraper.enabled`.
+    if server is not None:
+        CoredumpRoutes(server).register(app)
 
     # Media endpoints (TTS synthesis, STT transcription, OTA)
     if voice_config:

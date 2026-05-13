@@ -127,6 +127,69 @@ class TestAgentLogIntegration(_BaseRingTest):
         self.assertIn(ack["platform_message_id"], entry["result"])
         self.assertIn('"ok": true', entry["result"])
 
+
+class TestConnectorDispatch(_BaseRingTest):
+    """W7-F.2 scaffold: handler dispatches via injected ChannelConnector."""
+
+    async def test_connector_override_param_used(self):
+        from dragon_voice.channels import ChannelReplyResult
+
+        class RecordingConnector:
+            def __init__(self) -> None:
+                self.calls: list = []
+
+            async def send_reply(self, channel, thread_id, text, in_reply_to=""):
+                self.calls.append((channel, thread_id, text, in_reply_to))
+                return ChannelReplyResult(
+                    ok=True, platform_message_id="recorded:abc123"
+                )
+
+        rec = RecordingConnector()
+        cmd = {
+            "channel": "wa",
+            "thread_id": "wa:99",
+            "text": "via recorder",
+            "in_reply_to": "wa:99:42",
+        }
+        ack = await handle_channel_reply(
+            cmd, self.ws, "ws", self.logger, connector=rec
+        )
+        self.assertEqual(len(rec.calls), 1)
+        self.assertEqual(rec.calls[0], ("wa", "wa:99", "via recorder", "wa:99:42"))
+        self.assertEqual(ack["platform_message_id"], "recorded:abc123")
+        self.assertTrue(ack["ok"])
+
+    async def test_connector_failure_surfaces_in_ack(self):
+        from dragon_voice.channels import ChannelReplyResult
+
+        class FailingConnector:
+            async def send_reply(self, channel, thread_id, text, in_reply_to=""):
+                return ChannelReplyResult(
+                    ok=False,
+                    platform_message_id="",
+                    error="rate limit hit",
+                )
+
+        cmd = {"channel": "tg", "thread_id": "t", "text": "hi"}
+        ack = await handle_channel_reply(
+            cmd, self.ws, "ws", self.logger, connector=FailingConnector()
+        )
+        self.assertFalse(ack["ok"])
+        self.assertEqual(ack["error"], "rate limit hit")
+        # agent_log result must also record the failure for visibility.
+        with _alog._lock:
+            entry = list(_alog._ring)[0]
+        self.assertIn("rate limit hit", entry["result"])
+        self.assertIn('"ok": false', entry["result"])
+
+    async def test_default_module_connector_is_mock(self):
+        from dragon_voice.channel_reply_handler import get_connector
+        from dragon_voice.channels import MockConnector
+
+        # Module-level singleton initialises to MockConnector — the
+        # boot default until W7-F.2 swaps in a real one.
+        self.assertIsInstance(get_connector(), MockConnector)
+
     async def test_source_bucket_appears_in_feed_summary(self):
         cmd = {"channel": "tg", "thread_id": "t", "text": "hi"}
         await handle_channel_reply(cmd, self.ws, "ws", self.logger)

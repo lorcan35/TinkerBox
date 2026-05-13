@@ -45,6 +45,7 @@ def setup_all_routes(
     media_url_signer: Any = None,
     scheduler_mgr: Any = None,
     get_active_conn_dict: Callable[[], dict[str, Any]] | None = None,  # #177
+    get_gateway_connector: Callable[[], Any] | None = None,  # W7-B.2
 ) -> None:
     """Register all API route modules on the aiohttp app.
 
@@ -63,7 +64,10 @@ def setup_all_routes(
     # W7-B (audit 2026-05-11): agent-skill catalog for mode-3 Tab5.
     # Merges a known-static OpenClaw core-tool list with any tool names
     # observed in the agent_log ring.
-    AgentSkillsRoutes().register(app)
+    # W7-B.2: when a gateway connector is wired (via W7-F.2 startup),
+    # the route live-polls `skills.status` via WS-RPC with a 60 s TTL
+    # cache and falls back to the static+observed shape on any failure.
+    AgentSkillsRoutes(connector_getter=get_gateway_connector).register(app)
     # W5-A: daily spend rollup from api_usage events
     SpendRoutes(db).register(app)
 

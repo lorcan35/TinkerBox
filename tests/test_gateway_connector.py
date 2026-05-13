@@ -105,17 +105,39 @@ class FakeGateway:
         self.send_handler: Callable[[dict], tuple[bool, Optional[dict], str]] = (
             self._default_send_handler
         )
+        # W7-B.2: skills.status handler.  Default returns the canonical
+        # 8 W7-B core tools so connector tests run green out-of-the-box.
+        self.skills_status_handler: Callable[
+            [dict], tuple[bool, Optional[dict], str]
+        ] = self._default_skills_status_handler
         # Captured for assertions.
         self.last_connect_params: Optional[dict] = None
         self.last_send_params: Optional[dict] = None
+        self.last_skills_status_params: Optional[dict] = None
         self.last_challenge_nonce: str = ""
         self.connect_count: int = 0
         self.send_count: int = 0
+        self.skills_status_count: int = 0
 
     def _default_send_handler(
         self, params: dict
     ) -> tuple[bool, Optional[dict], str]:
         return True, {"messageId": f"fake-{uuid.uuid4().hex[:8]}"}, ""
+
+    def _default_skills_status_handler(
+        self, params: dict
+    ) -> tuple[bool, Optional[dict], str]:
+        return True, {
+            "agentId": params.get("agentId") or "default",
+            "skills": [
+                {"name": "bash", "description": "Shell exec",
+                 "disabled": False, "bundled": True, "skillKey": "bash"},
+                {"name": "web_search", "description": "Search the web",
+                 "disabled": False, "bundled": True, "skillKey": "web_search"},
+                {"name": "remember", "description": "Store user facts",
+                 "disabled": False, "bundled": True, "skillKey": "remember"},
+            ],
+        }, ""
 
     async def handle(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse()
@@ -183,6 +205,21 @@ class FakeGateway:
                         "type": "res", "id": req_id, "ok": False,
                         "error": {"code": "SEND_FAILED",
                                   "message": err or "send failed"},
+                    })
+            elif method == "skills.status":
+                self.skills_status_count += 1
+                self.last_skills_status_params = params
+                ok, payload, err = self.skills_status_handler(params)
+                if ok:
+                    await ws.send_json({
+                        "type": "res", "id": req_id, "ok": True,
+                        "payload": payload or {},
+                    })
+                else:
+                    await ws.send_json({
+                        "type": "res", "id": req_id, "ok": False,
+                        "error": {"code": "SKILLS_STATUS_FAILED",
+                                  "message": err or "skills.status failed"},
                     })
             else:
                 # Unknown method — return generic failure
@@ -574,3 +611,110 @@ class TestLoadOrCreateIdentityPersistence:
         assert len(ident.device_id) == 64
 
 
+
+
+# ── W7-B.2: fetch_skills_status RPC ────────────────────────────────────
+
+
+class TestFetchSkillsStatus(AioHTTPTestCase):
+    """W7-B.2: ``skills.status`` RPC round-trip + parsing.
+
+    Same in-process FakeGateway as TestGatewayConnectorIntegration above;
+    this class scopes to the new method so failures in send_reply or
+    handshake stay separable.
+    """
+
+    async def get_application(self) -> web.Application:
+        self.gateway = FakeGateway()
+        app = web.Application()
+        app.router.add_get("/", self.gateway.handle)
+        return app
+
+    def _make_connector(self, *, token: str = "test-token", timeout: float = 2.0) -> GatewayConnector:
+        url = f"ws://127.0.0.1:{self.server.port}/"
+        return GatewayConnector(
+            url=url,
+            token=token,
+            client_id="test-client",
+            rpc_timeout_s=timeout,
+            identity=_make_test_identity(),
+        )
+
+    async def test_happy_path_returns_parsed_skills(self) -> None:
+        connector = self._make_connector()
+        try:
+            result = await connector.fetch_skills_status()
+            assert result.ok is True
+            assert result.error == ""
+            names = [s["name"] for s in result.skills]
+            assert "bash" in names
+            assert "web_search" in names
+            assert "remember" in names
+            for s in result.skills:
+                assert "name" in s
+                assert "description" in s
+                assert "disabled" in s
+                assert "bundled" in s
+                assert "skillKey" in s
+            assert self.gateway.skills_status_count == 1
+        finally:
+            await connector.close()
+
+    async def test_agent_id_forwarded_to_gateway(self) -> None:
+        connector = self._make_connector()
+        try:
+            await connector.fetch_skills_status(agent_id="my-agent")
+            assert self.gateway.last_skills_status_params.get("agentId") == "my-agent"
+        finally:
+            await connector.close()
+
+    async def test_empty_agent_id_omitted_from_params(self) -> None:
+        connector = self._make_connector()
+        try:
+            await connector.fetch_skills_status(agent_id="")
+            assert "agentId" not in (self.gateway.last_skills_status_params or {})
+        finally:
+            await connector.close()
+
+    async def test_rpc_failure_returns_clean_error(self) -> None:
+        connector = self._make_connector()
+        self.gateway.skills_status_handler = (
+            lambda params: (False, None, "missing scope: operator.read")
+        )
+        try:
+            result = await connector.fetch_skills_status()
+            assert result.ok is False
+            assert result.skills == []
+            assert "operator.read" in result.error
+        finally:
+            await connector.close()
+
+    async def test_malformed_payload_handled_gracefully(self) -> None:
+        connector = self._make_connector()
+        self.gateway.skills_status_handler = (
+            lambda params: (True, {"skills": "not a list"}, "")
+        )
+        try:
+            result = await connector.fetch_skills_status()
+            assert result.ok is False
+            assert "malformed" in result.error
+        finally:
+            await connector.close()
+
+    async def test_entries_without_name_skipped(self) -> None:
+        connector = self._make_connector()
+        self.gateway.skills_status_handler = (
+            lambda params: (True, {"skills": [
+                {"name": "valid_skill", "description": "ok"},
+                {"description": "anonymous tool"},
+                {"name": "", "description": "empty name"},
+                {"name": "another_valid", "description": "ok"},
+            ]}, "")
+        )
+        try:
+            result = await connector.fetch_skills_status()
+            assert result.ok is True
+            names = [s["name"] for s in result.skills]
+            assert names == ["valid_skill", "another_valid"]
+        finally:
+            await connector.close()

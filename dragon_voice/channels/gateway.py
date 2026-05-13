@@ -117,6 +117,22 @@ class _PendingCall:
     sent_at: float = field(default_factory=time.monotonic)
 
 
+@dataclass
+class SkillsStatusResult:
+    """W7-B.2: result envelope for the ``skills.status`` RPC.
+
+    ``skills`` is a list of dicts with stable keys: ``name``,
+    ``description``, ``disabled``, ``bundled``, ``skillKey``.  When
+    ``ok=False``, ``skills`` is empty and ``error`` describes why.
+    Callers should fall back to a static list when ``ok=False`` so the
+    Tab5 surface stays populated.
+    """
+
+    ok: bool
+    skills: list[dict[str, Any]]
+    error: str = ""
+
+
 class GatewayConnector:
     """WS-RPC connector to a loopback OpenClaw gateway.
 
@@ -239,6 +255,74 @@ class GatewayConnector:
             ok=True,
             platform_message_id=platform_id,
         )
+
+    async def fetch_skills_status(
+        self,
+        agent_id: Optional[str] = None,
+    ) -> "SkillsStatusResult":
+        """W7-B.2: live-poll the gateway for the agent's skills catalog.
+
+        Calls the ``skills.status`` RPC (see
+        ``openclaw/src/gateway/server-methods/skills.ts``).  Returns a
+        ``SkillsStatusResult`` with the parsed skill entries or an error
+        message — never raises.  Caller decides whether to fall back to
+        a static list when the connector is unreachable / unauthorized.
+
+        Params:
+          agent_id: Optional gateway-side agent id.  Empty/None lets the
+            gateway resolve its default agent.
+        """
+        try:
+            await self._ensure_connected()
+        except Exception as e:  # noqa: BLE001 — surface to result, not crash
+            logger.warning("gateway: connect failed for skills.status: %s", e)
+            return SkillsStatusResult(
+                ok=False,
+                skills=[],
+                error=f"gateway_unreachable: {e}",
+            )
+
+        params: dict[str, Any] = {}
+        if agent_id:
+            params["agentId"] = agent_id
+
+        result = await self._rpc("skills.status", params)
+        if not result.ok:
+            return SkillsStatusResult(
+                ok=False,
+                skills=[],
+                error=result.error or "skills_status_failed",
+            )
+
+        payload = result.payload or {}
+        raw_skills = payload.get("skills") if isinstance(payload, dict) else None
+        if not isinstance(raw_skills, list):
+            # OpenClaw schema guarantees the field, but tolerate
+            # forward-compat shape drift rather than crashing.
+            return SkillsStatusResult(
+                ok=False,
+                skills=[],
+                error="skills_status_malformed",
+            )
+
+        parsed: list[dict[str, Any]] = []
+        for entry in raw_skills:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            parsed.append({
+                "name": name.strip(),
+                "description": entry.get("description") or "",
+                "disabled": bool(entry.get("disabled")),
+                "bundled": bool(entry.get("bundled")),
+                # Preserve the gateway-side skillKey when present — Tab5
+                # can use it later to fire skill-invoke RPCs (W7-D).
+                "skillKey": entry.get("skillKey") or name.strip(),
+            })
+
+        return SkillsStatusResult(ok=True, skills=parsed)
 
     async def close(self) -> None:
         """Tear down the WS + any pending RPCs.  Idempotent."""

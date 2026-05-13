@@ -135,6 +135,13 @@ async def run_startup(server: Any, app: web.Application) -> None:
         # `_scheduler_mgr = None` if init failed so the guard in
         # setup_all_routes does the right thing.
         scheduler_mgr=getattr(server, "_scheduler_mgr", None),
+        # W7-B.2: live skills.status polling needs the gateway
+        # connector.  Wired below (W7-F.2 channel-gateway init flips
+        # server._gateway_connector from None to the real connector).
+        # `agent_skills.py` calls the getter at request time, so it
+        # sees whatever connector is live at *that* moment — including
+        # any future hot-swap.
+        get_gateway_connector=lambda: getattr(server, "_gateway_connector", None),
     )
 
     # SOLID-audit follow-up: notes module + tool registration

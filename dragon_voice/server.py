@@ -815,6 +815,33 @@ class VoiceServer:
                     elif cmd_type == "config_ack":
                         logger.debug("Connection %s: config_ack %s", ws_id, cmd.get("applied"))
 
+                    elif cmd_type == "channel_reply":
+                        # W7-F stub (TT #471 round-trip closure): Tab5 sends real
+                        # channel_reply frames via voice_send_channel_reply.  Real
+                        # gateway forwarding lives in W7-F.2 (Python WS-RPC client
+                        # to OpenClaw); for now ACK with ok=true so Tab5's
+                        # "Replied via X" toast fires naturally without needing
+                        # a Tab5-side debug-inject simulation.  Logs to events
+                        # table when a session is attached so the dashboard can
+                        # show channel-reply history.
+                        ch = cmd.get("channel", "")
+                        thread = cmd.get("thread_id", "")
+                        text = cmd.get("text", "")
+                        in_reply_to = cmd.get("in_reply_to", "")
+                        logger.info(
+                            "channel_reply RX: ws=%s ch=%s thread=%s text=%.60s in_reply_to=%s",
+                            ws_id, ch, thread, text, in_reply_to,
+                        )
+                        import secrets as _secrets
+                        ack = {
+                            "type": "channel_reply_ack",
+                            "channel": ch,
+                            "thread_id": thread,
+                            "ok": True,
+                            "platform_message_id": f"stub:{_secrets.token_hex(6)}",
+                        }
+                        await ws.send_json(ack)
+
                     else:
                         logger.warning("Unknown command from %s: %s", ws_id, cmd_type)
 

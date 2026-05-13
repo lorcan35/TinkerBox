@@ -20,6 +20,7 @@ from dragon_voice.api.media_routes import MediaRoutes
 from dragon_voice.api.synthesize import SynthesizeRoutes
 from dragon_voice.api.completions import CompletionRoutes
 from dragon_voice.api.system import SystemRoutes
+from dragon_voice.api.debug_channel import DebugChannelRoutes
 from dragon_voice.api.video_inject import VideoInjectRoutes
 
 logger = logging.getLogger(__name__)
@@ -87,6 +88,10 @@ def setup_all_routes(
     # session_id back to the live ws handle.
     if get_active_conn_dict:
         VideoInjectRoutes(get_active_conn_dict).register(app)
+        # W7-F stub (closes round-trip with TT W7-E.4b): synthetic
+        # channel_message push so we can exercise Tab5's notification
+        # surface end-to-end without the full WS-RPC gateway client.
+        DebugChannelRoutes(get_active_conn_dict).register(app)
 
     # Agentic routes (Sprint 2 — registered when available)
     if tool_registry:

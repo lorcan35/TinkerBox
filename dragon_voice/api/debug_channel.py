@@ -34,6 +34,8 @@ from typing import Callable
 
 from aiohttp import web
 
+from dragon_voice.api import agent_log
+
 logger = logging.getLogger(__name__)
 
 
@@ -116,6 +118,36 @@ class DebugChannelRoutes:
             frame.get("priority", ""),
             match.get("device_id", ""),
             match.get("session_id", ""),
+        )
+
+        # W7-F symmetry follow-up: record the outbound push in the
+        # cross-session agent_log feed.  Mirrors what
+        # channel_reply_handler does for the inbound side, so Tab5's
+        # Agents overlay shows both halves of the channel traffic via
+        # the W7-A.3-Tab5 source counter.  source="channel_push" keeps
+        # the bucket separate from "user_reply" (replies the user
+        # dictated) and "dragon"/"gateway" (auto-fired tool calls).
+        sender_name = ""
+        if isinstance(frame.get("sender"), dict):
+            sender_name = str(frame["sender"].get("display_name", ""))
+        agent_log.record_call(
+            "channel_message_push",
+            {
+                "channel": frame.get("channel", ""),
+                "sender": sender_name,
+                "priority": frame.get("priority", ""),
+                "preview": (frame.get("preview") or frame.get("text") or "")[:80],
+            },
+            source="channel_push",
+        )
+        agent_log.record_result(
+            "channel_message_push",
+            {
+                "ok": True,
+                "device_id": match.get("device_id", ""),
+            },
+            execution_ms=0,
+            source="channel_push",
         )
 
         return web.json_response(

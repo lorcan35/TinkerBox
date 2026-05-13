@@ -832,13 +832,39 @@ class VoiceServer:
                             "channel_reply RX: ws=%s ch=%s thread=%s text=%.60s in_reply_to=%s",
                             ws_id, ch, thread, text, in_reply_to,
                         )
-                        import secrets as _secrets
+                        # W7-F follow-up: record the reply in the cross-session
+                        # agent_log feed so it surfaces in Tab5's Agents overlay
+                        # alongside Dragon + gateway tool calls.  source="user_reply"
+                        # bucket separates these from auto-fired tool calls so
+                        # the dashboard can render them differently if it wants
+                        # (Tab5 already has the dragon/gateway/other source
+                        # counter from W7-A.3 + W7-A.3-Tab5).
+                        from dragon_voice.api import agent_log
+                        platform_msg_id = f"stub:{__import__('secrets').token_hex(6)}"
+                        agent_log.record_call(
+                            "channel_reply",
+                            {
+                                "channel": ch,
+                                "thread_id": thread,
+                                "text_preview": text[:80],
+                            },
+                            source="user_reply",
+                        )
+                        agent_log.record_result(
+                            "channel_reply",
+                            {
+                                "ok": True,
+                                "platform_message_id": platform_msg_id,
+                            },
+                            execution_ms=0,
+                            source="user_reply",
+                        )
                         ack = {
                             "type": "channel_reply_ack",
                             "channel": ch,
                             "thread_id": thread,
                             "ok": True,
-                            "platform_message_id": f"stub:{_secrets.token_hex(6)}",
+                            "platform_message_id": platform_msg_id,
                         }
                         await ws.send_json(ack)
 

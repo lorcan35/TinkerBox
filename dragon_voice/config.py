@@ -223,7 +223,11 @@ class ChannelGatewayConfig:
     # process.  Set explicitly only if the gateway is configured with
     # distinct tokens per client role.
     token: str = ""
-    client_id: str = "tinkerbox-dragon"
+    # Must match the OpenClaw `GATEWAY_CLIENT_IDS` enum
+    # (see openclaw/src/gateway/protocol/client-info.ts).  "gateway-client"
+    # is the generic backend id and matches the TypeScript reference client's
+    # default for backend-mode connections.
+    client_id: str = "gateway-client"
 
 
 @dataclass

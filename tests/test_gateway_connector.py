@@ -198,7 +198,14 @@ class TestGatewayConnectorIntegration(AioHTTPTestCase):
             cp = self.gateway.last_connect_params
             assert cp is not None
             assert cp["auth"]["token"] == "test-token"
-            assert cp["role"] == "agent.runner"
+            assert cp["role"] == "operator"
+            # `send` requires WRITE scope per openclaw method-scopes.ts;
+            # the connector includes WRITE alongside READ + ADMIN so
+            # ancillary probes don't fail the gate.
+            assert "operator.write" in cp["scopes"]
+            # client.id must be one of the OpenClaw enum values; the
+            # generic backend default is "gateway-client".
+            assert cp["client"]["id"] == "test-client"  # set in _make_connector
         finally:
             await connector.close()
 

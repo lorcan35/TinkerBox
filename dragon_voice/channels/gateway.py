@@ -49,10 +49,15 @@ from dragon_voice.channels.base import ChannelReplyResult
 
 logger = logging.getLogger(__name__)
 
-# OpenClaw gateway protocol version — must match ``PROTOCOL_VERSION``
-# in ``openclaw/src/gateway/protocol/index.ts``.  Bump in lockstep
-# with the gateway when the wire shape changes.
-GATEWAY_PROTOCOL_VERSION = 1
+# OpenClaw gateway protocol negotiation window.  The server enforces
+# ``maxProtocol >= PROTOCOL_VERSION >= minProtocol`` (see
+# ``openclaw/src/gateway/protocol/schema/protocol-schemas.ts``).
+# Quote a generous range so a server bump within the [MIN, MAX] window
+# doesn't require a connector redeploy.  ``MAX`` should be raised in
+# lockstep with the gateway when the wire shape changes incompatibly;
+# ``MIN`` stays at 1 (the lowest server-supported version).
+GATEWAY_PROTOCOL_MIN = 1
+GATEWAY_PROTOCOL_MAX = 3
 
 # Per-RPC budget.  Sends to Telegram/WhatsApp/etc. round-trip in
 # <1 s on the happy path; 15 s leaves comfortable headroom for cold
@@ -106,7 +111,7 @@ class GatewayConnector:
         *,
         url: str = "ws://127.0.0.1:18789",
         token: str,
-        client_id: str = "tinkerbox-dragon",
+        client_id: str = "gateway-client",
         client_version: str = "0.1.0",
         rpc_timeout_s: float = DEFAULT_RPC_TIMEOUT_S,
         session: Optional[aiohttp.ClientSession] = None,
@@ -241,17 +246,32 @@ class GatewayConnector:
         )
 
     async def _handshake(self) -> None:
+        # W7-F.3: role + client.id + scopes must satisfy the OpenClaw gateway
+        # validators (see openclaw src/gateway/protocol/client-info.ts +
+        # role-policy.ts + method-scopes.ts).
+        #   * role     ∈ {"operator", "node"}.  "operator" is the right
+        #                role for a backend that invokes operator-tier
+        #                methods like `send`.
+        #   * client.id ∈ GATEWAY_CLIENT_IDS enum.  "gateway-client" is
+        #                the generic backend id — matches what the OpenClaw
+        #                TypeScript reference client (gateway/client.ts:447)
+        #                uses by default for backend-mode connections.
+        #   * scopes   — `send` is gated on `operator.write`; include `read`
+        #                + `admin` too so future health / status probes don't
+        #                fail the gate.  (`operator.admin` does NOT
+        #                transitively grant `write` — they're independent
+        #                bags in METHOD_SCOPE_GROUPS.)
         connect_params = {
-            "minProtocol": GATEWAY_PROTOCOL_VERSION,
-            "maxProtocol": GATEWAY_PROTOCOL_VERSION,
+            "minProtocol": GATEWAY_PROTOCOL_MIN,
+            "maxProtocol": GATEWAY_PROTOCOL_MAX,
             "client": {
                 "id": self._client_id,
                 "version": self._client_version,
                 "platform": "linux",
                 "mode": "backend",
             },
-            "role": "agent.runner",
-            "scopes": ["operator.admin"],
+            "role": "operator",
+            "scopes": ["operator.read", "operator.write", "operator.admin"],
             "auth": {"token": self._token},
             "caps": [],
         }

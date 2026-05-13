@@ -402,5 +402,169 @@ class TestAgentLogBridge(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(entries), 1)
 
 
+# ── W7-G: gateway browser source bucketing ────────────────────────────
+
+
+class TestGatewayBrowserSourceClassifier(unittest.TestCase):
+    """W7-G: pure-function classifier maps gateway tool names to a
+    bucketed source string.  Pulled out as a tiny unit so we can lock
+    the contract before exercising it end-to-end through the SSE
+    flush helpers (covered in TestGatewayBrowserSource below)."""
+
+    def test_bare_browser_is_browser_bucket(self):
+        from dragon_voice.llm.tinkerclaw_llm import _classify_gateway_source
+        self.assertEqual(_classify_gateway_source("browser"), "gateway_browser")
+
+    def test_underscore_namespace_is_browser_bucket(self):
+        from dragon_voice.llm.tinkerclaw_llm import _classify_gateway_source
+        # OpenClaw + tooling test fixtures show `browser_actions` as a
+        # real surface (see tool-mutation.test.ts).
+        self.assertEqual(
+            _classify_gateway_source("browser_actions"), "gateway_browser",
+        )
+        self.assertEqual(
+            _classify_gateway_source("browser_open"), "gateway_browser",
+        )
+
+    def test_dotted_namespace_is_browser_bucket(self):
+        from dragon_voice.llm.tinkerclaw_llm import _classify_gateway_source
+        # Forward-compat for "browser.click", "browser.navigate", etc.
+        self.assertEqual(
+            _classify_gateway_source("browser.click"), "gateway_browser",
+        )
+        self.assertEqual(
+            _classify_gateway_source("browser.navigate"), "gateway_browser",
+        )
+
+    def test_case_insensitive_match(self):
+        from dragon_voice.llm.tinkerclaw_llm import _classify_gateway_source
+        self.assertEqual(_classify_gateway_source("Browser"), "gateway_browser")
+        self.assertEqual(_classify_gateway_source("BROWSER"), "gateway_browser")
+        self.assertEqual(
+            _classify_gateway_source("Browser_Actions"), "gateway_browser",
+        )
+
+    def test_unrelated_tools_stay_in_gateway_bucket(self):
+        from dragon_voice.llm.tinkerclaw_llm import _classify_gateway_source
+        self.assertEqual(_classify_gateway_source("bash"), "gateway")
+        self.assertEqual(_classify_gateway_source("web_search"), "gateway")
+        self.assertEqual(_classify_gateway_source("remember"), "gateway")
+        self.assertEqual(_classify_gateway_source("read_file"), "gateway")
+        # `browser`-prefixed but NOT a browser tool — must not false-fire.
+        # The rule is exact match or `browser_`/`browser.` separator.
+        self.assertEqual(_classify_gateway_source("browserify"), "gateway")
+        self.assertEqual(_classify_gateway_source("browseractivity"), "gateway")
+
+    def test_empty_and_none_fall_through_to_gateway(self):
+        from dragon_voice.llm.tinkerclaw_llm import _classify_gateway_source
+        self.assertEqual(_classify_gateway_source(""), "gateway")
+        self.assertEqual(_classify_gateway_source("   "), "gateway")
+        # Tolerate None — the SSE buffer can hand us empty names if the
+        # upstream stream drops mid-frame.
+        self.assertEqual(_classify_gateway_source(None), "gateway")  # type: ignore[arg-type]
+
+
+class TestGatewayBrowserSourceEndToEnd(unittest.IsolatedAsyncioTestCase):
+    """W7-G: when the SSE parser flushes a tool call whose name is
+    `browser` (or a `browser_*` / `browser.*` namespace), the
+    agent_log ring records source=gateway_browser so /api/v1/agent_log
+    can bucket browser activity separately from generic gateway work.
+    """
+
+    async def asyncSetUp(self):
+        from dragon_voice.api import agent_log as _alog
+        self._alog = _alog
+        with _alog._lock:
+            self._saved_ring = list(_alog._ring)
+            self._saved_next = _alog._next_id
+            _alog._ring.clear()
+            _alog._next_id = 1
+
+    async def asyncTearDown(self):
+        with self._alog._lock:
+            self._alog._ring.clear()
+            for item in self._saved_ring:
+                self._alog._ring.append(item)
+            self._alog._next_id = self._saved_next
+
+    async def test_browser_flush_records_browser_source(self):
+        be = _NoInitBackend()
+        buf = {0: {"id": "x", "name": "browser",
+                   "arguments": '{"action":"tabs"}'}}
+        await be._flush_tool_calls(buf, set())
+        with self._alog._lock:
+            entries = list(self._alog._ring)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["tool"], "browser")
+        self.assertEqual(entries[0]["source"], "gateway_browser")
+        self.assertEqual(entries[0]["status"], "running")
+
+    async def test_browser_actions_flush_records_browser_source(self):
+        be = _NoInitBackend()
+        buf = {0: {"id": "x", "name": "browser_actions",
+                   "arguments": '{"action":"list"}'}}
+        await be._flush_tool_calls(buf, set())
+        with self._alog._lock:
+            entries = list(self._alog._ring)
+        self.assertEqual(entries[0]["source"], "gateway_browser")
+
+    async def test_dotted_browser_flush_records_browser_source(self):
+        be = _NoInitBackend()
+        buf = {0: {"id": "x", "name": "browser.click",
+                   "arguments": '{"selector":"#submit"}'}}
+        await be._flush_tool_calls(buf, set())
+        with self._alog._lock:
+            entries = list(self._alog._ring)
+        self.assertEqual(entries[0]["source"], "gateway_browser")
+
+    async def test_non_browser_flush_stays_in_gateway_bucket(self):
+        # Sanity check: pre-W7-G behavior preserved for non-browser tools.
+        be = _NoInitBackend()
+        buf = {
+            0: {"id": "a", "name": "bash", "arguments": '{"cmd":"ls"}'},
+            1: {"id": "b", "name": "web_search", "arguments": '{"q":"x"}'},
+        }
+        await be._flush_tool_calls(buf, set())
+        with self._alog._lock:
+            entries = list(self._alog._ring)
+        sources = {e["tool"]: e["source"] for e in entries}
+        self.assertEqual(sources["bash"], "gateway")
+        self.assertEqual(sources["web_search"], "gateway")
+
+    async def test_synthetic_result_uses_browser_source(self):
+        # _emit_synthetic_results must classify the same way so the
+        # done-marker flips the matching gateway_browser running entry,
+        # NOT spawn a synthetic gateway-bucket entry alongside it.
+        be = _NoInitBackend()
+        # Seed a running browser call.
+        buf = {0: {"id": "x", "name": "browser", "arguments": "{}"}}
+        await be._flush_tool_calls(buf, set())
+        await be._emit_synthetic_results(["browser"])
+        with self._alog._lock:
+            entries = list(self._alog._ring)
+        # Exactly one entry, source=gateway_browser, status=done.
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["source"], "gateway_browser")
+        self.assertEqual(entries[0]["status"], "done")
+
+    async def test_mixed_burst_yields_two_source_buckets(self):
+        # Realistic mode-3 turn: gateway fires `browser` + `web_search`
+        # in the same flush.  agent_log must split them into two
+        # source buckets, both tagged as gateway-flavored.
+        be = _NoInitBackend()
+        buf = {
+            0: {"id": "a", "name": "browser",
+                "arguments": '{"action":"tabs"}'},
+            1: {"id": "b", "name": "web_search",
+                "arguments": '{"q":"esp32-p4"}'},
+        }
+        await be._flush_tool_calls(buf, set())
+        with self._alog._lock:
+            entries = list(self._alog._ring)
+        sources = {e["tool"]: e["source"] for e in entries}
+        self.assertEqual(sources["browser"], "gateway_browser")
+        self.assertEqual(sources["web_search"], "gateway")
+
+
 if __name__ == "__main__":
     unittest.main()

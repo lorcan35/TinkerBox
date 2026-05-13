@@ -142,6 +142,10 @@ async def run_startup(server: Any, app: web.Application) -> None:
         # sees whatever connector is live at *that* moment — including
         # any future hot-swap.
         get_gateway_connector=lambda: getattr(server, "_gateway_connector", None),
+        # W4-D: pass the server handle so /api/v1/coredumps can read
+        # `_config.coredump_scraper.save_dir` + LAST_RESULTS for last
+        # per-target scrape outcomes.
+        server=server,
     )
 
     # SOLID-audit follow-up: notes module + tool registration

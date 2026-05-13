@@ -93,6 +93,25 @@ def init_background_tasks(server: Any) -> None:
         rss, server._mem_warn_mb, server._mem_crit_mb,
     )
 
+    # W4-D (audit 2026-05-11): Dragon-side Tab5 coredump scraper.  Only
+    # spawned when `coredump_scraper.enabled=true` in config.yaml.
+    # `scraper_loop` self-no-ops when disabled, but we also gate here so
+    # the task handle isn't created at all on a disabled deploy.
+    server._coredump_scraper_task = None
+    if getattr(server._config, "coredump_scraper", None) and \
+       server._config.coredump_scraper.enabled:
+        from dragon_voice import coredump_scraper as _cd
+        server._coredump_scraper_task = asyncio.create_task(
+            _cd.scraper_loop(server)
+        )
+        n = len(server._config.coredump_scraper.targets)
+        logger.info(
+            "W4-D coredump scraper task spawned (%d target%s, "
+            "interval=%.0fs)",
+            n, "" if n == 1 else "s",
+            server._config.coredump_scraper.poll_interval_s,
+        )
+
 
 async def _run_startup_purge_then_loop(
     server: Any,

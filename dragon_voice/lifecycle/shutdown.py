@@ -66,6 +66,15 @@ async def run_shutdown(server: Any, app: web.Application) -> None:
         except (asyncio.CancelledError, Exception):
             pass
 
+    # W4-D: cancel coredump scraper.  Same cancel-then-await pattern.
+    cd_task = getattr(server, "_coredump_scraper_task", None)
+    if cd_task is not None and not cd_task.done():
+        cd_task.cancel()
+        try:
+            await cd_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
     # Phase 5 ε1a (issue #128): cancel scheduler tasks BEFORE pipeline
     # drain so an in-flight notification fire doesn't race with a
     # closed WS.  Pattern matches the cancel-then-await discipline

@@ -231,6 +231,46 @@ class ChannelGatewayConfig:
 
 
 @dataclass
+class CoredumpScraperTarget:
+    """W4-D: one Tab5 to poll for coredumps."""
+
+    device_id: str = ""              # Stable id (Tab5 NVS `device_id`); used as folder name + dedupe key
+    host: str = ""                    # LAN IP or hostname (e.g. "192.168.1.90")
+    port: int = 8080                  # Tab5 debug-server port
+    token: str = ""                   # Bearer for `/coredump` (Tab5 NVS `auth_tok`)
+
+
+@dataclass
+class CoredumpScraperConfig:
+    """W4-D (audit 2026-05-11): Dragon-side coredump scraper.
+
+    Periodically polls each Tab5 in `targets` for a coredump on flash.
+    When `coredump_present=true` per `/info`, pulls the body via
+    `/coredump` and archives it under `save_dir/{device_id}/`.  Pre-W4-D
+    coredumps only existed on Tab5 flash until a human manually curled
+    them — operators saw a `SW` reset and had no on-disk dump to symbolicate.
+
+    Default `enabled: false` so existing deploys stay unchanged.  Set
+    `enabled: true` + a non-empty `targets` list to opt in.
+    """
+
+    enabled: bool = False
+    poll_interval_s: float = 60.0     # one full target sweep per minute
+    request_timeout_s: float = 10.0   # per-request HTTP timeout (info + coredump)
+    # Default lives under /home/radxa/tinkerclaw/ because Dragon's systemd
+    # hardening drop-in (W14-H14) sets `ProtectHome=read-only` + a
+    # narrow `ReadWritePaths` whitelist; /home/radxa/tinkerclaw is on the
+    # list, /home/radxa/tab5-coredumps is not.  Operators on un-hardened
+    # deploys can override to anywhere.
+    save_dir: str = "/home/radxa/tinkerclaw/tab5-coredumps"
+    # Optional path to the deployed firmware ELF for auto-symbolicate.
+    # If empty or non-readable, the scraper still archives the raw bin
+    # — symbolication is a nice-to-have, not a gate.
+    firmware_elf: str = ""
+    targets: list[CoredumpScraperTarget] = field(default_factory=list)
+
+
+@dataclass
 class VoiceConfig:
     """Top-level configuration container."""
 
@@ -245,6 +285,9 @@ class VoiceConfig:
     billing: BillingConfig = field(default_factory=BillingConfig)
     channel_gateway: ChannelGatewayConfig = field(
         default_factory=ChannelGatewayConfig,
+    )
+    coredump_scraper: CoredumpScraperConfig = field(
+        default_factory=CoredumpScraperConfig,
     )
 
     # β-arch (issue #123): protocol-level transition flag for the
@@ -346,6 +389,25 @@ def _dict_to_dataclass(section_cls, data: dict):
     return section_cls(**filtered)
 
 
+def _build_coredump_scraper_cfg(data: dict) -> CoredumpScraperConfig:
+    """W4-D: build `CoredumpScraperConfig` with a typed `targets` list.
+
+    `_dict_to_dataclass` would leave `targets` as a list of plain dicts;
+    we need each entry to be a `CoredumpScraperTarget`.  Unknown
+    per-target keys are silently dropped (forward-compat).
+    """
+    targets_raw = data.get("targets") or []
+    targets: list[CoredumpScraperTarget] = []
+    if isinstance(targets_raw, list):
+        for t in targets_raw:
+            if isinstance(t, dict):
+                targets.append(_dict_to_dataclass(CoredumpScraperTarget, t))
+    base = {k: v for k, v in data.items() if k != "targets"}
+    cfg = _dict_to_dataclass(CoredumpScraperConfig, base)
+    cfg.targets = targets
+    return cfg
+
+
 def load_config(path: Optional[str] = None) -> VoiceConfig:
     """Load configuration from YAML file with environment variable overrides.
 
@@ -375,7 +437,7 @@ def load_config(path: Optional[str] = None) -> VoiceConfig:
     # Ensure all sections exist
     for section in (
         "server", "stt", "tts", "llm", "audio", "tools", "memory",
-        "database", "channel_gateway",
+        "database", "channel_gateway", "coredump_scraper",
     ):
         raw.setdefault(section, {})
 
@@ -395,6 +457,7 @@ def load_config(path: Optional[str] = None) -> VoiceConfig:
         channel_gateway=_dict_to_dataclass(
             ChannelGatewayConfig, raw["channel_gateway"],
         ),
+        coredump_scraper=_build_coredump_scraper_cfg(raw["coredump_scraper"]),
     )
 
     # Wave 13 C2: DRAGON_API_TOKEN env var sets the REST bearer token without

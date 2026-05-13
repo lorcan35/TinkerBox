@@ -114,6 +114,16 @@ async def run_shutdown(server: Any, app: web.Application) -> None:
     if server._proxy_session and not server._proxy_session.closed:
         await server._proxy_session.close()
 
+    # W7-F.2: close the gateway connector's WS + session if it was
+    # opted-in at startup.  No-op when MockConnector is still active.
+    _gw = getattr(server, "_gateway_connector", None)
+    if _gw is not None:
+        try:
+            await _gw.close()
+        except Exception:
+            logger.debug("GatewayConnector shutdown raised", exc_info=True)
+        server._gateway_connector = None
+
     # Shut down foundation
     if server._notes_svc:
         await server._notes_svc.shutdown()

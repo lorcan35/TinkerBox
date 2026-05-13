@@ -134,4 +134,5 @@ jobs:
             tests/test_agent_skills_api.py \
             tests/test_channel_reply_handler.py \
             tests/test_debug_channel_push.py \
-            tests/test_channels_mock.py
+            tests/test_channels_mock.py \
+            tests/test_gateway_connector.py

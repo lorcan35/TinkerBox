@@ -157,4 +157,47 @@ async def run_startup(server: Any, app: web.Application) -> None:
     )
     init_background_tasks(server)
 
+    # W7-F.2: swap the boot-default MockConnector for a real WS-RPC
+    # gateway connector when channel_gateway.enabled is set.  Lazy
+    # connect — failure here is only logged so a downed gateway
+    # doesn't block Dragon boot; send_reply() will retry per-call.
+    _init_channel_gateway(server)
+
     logger.info("Foundation modules initialized")
+
+
+def _init_channel_gateway(server: Any) -> None:
+    """Wire the gateway connector if channel_gateway.enabled is True.
+
+    Reads ``channel_gateway.token`` (falling back to
+    ``llm.tinkerclaw_token`` since both point at the same loopback
+    gateway process).  Failure to construct the connector — missing
+    token, bad URL — logs at WARNING and leaves the default
+    MockConnector in place so reply ACKs still succeed locally.
+    """
+    cg = getattr(server._config, "channel_gateway", None)
+    if cg is None or not getattr(cg, "enabled", False):
+        return
+    token = (cg.token or "").strip() or (server._config.llm.tinkerclaw_token or "").strip()
+    if not token:
+        logger.warning(
+            "channel_gateway.enabled=True but no token configured "
+            "(channel_gateway.token / llm.tinkerclaw_token both empty) — "
+            "staying on MockConnector",
+        )
+        return
+    try:
+        from dragon_voice.channel_reply_handler import set_connector
+        from dragon_voice.channels import GatewayConnector
+        connector = GatewayConnector(
+            url=cg.url,
+            token=token,
+            client_id=cg.client_id,
+        )
+        set_connector(connector)
+        server._gateway_connector = connector
+        logger.info("W7-F.2: channel_reply connector swapped to GatewayConnector(url=%s)", cg.url)
+    except Exception:
+        logger.exception(
+            "channel_gateway init failed — staying on MockConnector",
+        )

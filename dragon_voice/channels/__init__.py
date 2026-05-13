@@ -31,10 +31,12 @@ from dragon_voice.channels.base import (
     ChannelConnector,
     ChannelReplyResult,
 )
+from dragon_voice.channels.gateway import GatewayConnector
 from dragon_voice.channels.mock import MockConnector
 
 __all__ = [
     "ChannelConnector",
     "ChannelReplyResult",
+    "GatewayConnector",
     "MockConnector",
 ]

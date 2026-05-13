@@ -203,6 +203,30 @@ class MemoryConfig:
 
 
 @dataclass
+class ChannelGatewayConfig:
+    """W7-F.2: OpenClaw gateway WS-RPC connector settings.
+
+    The gateway runs as a sibling process on the Dragon machine (port
+    18789, loopback-only).  When ``enabled`` is True, server startup
+    swaps ``MockConnector`` for ``GatewayConnector`` so Tab5-originated
+    ``channel_reply`` frames actually forward to Telegram/WhatsApp/etc.
+
+    Default is OFF — keeping the existing mock-only behavior until an
+    operator deliberately turns it on.  This lets the connector ship
+    without disrupting any active session.
+    """
+
+    enabled: bool = False
+    url: str = "ws://127.0.0.1:18789"
+    # Reuses the same shared secret as ``llm.tinkerclaw_token`` by
+    # default when blank — both auth surfaces target the same gateway
+    # process.  Set explicitly only if the gateway is configured with
+    # distinct tokens per client role.
+    token: str = ""
+    client_id: str = "tinkerbox-dragon"
+
+
+@dataclass
 class VoiceConfig:
     """Top-level configuration container."""
 
@@ -215,6 +239,9 @@ class VoiceConfig:
     memory: MemoryConfig = field(default_factory=MemoryConfig)
     database: DatabaseConfig = field(default_factory=DatabaseConfig)
     billing: BillingConfig = field(default_factory=BillingConfig)
+    channel_gateway: ChannelGatewayConfig = field(
+        default_factory=ChannelGatewayConfig,
+    )
 
     # β-arch (issue #123): protocol-level transition flag for the
     # progress event bus.  When True (default), migrated emitters

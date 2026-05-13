@@ -1710,3 +1710,97 @@ Migrated emitters in the Dragon server send BOTH the legacy ad-hoc event AND the
 
 `stt`, `llm`, `tts`, and `media_render` phases are intentionally out of scope for this PR — they're deeply wired into Tab5's audio + chat-bubble rendering and need more careful migration. Their phase entries are reserved in the enum so tooling that switches on `Phase` doesn't break when they land.
 
+---
+
+## 20. Channel Messaging (W7-E / W7-F)
+
+The channel-messaging surface lets a third-party messaging platform (Telegram, WhatsApp, Discord, etc.) deliver a message to Tab5 via Dragon, and lets the user reply back through the same path.  W7-E (Tab5 side) implements the rendering + reply UI; W7-F (Dragon side) implements the WS plumbing.  Real platform connectors land later (W7-F.2 — Python WS-RPC client to OpenClaw gateway).
+
+### 20.1 channel_message (Dragon -> Tab5)
+
+```json
+{
+  "type": "channel_message",
+  "channel": "tg",
+  "message_id": "tg:8675309:42",
+  "thread_id": "tg:8675309",
+  "sender": {"display_name": "Jamie Park", "starred": true},
+  "text": "Are you still on for lunch Thursday?",
+  "preview": "Are you still on for lunch Thursday?",
+  "ts": 1715568000,
+  "priority": "high",
+  "needs_reply": true,
+  "metadata": {"platform_thread_url": "https://t.me/c/..."}
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | string | `"channel_message"` |
+| `channel` | string | Short canonical platform name (`tg`, `wa`, `dc`, `sl`, `sg`, `im`, `ma`, `em`).  Maps to NVS `ch_*_on` toggle on Tab5 (see TinkerTab CLAUDE.md). |
+| `message_id` | string | Globally unique id; Tab5 dedupes against a 32-entry PSRAM ring. |
+| `thread_id` | string | Used for reply routing (carried back in `channel_reply.thread_id`). |
+| `sender.display_name` | string | Sender name surfaced in toast + now-card kicker. |
+| `sender.starred` | bool | If true, Tab5 routes the message to the now-card surface regardless of `priority`. |
+| `text` | string | Full message body. |
+| `preview` | string | Short version for the toast surface; falls back to `text` when absent. |
+| `priority` | string | `low` / `normal` / `high`.  `high` → now-card; lower → toast. |
+| `needs_reply` | bool | Force now-card routing.  Implies user wants to react. |
+| `metadata` | object | Free-form; Tab5 ignores unknown fields. |
+
+**Tab5 behavior:**
+1. Drop if `channel` is set AND `tab5_settings_get_channel_enabled(channel)` is false (Settings → CHANNELS toggle).
+2. Drop if `message_id` already seen in the 32-entry dedupe ring.
+3. Route to now-card (priority=high OR sender.starred OR needs_reply) or toast.
+4. Fire `UI_CUE_INCOMING_HIGH` / `UI_CUE_INCOMING_LOW` unless quiet-hours active.
+
+### 20.2 channel_reply (Tab5 -> Dragon)
+
+```json
+{
+  "type": "channel_reply",
+  "channel": "tg",
+  "thread_id": "tg:8675309",
+  "text": "yes lunch thurs works, 12:30 ok?",
+  "in_reply_to": "tg:8675309:42"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | string | `"channel_reply"` |
+| `channel` | string | Mirrors the inbound `channel`. |
+| `thread_id` | string | Mirrors the inbound `thread_id`. |
+| `text` | string | The user's reply text — either a voice-dictated transcript (W7-E.4b) or programmatic quick-ack (W7-E.4 legacy). |
+| `in_reply_to` | string | Optional `message_id` the user is replying to. |
+
+**Dragon behavior (W7-F stub):**
+1. Log the receive.
+2. Emit `channel_reply_ack` with `ok=true` and a `stub:<hex>` `platform_message_id`.
+3. Real platform forwarding (Telegram send-message API etc.) is W7-F.2 — the stub closes the round-trip so Tab5's "Replied via X" toast fires naturally.
+
+### 20.3 channel_reply_ack (Dragon -> Tab5)
+
+```json
+{
+  "type": "channel_reply_ack",
+  "channel": "tg",
+  "thread_id": "tg:8675309",
+  "ok": true,
+  "platform_message_id": "tg:8675309:43"
+}
+```
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | string | `"channel_reply_ack"` |
+| `channel` | string | Mirrors the reply's `channel`. |
+| `thread_id` | string | Mirrors the reply's `thread_id`. |
+| `ok` | bool | True on successful delivery (or stub-acknowledged). |
+| `platform_message_id` | string | Platform-assigned message id on success; `stub:<hex>` from the W7-F stub. |
+| `error` | string | Present when `ok=false`; surfaced as a Tab5 toast. |
+
+**Tab5 behavior:**
+1. On `ok=true` → toast "Replied via {channel}" + obs `ui.notif.reply ack_ok`.
+2. On `ok=false` → toast "Reply failed: {error}" + obs `ui.notif.reply ack_fail`.
+

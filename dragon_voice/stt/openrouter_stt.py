@@ -124,3 +124,29 @@ class OpenRouterSTTBackend(STTBackend):
     @property
     def name(self) -> str:
         return f"OpenRouter STT ({MODEL})"
+
+    async def health_check(self, timeout_s: float = 2.0) -> tuple[bool, str]:
+        """W4-B: cheap reachability probe — `GET {base_url}/models`.
+
+        Same probe as the LLM backend; bearer-authed via session header.
+        Catches auth misconfig (401) + transport errors so operators see
+        the OpenRouter side of the cloud-mode stack honestly.
+        """
+        if not self._api_key:
+            return False, "no api key"
+        if self._session is None or self._session.closed:
+            return False, "session not initialized"
+        try:
+            async with self._session.get(
+                f"{self._base_url}/models",
+                timeout=aiohttp.ClientTimeout(total=timeout_s),
+            ) as resp:
+                if resp.status == 200:
+                    return True, f"{self._base_url}"
+                return False, f"HTTP {resp.status}"
+        except asyncio.TimeoutError:
+            return False, f"timeout after {timeout_s}s"
+        except aiohttp.ClientError as e:
+            return False, str(e)[:120]
+        except Exception as e:  # noqa: BLE001
+            return False, f"{type(e).__name__}: {e}"[:120]

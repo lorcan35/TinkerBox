@@ -265,6 +265,27 @@ class TinkerClawBackend(LLMBackend):
         self._health_cache_until = now + HEALTH_CACHE_TTL_S
         return ok
 
+    async def health_check(self, timeout_s: float = 2.0) -> tuple[bool, str]:
+        """W4-B: surface the cached gateway-health probe to `/health`.
+
+        Reuses the existing `is_healthy()` 30 s cache so a /health hit
+        every few seconds doesn't re-probe the gateway each time — the
+        operator gets a near-realtime answer with stable load.
+        `timeout_s` is informational here (the underlying probe budget
+        is `HEALTH_CHECK_TIMEOUT_S=5`); we honor `timeout_s` only for
+        the cache-lookup path (which is sub-ms anyway).
+        """
+        try:
+            ok = await asyncio.wait_for(
+                self.is_healthy(force=False),
+                timeout=max(timeout_s, HEALTH_CHECK_TIMEOUT_S + 0.5),
+            )
+        except asyncio.TimeoutError:
+            return False, f"timeout after {timeout_s}s"
+        except Exception as e:  # noqa: BLE001 — must never raise
+            return False, f"{type(e).__name__}: {e}"[:120]
+        return (True, f"{self._url}") if ok else (False, "gateway /health not 200")
+
     def set_session_key(self, session_key: str) -> None:
         """Set the session key for conversation continuity.
 

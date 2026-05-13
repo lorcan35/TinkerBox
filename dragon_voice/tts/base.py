@@ -40,3 +40,16 @@ class TTSBackend(ABC):
     def name(self) -> str:
         """Human-readable backend name for logging and status pages."""
         ...
+
+    async def health_check(self, timeout_s: float = 2.0) -> tuple[bool, str]:
+        """W4-B: cheap reachability probe surfaced by `GET /health`.
+
+        Default returns `(True, "no probe")` so local/in-process backends
+        (Piper, Kokoro) don't need to override — they're considered
+        healthy as long as `initialize()` returned without raising.
+        Network-backed backends (OpenRouter TTS, Edge TTS) override to
+        actually round-trip a cheap request within `timeout_s`.
+
+        Must never raise — wrap exceptions and report as (False, str(e)).
+        """
+        return True, "no probe"

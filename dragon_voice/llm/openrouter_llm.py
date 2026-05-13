@@ -79,6 +79,32 @@ class OpenRouterBackend(LLMBackend):
         except aiohttp.ClientError as e:
             logger.warning("Cannot reach OpenRouter: %s", e)
 
+    async def health_check(self, timeout_s: float = 2.0) -> tuple[bool, str]:
+        """W4-B: cheap reachability probe — `GET {base_url}/models`.
+
+        Bearer-authed via the session's stored Authorization header.  A
+        non-200 surfaces as not-ok with the status code; auth misconfig
+        bubbles up here too (401 → operators see it in /health).
+        """
+        if not self._api_key:
+            return False, "no api key"
+        if self._session is None or self._session.closed:
+            return False, "session not initialized"
+        try:
+            async with self._session.get(
+                f"{self._base_url}/models",
+                timeout=aiohttp.ClientTimeout(total=timeout_s),
+            ) as resp:
+                if resp.status == 200:
+                    return True, f"{self._base_url}"
+                return False, f"HTTP {resp.status}"
+        except asyncio.TimeoutError:
+            return False, f"timeout after {timeout_s}s"
+        except aiohttp.ClientError as e:
+            return False, str(e)[:120]
+        except Exception as e:  # noqa: BLE001 — must never raise
+            return False, f"{type(e).__name__}: {e}"[:120]
+
     async def _stream_messages(
         self, messages: list[dict], _retried: bool = False,
     ) -> AsyncIterator[str]:

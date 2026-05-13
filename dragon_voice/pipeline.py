@@ -329,8 +329,45 @@ class VoicePipeline:
             self._on_tool_call is not None
             and hasattr(self._llm, "set_tool_event_handler")
         ):
+            # W7-C memory bridge: wrap the caller's on_tool_call so any
+            # gateway-side `remember` tool also mirrors into Dragon's
+            # local memory_facts with source="gateway".  See
+            # dragon_voice/gateway_memory_mirror.py for rationale (the
+            # gateway has no memory.* RPC verb; mirroring is the closest
+            # honest implementation of the "memory bridge" W7-C slot).
+            # Conversation engine carries the memory service handle; if
+            # it's None (no engine or engine without memory) the mirror
+            # is a no-op.
+            from dragon_voice.gateway_memory_mirror import (
+                mirror_gateway_tool_call,
+            )
+            outer_on_tool_call = self._on_tool_call
+            memory_svc = (
+                getattr(self._conversation_engine, "_memory_service", None)
+                if self._conversation_engine is not None
+                else None
+            )
+            session_id_for_mirror = self._session_id
+
+            async def _on_tool_call_with_mirror(call: dict) -> None:
+                # Mirror first so a slow forward (e.g. WS backpressure)
+                # doesn't delay the local write.  Mirror is best-effort;
+                # any failure is logged + swallowed inside the helper.
+                try:
+                    await mirror_gateway_tool_call(
+                        call.get("tool", ""),
+                        call.get("args", {}),
+                        memory_svc,
+                        session_id_for_mirror,
+                    )
+                except Exception:  # noqa: BLE001 — never block stream
+                    logger.exception(
+                        "W7-C: gateway_memory_mirror raised — swallowed",
+                    )
+                await outer_on_tool_call(call)
+
             self._llm.set_tool_event_handler(
-                self._on_tool_call, self._on_tool_result,
+                _on_tool_call_with_mirror, self._on_tool_result,
             )
 
     def set_uplink_codec(self, codec: str) -> str:

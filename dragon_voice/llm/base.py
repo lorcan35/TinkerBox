@@ -130,6 +130,26 @@ class LLMBackend(ABC):
         """
         return frozenset({Modality.TEXT})
 
+    async def health_check(self, timeout_s: float = 2.0) -> tuple[bool, str]:
+        """W4-B: cheap reachability probe surfaced by `GET /health`.
+
+        Default returns `(True, "no probe")` so local/in-process backends
+        (e.g. NPU Genie) don't need to override — they're considered
+        healthy as long as `initialize()` returned without raising.
+        Network-backed backends (Ollama, OpenRouter, TinkerClaw) override
+        to actually round-trip a cheap request within `timeout_s`.
+
+        Returns
+        -------
+        (ok, detail)
+            ok=True  → probe succeeded or none implemented
+            ok=False → reachability failed; `detail` is the error string
+                       (≤ ~120 chars; truncated by the caller for display)
+
+        Must never raise — wrap exceptions and report as (False, str(e)).
+        """
+        return True, "no probe"
+
 
 # ─────────────────────────────────────────────────────────────────────
 # Optional-feature Protocol mixins (#204, Wave 21b).

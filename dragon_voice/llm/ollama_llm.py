@@ -174,6 +174,30 @@ class OllamaBackend(LLMBackend):
                 e,
             )
 
+    async def health_check(self, timeout_s: float = 2.0) -> tuple[bool, str]:
+        """W4-B: cheap reachability probe — `GET {base_url}/api/tags`.
+
+        Cap at `timeout_s` so a stuck Ollama daemon can't stall `/health`.
+        Returns (False, error_text) on any non-200, connect refused, or
+        timeout; never raises.
+        """
+        if self._session is None or self._session.closed:
+            return False, "session not initialized"
+        try:
+            async with self._session.get(
+                f"{self._base_url}/api/tags",
+                timeout=aiohttp.ClientTimeout(total=timeout_s),
+            ) as resp:
+                if resp.status == 200:
+                    return True, f"{self._base_url}"
+                return False, f"HTTP {resp.status}"
+        except asyncio.TimeoutError:
+            return False, f"timeout after {timeout_s}s"
+        except aiohttp.ClientError as e:
+            return False, str(e)[:120]
+        except Exception as e:  # noqa: BLE001 — must never raise
+            return False, f"{type(e).__name__}: {e}"[:120]
+
     async def generate_stream(
         self, prompt: str, system_prompt: str = ""
     ) -> AsyncIterator[str]:

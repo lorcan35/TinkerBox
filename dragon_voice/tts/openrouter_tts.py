@@ -4,6 +4,7 @@ Sends text to OpenRouter's gpt-audio-mini model with audio modality,
 streams pcm16 audio chunks via SSE, returns raw PCM int16 at 24kHz.
 """
 
+import asyncio
 import base64
 import json
 import logging
@@ -144,3 +145,28 @@ class OpenRouterTTSBackend(TTSBackend):
     @property
     def name(self) -> str:
         return f"OpenRouter TTS ({MODEL}, {self._voice})"
+
+    async def health_check(self, timeout_s: float = 2.0) -> tuple[bool, str]:
+        """W4-B: cheap reachability probe — `GET {base_url}/models`.
+
+        Same shape as the LLM + STT OpenRouter backends so all three
+        cloud-mode subsystems share one probe path.
+        """
+        if not self._api_key:
+            return False, "no api key"
+        if self._session is None or self._session.closed:
+            return False, "session not initialized"
+        try:
+            async with self._session.get(
+                f"{self._base_url}/models",
+                timeout=aiohttp.ClientTimeout(total=timeout_s),
+            ) as resp:
+                if resp.status == 200:
+                    return True, f"{self._base_url}"
+                return False, f"HTTP {resp.status}"
+        except asyncio.TimeoutError:
+            return False, f"timeout after {timeout_s}s"
+        except aiohttp.ClientError as e:
+            return False, str(e)[:120]
+        except Exception as e:  # noqa: BLE001
+            return False, f"{type(e).__name__}: {e}"[:120]

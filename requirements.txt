@@ -7,3 +7,6 @@ numpy>=1.24
 # OPUS codec for the voice WS (#173 / TinkerTab #262).  ctypes wrapper
 # around libopus — apt-get install libopus0 on Dragon if needed.
 opuslib>=3.0.1
+# W7-F.4: ed25519 device identity for the OpenClaw gateway WS-RPC
+# handshake (see dragon_voice/channels/device_identity.py).
+cryptography>=42.0.0

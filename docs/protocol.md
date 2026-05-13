@@ -1318,7 +1318,10 @@ strip_rendered_content() → text_update message
 | `clear` | `{"type":"clear"}` | Clear history | `session_start` (new session) |
 | `ping` | `{"type":"ping"}` | Every 15s during PROCESSING/SPEAKING | `pong` |
 | `config_update` | `{"type":"config_update","cloud_mode":true}` | Cloud mode toggle | `config_update` (confirmation) |
+| `config_ack` | `{"type":"config_ack","applied":{...}}` | Tab5 confirming receipt of Dragon's `config_update` response | None (Dragon logs at debug level) |
 | `user_media` | `{"type":"user_media","media_id":"...","media_type":"image","text":"..."}` | Camera photo for multimodal LLM | `llm` -> `llm_done` -> optional TTS |
+| `widget_action` | `{"type":"widget_action","session_id":"...","card_id":"...","event":"..."}` | User tapped a prompt choice / card button (Widget Platform §15) | Skill-specific (delegated to `surface_mgr.handle_action`) |
+| `channel_reply` | `{"type":"channel_reply","channel":"telegram","thread_id":"...","text":"..."}` | User reply to a `channel_message` (W7-E.4 / W7-E.4b — voice-dictated or typed) | `channel_reply_ack` |
 
 ### All Messages: Dragon -> Tab5
 
@@ -1336,6 +1339,8 @@ strip_rendered_content() → text_update message
 | `pong` | `{"type":"pong"}` | In response to ping | None |
 | `config_update` | `{"type":"config_update","config":{"cloud_mode":true,"stt":"...","tts":"...","llm":"..."}}` | After config change | Persist cloud_mode to NVS |
 | `tool_call` | `{"type":"tool_call","tool":"web_search","args":{"query":"..."}}` | During LLM tool execution | Display tool activity indicator |
+| `channel_message` | `{"type":"channel_message","channel":"tg","message_id":"...","thread_id":"...","sender":{"display_name":"...","starred":bool},"text":"...","preview":"...","priority":"low|normal|high","needs_reply":bool}` | Third-party platform message routed through OpenClaw gateway → Dragon → Tab5 (W7-E + W7-F).  Full schema: §20.1 | Route to toast or now-card per W7-E.2 rules; fire `UI_CUE_INCOMING_*` audio cue unless quiet-hours active |
+| `channel_reply_ack` | `{"type":"channel_reply_ack","channel":"telegram","thread_id":"...","ok":bool,"platform_message_id":"...","error":"..."}` | Confirms outcome of a `channel_reply` Tab5 sent (W7-F stub OR real GatewayConnector ACK).  Full schema: §20.3 | On `ok=true` toast "Replied via {channel}"; on `ok=false` show error toast |
 | `tool_result` | `{"type":"tool_result","tool":"web_search","result":{...},"execution_ms":234}` | After tool execution completes | Display tool result, update UI |
 | `dictation_summary` | `{"type":"dictation_summary","title":"...","summary":"..."}` | After dictation post-processing | Store title/summary, update UI |
 | `media` | `{"type":"media","media_type":"image","url":"/api/media/{id}","width":660,"height":N,"alt":"Code: python"}` | After llm_done (rendered code/table/image) | Fetch image, display inline in chat |

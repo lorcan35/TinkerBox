@@ -305,6 +305,68 @@ Tab5 ↔ Dragon ↔ (Tab5 or web) two-way video + audio calls. Dragon is a dumb 
 - **Decoder ready** for Phase 2B Dragon→Tab5 OPUS TTS — Tab5 can decode OPUS frames if Dragon emits them.
 - **Encoder BROKEN on Tab5** — SILK NSQ crash on ESP32-P4 mid-encode. Encoder is gated OFF in TinkerTab `voice_codec.h` pending TinkerTab #264 root-cause. Don't enable the OPUS uplink path until #264 closes.
 
+## Channel Messaging — W7-E (Tab5 surface) + W7-F (Dragon connector) (May 2026)
+
+The channel-messaging surface lets a third-party messaging platform (Telegram,
+WhatsApp, Discord, Slack, Signal, iMessage, Matrix, Email) deliver a message to
+Tab5 via Dragon, and lets the user reply back through the same path.  W7-E owns
+the Tab5 UI (toast / now-card / dedupe / snooze / quiet-hours / voice-dictated
+reply).  W7-F owns the Dragon side (WS dispatcher → channel_reply_ack +
+GatewayConnector → OpenClaw channel plugins).
+
+### Wire frames
+Full schema lives in [`docs/protocol.md`](docs/protocol.md) §20.  Three frame
+types: `channel_message` (Dragon → Tab5), `channel_reply` (Tab5 → Dragon),
+`channel_reply_ack` (Dragon → Tab5).
+
+### Dragon-side modules (W7-F)
+- `dragon_voice/channel_reply_handler.py` — WS dispatcher entry for the
+  `channel_reply` cmd_type.  Logs the receive, builds the ACK frame, calls
+  the GatewayConnector to forward to OpenClaw.
+- `dragon_voice/channels/__init__.py` — package boundary.
+- `dragon_voice/channels/gateway.py` — `GatewayConnector`, the WS-RPC client
+  for OpenClaw's `localhost:18789` gateway.  Signed-connect handshake using
+  ed25519 device identity (W7-F.4), connect.challenge nonce flow, role +
+  scopes (operator + operator.read + operator.write + operator.admin),
+  PROTOCOL_VERSION 3.  `_TAB5_CHANNEL_ALIASES` dict maps Tab5 short codes
+  (`tg`, `wa`, `dc`, `sl`, `sg`, `im`, `ma`, `em`) → OpenClaw canonical
+  plugin names (`telegram`, `whatsapp`, …) — W7-F.5.
+- `dragon_voice/channels/device_identity.py` — ed25519 keypair persistence
+  at `~/.dragon/identity/device.json` (0o600, atomic write, regenerates on
+  corruption).  Mirrors `openclaw/src/infra/device-identity.ts` byte-for-byte
+  including `buildDeviceAuthPayloadV3`.  Loopback + gateway-client + backend
+  + token-auth satisfies `shouldSkipBackendSelfPairing` so no manual pairing
+  approval is needed for a fresh keypair.
+- `dragon_voice/channels/mock.py` — `MockConnector` for tests (in-process
+  fake that records calls + lets the suite assert connector behavior without
+  a running OpenClaw gateway).
+- `dragon_voice/channels/base.py` — abstract `ChannelConnector` interface
+  (`send_reply`, lifecycle hooks).
+- `dragon_voice/api/debug_channel.py` — `POST /api/v1/debug/channel_message`
+  REST endpoint that fans a synthetic frame to a connected Tab5 over the
+  existing voice WS.  Mirrors `api/video_inject.py`'s structure.  Used for
+  Tab5-side notification-surface testing without a real OpenClaw channel
+  plugin loaded.  Records the push as a `channel_push` source entry in
+  `agent_log` so the Tab5 Agents overlay's source counts pick it up.
+
+### Status (2026-05-13)
+The W7-F connector chain is **fully end-to-end functional**: handshake
+succeeds, scopes are granted, channel-name alias maps correctly, and
+`gateway.send` reaches the real platform API.  W7-F.5's live verification
+showed `Error: Telegram send failed: chat not found (chat_id=42)` —
+expected because no real Telegram chat is paired.  A real paired bot will
+round-trip to `ok=true platform_message_id=<real-tg-id>`.
+
+### Live test surface
+- `POST /api/v1/debug/channel_message?device_id=<MAC>` with body
+  `{"channel":"tg","message_id":"…","sender":{"display_name":"…","starred":true},
+   "preview":"…","priority":"high","needs_reply":true}` → Tab5 surfaces the
+  message per its W7-E routing.
+- Tab5's REPLY-button flow (W7-E.4b real voice-dictated) sends `channel_reply`
+  via the existing voice WS → `channel_reply_handler.handle_channel_reply`
+  → `GatewayConnector.send_reply` → OpenClaw plugin → platform API → ACK
+  trace ends with Tab5 obs `ui.notif.reply ack_ok`.
+
 ## OTA Firmware Endpoints
 Dragon serves firmware updates for Tab5 via two endpoints:
 - **GET /api/ota/check?current=VERSION** — compares against `/home/radxa/ota/version.json`, returns `{"update":bool,"version":"...","url":"...","sha256":"..."}`
@@ -386,13 +448,16 @@ etc.) stay below as durable design rules.
 ### Schema
 See `schema.sql` — **11 tables**: 6 foundation (devices, sessions, messages, notes, events, config), 3 memory (memory_facts, memory_documents, memory_chunks), and 2 scheduler (scheduled_notifications, notification_queue).
 
-## API-First Architecture (54 REST endpoints + 1 WebSocket)
+## API-First Architecture (58 REST endpoints + 1 WebSocket)
 
-_Counted from code via per-file grep:
-`for f in dragon_voice/api/*.py dragon_voice/notes/api.py; do grep -c 'app.router.add_' "$f"; done` → 54 total
-(53 was the count before #178 added `/api/video/inject` for the Phase 3B downlink debug injector;
-52 before TT #328 Wave 12 added `/api/v1/agent_log`; 47 before Phase 5 ε1b added the 5 scheduler
-endpoints).  Drifted from "46" to "54" — see wave-14 H23 + TT #328 Wave 12 + #178._
+_Counted 2026-05-13 via:
+`grep -c 'app.router.add_' dragon_voice/api/*.py dragon_voice/notes/api.py | awk -F: '{s+=$2} END {print s}'` → 58.
+W7 sprint added 4 endpoints: `/api/v1/spend` (W5-A cross-stack audit),
+`/api/v1/agent_skills` (W7-B catalog), `/api/v1/debug/channel_message` (W7-F stub
+push), `/api/video/inject` (#178 debug injector — pre-W7 but missed in prior count).
+Prior count was 54 (post-#187 multi-model router); 53 was the count before #178;
+52 before TT #328 Wave 12 added `/api/v1/agent_log`; 47 before Phase 5 ε1b added
+the 5 scheduler endpoints._
 
 Dragon is an API-first server. Every capability is accessible via REST so any hardware client can use it.
 
@@ -453,6 +518,10 @@ Dragon is an API-first server. Every capability is accessible via REST so any ha
 | | GET | `/api/v1/scheduler/notifications/{id}` | Get one notification |
 | | DELETE | `/api/v1/scheduler/notifications/{id}` | Cancel a pending notification |
 | | PATCH | `/api/v1/scheduler/notifications/{id}` | Reschedule (change `when`) |
+| **Spend** | GET | `/api/v1/spend?day=YYYY-MM-DD` | W5-A: daily LLM spend roll-up over the `events` table.  Empty `day` = today UTC.  Backed by `dragon_voice/billing/spend_tracker.py`. |
+| **Agent skills** | GET | `/api/v1/agent_skills` | W7-B: merged catalog of OpenClaw core tools (static 8) + tool names observed in `agent_log`.  Tab5 fetches on Agents-overlay open + on voice-mode change (when overlay visible). |
+| **Channel push (debug)** | POST | `/api/v1/debug/channel_message?device_id=X` | W7-F stub: fan a synthetic `channel_message` JSON frame to a connected Tab5 over the existing voice WS.  Mirrors `video_inject` shape.  Real gateway-driven push lives in W7-F.2's `GatewayConnector` (`dragon_voice/channels/gateway.py`). |
+| **Video (debug)** | POST | `/api/video/inject?device_id=X` | #178: push a JPEG frame as if from a paired Tab5 — exercises the downlink decode + ui_video_pane render path without a second device.  Body = raw JPEG; wraps with VID0 magic + 4-byte BE length. |
 
 ### Agentic Pipeline
 
@@ -511,8 +580,15 @@ dragon_voice/         — Voice pipeline package (port 3502)
   server.py           — VoiceServer class + create_app wiring + WS-voice handler family
                         (register / text / user_media / disconnect / audio + event hooks).
                         ~2,720 LOC (was 1,803 right after #65 decomposition; regrown as
-                        Phase 1-3 UX-gap fixes + multi-model router accreted to the
-                        WS-voice handler family).
+                        Phase 1-3 UX-gap fixes + multi-model router + W7-A/B/F handlers
+                        accreted).  Top-level `dragon_voice/` now has 60+ extracted
+                        sibling modules — see the *_handler.py / *_swap.py / config_*.py /
+                        *_path.py / *_emit.py families directly under the package root.
+                        Find them with `ls dragon_voice/*.py | wc -l`.  Each sibling owns
+                        one concern (config swap guards, config update rate limit,
+                        widget action handler, channel reply handler, vision turn,
+                        local text stream, tinkerclaw text path, etc.) so tests can
+                        import them in isolation without spinning up `VoiceServer`.
   pipeline.py         — STT→LLM→TTS orchestration with VAD + dictation + post-processing
   conversation.py     — Multi-turn ConversationEngine with tool-calling + memory-augmented context
   sessions.py         — SessionManager (create/resume/pause/end lifecycle)
@@ -539,8 +615,8 @@ dragon_voice/         — Voice pipeline package (port 3502)
     purge.py          — periodic_purge_loop (US-DQ14 message retention) + media_cleanup_loop (W13-H3 mid-sleep cancel fix preserved)
     startup.py        — run_startup(server, app): DB → sessions → memory + tools → surfaces → conversation → REST routes → notes → MCP → periodic tasks
     shutdown.py       — run_shutdown(server, app): cancel+await monitors (W14-M09) → drain pipelines → release backend pool (W15-C01) → close HTTP clients (W14-H12)
-  api/                — Modular REST API package (53 endpoints, counted from code)
-    __init__.py       — setup_all_routes() entry point
+  api/                — Modular REST API package (58 endpoints as of 2026-05-13)
+    __init__.py       — setup_all_routes() entry point — wires all route classes
     utils.py          — Shared helpers (json_error, pagination)
     sessions.py       — Session CRUD + lifecycle routes
     messages.py       — Message listing + SSE chat routes
@@ -548,9 +624,29 @@ dragon_voice/         — Voice pipeline package (port 3502)
     config_routes.py  — Config CRUD + delete routes
     events.py         — Events listing with device_id filter
     agent_log.py      — Cross-session tool-call ring buffer + GET /api/v1/agent_log
-                        (TT #328 Wave 12).  Populated at ToolRegistry.execute
-                        chokepoint so all callers (WS conversations, REST tool
-                        execute, dashboard) feed the same log.
+                        (TT #328 Wave 12).  W7-A.3 added `source` field
+                        (dragon/gateway/channel_push/user_reply) so consumers can
+                        bucket activity.  Populated at ToolRegistry.execute
+                        chokepoint + by `debug_channel.py` + `channel_reply_handler.py`.
+    agent_skills.py   — W7-B catalog: GET /api/v1/agent_skills.  Merges static list
+                        of 8 OpenClaw core tools (bash, browser, edit_file, memory,
+                        read_file, search_files, task, web_search) with tool names
+                        observed in agent_log.  Tab5 fetches on Agents-overlay open
+                        + on /mode POST when overlay is visible (W7-B + W7-B.4 +
+                        TT #467 follow-up).
+    debug_channel.py  — W7-F stub: POST /api/v1/debug/channel_message.  Fans
+                        synthetic channel_message frames to a connected Tab5 over
+                        the existing voice WS.  Records the push as `channel_push`
+                        agent_log entry.
+    video_inject.py   — #178 debug-only POST /api/video/inject.  Push a JPEG as if
+                        from a paired Tab5; exercises downlink decode + ui_video_pane
+                        without a second device.  Body = raw JPEG, wraps with VID0
+                        magic + 4-byte BE length.
+    spend.py          — W5-A: GET /api/v1/spend[?day=YYYY-MM-DD].  Daily LLM spend
+                        roll-up over the events table.  Backed by
+                        `dragon_voice/billing/spend_tracker.py`.
+    scheduler.py      — 5 endpoints for the in-process notification scheduler
+                        (RFC-scheduler.md; ε2 store at sqlite for replay).
     synthesize.py     — TTS synthesis + STT transcription + OTA routes
     completions.py    — Direct LLM completion (stateless)
     system.py         — System metrics + backend listing
@@ -602,12 +698,34 @@ dragon_voice/         — Voice pipeline package (port 3502)
     store.py          — InMemoryNotificationStore + SqliteNotificationStore
                         (boot replay + offline queue + snooze; ε2 PR #132)
   surfaces/           — Tab5 widget-surface abstraction (widget_live/card/list/chart/media/prompt)
+  channels/           — W7-F third-party messaging channel infrastructure
+    __init__.py       — Package exports
+    base.py           — `ChannelConnector` abstract base (`send_reply`, lifecycle)
+    gateway.py        — `GatewayConnector` WS-RPC client to OpenClaw `localhost:18789`.
+                        Signed-connect handshake (ed25519 device identity, connect.challenge
+                        nonce, role=operator + operator.read/write/admin scopes,
+                        PROTOCOL_VERSION 3).  `_TAB5_CHANNEL_ALIASES` maps Tab5 short codes
+                        (tg/wa/dc/…) → OpenClaw canonical plugin names (W7-F.5).
+    device_identity.py — ed25519 keypair persistence at `~/.dragon/identity/device.json`
+                        (0o600, atomic write, regenerates on corruption).  Mirrors
+                        `openclaw/src/infra/device-identity.ts` byte-for-byte including
+                        `buildDeviceAuthPayloadV3` canonical-string serialization.
+    mock.py           — In-process `MockConnector` for tests — records `send_reply` calls
+                        + canned ACK shapes, no real gateway needed.
+  channel_reply_handler.py — WS dispatcher entry (W7-F stub).  Handles `cmd_type ==
+                        "channel_reply"` frames: logs receive, forwards to the active
+                        `ChannelConnector`, emits `channel_reply_ack` JSON back to Tab5.
+                        Source-flag agent_log entries as `user_reply`.
   mcp/                — Model Context Protocol client + bridge
-tests/                — Test suite (69 test_*.py files; **556 tests collected** when
-                        running pytest tests/ directly excluding tests/audit/ which needs
-                        pytest-asyncio; the test_api_e2e.py CLI runner contributes another
-                        29 live-Dragon scenarios that don't run in CI.  Last verified
-                        2026-04-28 post-#187 router catalog refresh.)
+tests/                — Test suite (**1533 tests collected** as of 2026-05-13 post-W7
+                        sprint; +977 since the 2026-04-28 baseline thanks to the W7-A
+                        agent_log instrumentation, W7-B agent_skills, W7-F gateway
+                        connector + device-identity + channel-alias suites, W5-A spend
+                        tracker, plus accumulated middleware/router/handler-extraction
+                        coverage).  Verify with
+                        `python3 -m pytest tests/ --collect-only -q --ignore=tests/audit`.
+                        The test_api_e2e.py CLI runner contributes another 29 live-Dragon
+                        scenarios that don't run in CI.
   test_api_e2e.py               — 29 live-device tests (local-only, not CI)
   test_e2e_dragon.py            — Dragon end-to-end (local-only, not CI)
   test_auth_middleware.py       — 6 tests for bearer-token gate (CI)
@@ -660,7 +778,7 @@ live under `dragon_voice/middleware/`, `dragon_voice/handlers/`, or
   - `tests/test_media_store.py` — 12 unit tests for MediaStore (disk storage, cleanup, capacity limits)
   - `tests/test_media_pipeline.py` — 29 unit tests for MediaPipeline (code block detection, table rendering, image URL handling, strip logic)
 
-Aggregate pytest run (excluding `tests/audit/` which needs pytest-asyncio): **556 tests collected, all passing** as of 2026-04-28 (post-#185-#188 multi-model router landing).  Verify with `python3 -m pytest tests/ -q --ignore=tests/audit`.  The CI named-set is a tighter subset of files picked so each can run without a live server; everything else is local-only.
+Aggregate pytest collection (including `tests/audit/`): **1533 tests collected** as of 2026-05-13 (post-W7 sprint).  Verify with `python3 -m pytest tests/ --collect-only -q`.  The CI named-set is a tighter subset of files picked so each can run without a live server; everything else is local-only.  Recent additions: W7-F gateway connector suite (~69 tests across `tests/test_channel_*.py` + `tests/test_gateway_*.py`), W7-A `agent_log` source-field tests, W5-A spend-tracker tests.
 
 ### Dashboard Debug Tab E2E Suite
 - **55 tests** — runnable from the Debug tab in the dashboard

@@ -369,7 +369,10 @@ def load_config(path: Optional[str] = None) -> VoiceConfig:
         )
 
     # Ensure all sections exist
-    for section in ("server", "stt", "tts", "llm", "audio", "tools", "memory", "database"):
+    for section in (
+        "server", "stt", "tts", "llm", "audio", "tools", "memory",
+        "database", "channel_gateway",
+    ):
         raw.setdefault(section, {})
 
     # Apply environment variable overrides
@@ -385,6 +388,9 @@ def load_config(path: Optional[str] = None) -> VoiceConfig:
         tools=_dict_to_dataclass(ToolsConfig, raw["tools"]),
         memory=_dict_to_dataclass(MemoryConfig, raw["memory"]),
         database=_dict_to_dataclass(DatabaseConfig, raw["database"]),
+        channel_gateway=_dict_to_dataclass(
+            ChannelGatewayConfig, raw["channel_gateway"],
+        ),
     )
 
     # Wave 13 C2: DRAGON_API_TOKEN env var sets the REST bearer token without

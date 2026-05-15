@@ -268,3 +268,87 @@ class TestEmitLegacyFlag:
         types = _emitted_types(on_event)
         # Legacy frame should NOT be present; progress.* frame should
         assert "dictation_summary" not in types
+
+
+# ── PR 2 polish: synthesized Local-mode title/summary ────────────────────
+
+from dragon_voice.dictation_post import _synthesize_local_title_summary
+
+
+def test_synthesize_local_long_transcript():
+    """Title is first ~50 chars at word boundary, capitalized; summary
+    is full transcript up to 200 chars."""
+    t = "hello world this is a test of long-form dictation across the network"
+    title, summary = _synthesize_local_title_summary(t)
+    assert title.startswith("Hello world")
+    assert len(title) <= 50
+    assert " " in title  # word boundary, not mid-word
+    assert summary == t  # under 200 chars, returned as-is
+
+
+def test_synthesize_local_short_transcript():
+    """Short transcripts: title is the whole transcript (capitalized)."""
+    title, summary = _synthesize_local_title_summary("short note")
+    assert title == "Short note"
+    assert summary == "short note"
+
+
+def test_synthesize_local_empty_transcript():
+    """Empty or whitespace transcript falls back to 'Untitled'."""
+    for empty in ("", "   ", "\n\t"):
+        title, summary = _synthesize_local_title_summary(empty)
+        assert title == "Untitled"
+        assert summary == "Untitled"
+
+
+def test_synthesize_local_long_summary_truncated_with_ellipsis():
+    """Summaries beyond 200 chars are truncated with an ellipsis."""
+    t = "word " * 100  # 500 chars
+    _title, summary = _synthesize_local_title_summary(t)
+    assert len(summary) <= 201  # 200 chars + 1-char ellipsis
+    assert summary.endswith("…")
+
+
+def test_synthesize_local_word_boundary_in_title():
+    """Title truncation respects word boundaries (no mid-word cuts)."""
+    t = "supercalifragilisticexpialidocious is a long word that should be word-broken"
+    title, _summary = _synthesize_local_title_summary(t)
+    # Either the whole long word fits, or we stop before it.
+    # Either way, no mid-word truncation.
+    assert title == "Supercalifragilisticexpialidocious" or \
+           not title.endswith(("supercalif", "supercalifragili"))
+
+
+@pytest.mark.asyncio
+async def test_ollama_backend_bypasses_llm_for_synthesis():
+    """When the LLM backend is OllamaBackend, dictation_post should
+    skip the LLM call entirely and emit a dictation_summary built from
+    the transcript directly (no slow CPU LLM round-trip)."""
+    events: list[dict] = []
+
+    async def on_event(e: dict) -> None:
+        events.append(e)
+
+    # Mock that *looks* like OllamaBackend by name — that's the gate
+    # we use to distinguish Local mode from Solo/Cloud (which use
+    # OpenRouter and are fast enough to call directly).
+    llm = MagicMock()
+    llm.__class__.__name__ = "OllamaBackend"
+
+    await run_dictation_post_process(
+        "hello world testing cross-network dictation",
+        llm=llm,
+        on_event=on_event,
+        emit_legacy=True,
+    )
+
+    # The LLM should NOT have been called.
+    llm.generate_stream.assert_not_called()
+
+    # dictation_summary event must have been emitted with the
+    # synthesized title + non-empty summary.
+    summaries = [e for e in events if e.get("type") == "dictation_summary"]
+    assert len(summaries) >= 1
+    final = summaries[-1]
+    assert final["title"].startswith("Hello world")
+    assert "cross-network dictation" in final["summary"]

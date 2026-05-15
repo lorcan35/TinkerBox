@@ -63,13 +63,40 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Awaitable, Callable, Optional
 
+from dragon_voice.dictation_classifier import classify_dictation
 from dragon_voice.errors import Scope, Severity
 from dragon_voice.progress import Phase, Stage
 from dragon_voice.progress_emit import emit_progress_pair
 
 logger = logging.getLogger(__name__)
+
+
+def _classify_safe(transcript: str) -> dict:
+    """Run the heuristic classifier with a wall-clock guard + fail-soft.
+
+    The classifier is meant to be ~10 ms; if it ever wanders into the
+    hundred-millisecond range we want to know AND we want to keep
+    dictation_summary flowing.  Returns the empty result on any error.
+    """
+    started = time.monotonic()
+    try:
+        # Local TZ for "Tuesday at 6 PM"-style parsing.  Dragon runs in
+        # the user's local zone; pull it from /etc/timezone-ish.
+        try:
+            tz_name = time.tzname[time.daylight] if time.daylight else time.tzname[0]
+        except Exception:
+            tz_name = "UTC"
+        result = classify_dictation(transcript, tz_name=tz_name)
+    except Exception:
+        logger.exception("classify_dictation crashed — skipping proposed_action")
+        return {"kind": "none", "confidence": 0.0, "payload": {}}
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    if elapsed_ms > 50:
+        logger.warning("classify_dictation took %d ms (target <10 ms)", elapsed_ms)
+    return result
 
 
 OnEvent = Callable[[dict], Awaitable[None]]
@@ -185,17 +212,25 @@ async def run_dictation_post_process(
     backend_name = type(llm).__name__
     if backend_name == 'OllamaBackend':
         title, summary = _synthesize_local_title_summary(transcript)
-        logger.info('Dictation summary (Local-mode synthesized): title=%r summary_len=%d', title, len(summary))
+        # PR 4: heuristic classifier → optional proposed_action chip.
+        proposed = _classify_safe(transcript)
+        logger.info(
+            'Dictation summary (Local-mode synthesized): title=%r summary_len=%d kind=%s conf=%.2f',
+            title, len(summary), proposed['kind'], proposed['confidence'],
+        )
+        legacy_frame: dict[str, Any] = {
+            'type': 'dictation_summary',
+            'title': title,
+            'summary': summary,
+        }
+        if proposed['kind'] != 'none':
+            legacy_frame['proposed_action'] = proposed
         await emit_progress_pair(
             on_event,
-            legacy={
-                'type': 'dictation_summary',
-                'title': title,
-                'summary': summary,
-            },
+            legacy=legacy_frame,
             phase=Phase.DICTATION_POST,
             stage=Stage.DONE,
-            payload={'title': title, 'summary': summary},
+            payload={'title': title, 'summary': summary, 'proposed_action': proposed},
             emit_legacy=emit_legacy,
         )
         return
@@ -211,20 +246,28 @@ async def run_dictation_post_process(
 
         title, summary = _parse_title_summary(response, transcript)
 
-        logger.info("Dictation summary: title='%s'", title)
+        # PR 4: heuristic classifier → optional proposed_action chip.
+        proposed = _classify_safe(transcript)
+        logger.info(
+            "Dictation summary: title='%s' kind=%s conf=%.2f",
+            title, proposed['kind'], proposed['confidence'],
+        )
+        legacy_frame: dict[str, Any] = {
+            "type": "dictation_summary",
+            "title": title,
+            "summary": summary,
+        }
+        if proposed['kind'] != 'none':
+            legacy_frame['proposed_action'] = proposed
         # β-arch (#123): legacy `dictation_summary` carries
         # title/summary at the top level; the new progress
         # frame nests them in `payload` so the bus is uniform.
         await emit_progress_pair(
             on_event,
-            legacy={
-                "type": "dictation_summary",
-                "title": title,
-                "summary": summary,
-            },
+            legacy=legacy_frame,
             phase=Phase.DICTATION_POST,
             stage=Stage.DONE,
-            payload={"title": title, "summary": summary},
+            payload={"title": title, "summary": summary, "proposed_action": proposed},
             emit_legacy=emit_legacy,
         )
     except asyncio.CancelledError:

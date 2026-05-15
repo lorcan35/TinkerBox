@@ -97,6 +97,36 @@ _DEFAULT_TITLE = "Untitled Note"
 _DEFAULT_SUMMARY_TRUNCATE = 200
 
 
+# PR 2 polish (long-form cross-network resilience):
+# When the resolved LLM is the local Ollama backend, skip the LLM call
+# and synthesize the title + summary directly from the transcript.
+# Ollama on Dragon's CPU takes 60-90 s for the 'TITLE: ... SUMMARY: ...'
+# prompt — long enough that ngrok closes the idle WS tunnel before the
+# response is ready, leaving Tab5 stuck at TRANSCRIBING forever.
+# The auto-created note's first-line-as-title is good enough for Local
+# mode; Solo / Cloud modes still go through the LLM (OpenRouter is fast).
+def _synthesize_local_title_summary(transcript: str) -> tuple[str, str]:
+    transcript = (transcript or '').strip() or 'Untitled'
+    words = transcript.split()
+    title = ''
+    for w in words:
+        if len(title) + len(w) + 1 > 50:
+            break
+        nxt = (title + ' ' + w).strip()
+        title = nxt
+        if title.count(' ') >= 7:
+            break
+    if not title:
+        title = transcript[:50].strip()
+    # Capitalize first letter for note title polish.
+    if title and not title[0].isupper():
+        title = title[0].upper() + title[1:]
+    summary = transcript[:200].strip()
+    if len(transcript) > 200:
+        summary = summary.rstrip() + '…'
+    return title, summary
+
+
 async def run_dictation_post_process(
     transcript: str,
     *,
@@ -143,6 +173,29 @@ async def run_dictation_post_process(
             message="Note saved — summary unavailable (LLM offline)",
             severity=Severity.TRANSIENT,
             scope=Scope.LLM,
+            emit_legacy=emit_legacy,
+        )
+        return
+
+
+    # PR 2 polish: short-circuit for Local mode (OllamaBackend).
+    # Synthesize title/summary from the transcript instead of calling
+    # the slow CPU LLM — fires dictation_summary immediately so the
+    # pipeline reaches SAVED before the ngrok WS idle-close window.
+    backend_name = type(llm).__name__
+    if backend_name == 'OllamaBackend':
+        title, summary = _synthesize_local_title_summary(transcript)
+        logger.info('Dictation summary (Local-mode synthesized): title=%r summary_len=%d', title, len(summary))
+        await emit_progress_pair(
+            on_event,
+            legacy={
+                'type': 'dictation_summary',
+                'title': title,
+                'summary': summary,
+            },
+            phase=Phase.DICTATION_POST,
+            stage=Stage.DONE,
+            payload={'title': title, 'summary': summary},
             emit_legacy=emit_legacy,
         )
         return

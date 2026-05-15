@@ -737,7 +737,17 @@ class VoicePipeline:
         self._dictation_mode = False
 
         # Post-process: generate title + summary via LLM (async, non-blocking)
-        # DQ22: store the task so it can be cancelled on shutdown/cancel
+        # DQ22: store the task so it can be cancelled on shutdown/cancel.
+        # PR 2 polish: when transcript is empty/short, emit a final
+        # dictation_summary with empty fields so Tab5's pipeline resolves
+        # (DICT_FAILED/EMPTY) instead of stalling at TRANSCRIBING forever.
+        if not (full_text.strip() and len(full_text) > 20):
+            await self._on_event({
+                "type": "dictation_summary",
+                "title": "",
+                "summary": "",
+            })
+            return full_text
         if full_text.strip() and len(full_text) > 20:
             # v4·D audit P1 fix: cancel any prior post-process task before
             # overwriting the handle.  Two rapid finish_dictation calls

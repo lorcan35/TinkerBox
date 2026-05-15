@@ -19,6 +19,18 @@ sequentially across the whole file (don't restart per section).
 
 ---
 
+## 2026-05-15 — Local-mode dictation_summary hangs: Ollama 60-90 s vs ngrok / WS PONG timeout
+
+- **Date:** 2026-05-15
+- **Symptom:** Long-form dictation in Local mode (voice_mode=0) stays at TRANSCRIBING on Tab5 forever.  Empty/silent dictations also stay TRANSCRIBING with no resolution event ever sent back.
+- **Root Cause:**
+  1. `dictation_post.py::run_dictation_post_process` calls the resolved LLM unconditionally.  With `OllamaBackend` on Dragon CPU, the summary prompt takes 60-90 s — exceeding both aiohttp 30 s server-side PONG timeout *and* ngrok ~60 s idle-WS close.  By the time the LLM streams its reply, the WS is dead.
+  2. `pipeline.py::finish_dictation` gates the post-process call on `full_text.strip() and len(full_text) > 20`.  Empty/short STT emits nothing back to Tab5 — no `dictation_summary`, no `dictation_postprocessing_error` — leaving the pipeline in TRANSCRIBING limbo.
+- **Fix:**
+  1. `dictation_post.py`: detect `type(llm).__name__ == "OllamaBackend"` and synthesize title/summary directly from the transcript.  Solo/Cloud modes still call the LLM normally.
+  2. `pipeline.py`: when transcript is empty/short, emit `{"type":"dictation_summary","title":"","summary":""}` immediately.  Tab5 maps empty-fields → `DICT_FAILED/EMPTY` in <1 s.
+- **Prevention:** Any LLM call that blocks the WS event loop longer than the smallest keepalive in the network path (aiohttp 30 s, ngrok ~60 s) is a violation.  Either (a) skip the LLM, (b) use a faster model, or (c) emit progress frames during the call to keep the WS warm (see `_ws_keepalive_during_inference` for the conversation-engine version of (c)).
+
 ## Dragon/ARM64 Quirks
 
 ### 1. Piper TTS model permissions

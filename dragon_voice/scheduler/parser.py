@@ -47,6 +47,41 @@ _NATURAL = re.compile(
     re.IGNORECASE,
 )
 
+# #330: weekday + time, "Tuesday at 6 PM", "next monday at 9am", "wed at 14:30".
+# Three-letter abbreviations + full names both accepted.  "next" prefix
+# forces at least 7 days out (so "next monday" on a Monday means a week
+# from today, not today).
+_WEEKDAY_NATURAL = re.compile(
+    r"^\s*(?P<next>next\s+)?"
+    r"(?P<wday>mon(?:day)?|tue(?:s|sday)?|wed(?:nesday)?|thu(?:rs|rsday)?|"
+    r"fri(?:day)?|sat(?:urday)?|sun(?:day)?)"
+    r"\s+at\s+(?P<hour>\d{1,2})(?::(?P<min>\d{2}))?\s*(?P<ampm>am|pm)?\s*$",
+    re.IGNORECASE,
+)
+_WEEKDAY_INDEX = {
+    "mon": 0, "monday": 0,
+    "tue": 1, "tues": 1, "tuesday": 1,
+    "wed": 2, "wednesday": 2,
+    "thu": 3, "thurs": 3, "thursday": 3,
+    "fri": 4, "friday": 4,
+    "sat": 5, "saturday": 5,
+    "sun": 6, "sunday": 6,
+}
+
+# #330: time-of-day aliases.  "tomorrow morning" → 09:00, afternoon → 13:00,
+# evening → 19:00.  "tonight" is a synonym for "today evening".
+_TOD_NATURAL = re.compile(
+    r"^\s*(?P<day>today|tomorrow|tonight)"
+    r"(?:\s+(?P<tod>morning|afternoon|evening|night))?\s*$",
+    re.IGNORECASE,
+)
+_TOD_DEFAULT_HOUR = {
+    "morning": 9,
+    "afternoon": 13,
+    "evening": 19,
+    "night": 21,
+}
+
 # Verbose relative phrasing the LLM emits in practice (#136).  Either an
 # `in N <unit>` prefix OR an `N <unit> from now` / `N <unit> later`
 # suffix is required — bare `5 minutes` is intentionally rejected
@@ -132,9 +167,24 @@ def parse_when(
         _check_far_future(fire_at, now=now)
         return fire_at
 
+    # ── 3b. Weekday + time, "Tuesday at 6 PM" (#330) ────────────────
+    fire_at = _try_parse_weekday(s_clean, now=now, tz=tz)
+    if fire_at is not None:
+        _check_past(fire_at, now=now)
+        _check_far_future(fire_at, now=now)
+        return fire_at
+
+    # ── 3c. Time-of-day alias, "tomorrow morning" / "tonight" (#330) ─
+    fire_at = _try_parse_time_of_day(s_clean, now=now, tz=tz)
+    if fire_at is not None:
+        _check_past(fire_at, now=now)
+        _check_far_future(fire_at, now=now)
+        return fire_at
+
     raise ValueError(
         f"could not parse 'when': {s!r} — expected '5m', "
-        f"'in 5 minutes', ISO 8601 timestamp, or 'tomorrow at 3pm' shape"
+        f"'in 5 minutes', ISO 8601 timestamp, 'tomorrow at 3pm', "
+        f"'Tuesday at 6 PM', or 'tomorrow morning' shape"
     )
 
 
@@ -218,6 +268,90 @@ def _try_parse_natural(s: str, *, now: float, tz: tzinfo) -> Optional[float]:
     target_dt = datetime(
         target_date.year, target_date.month, target_date.day,
         hour, minute, 0, tzinfo=tz,
+    )
+    return target_dt.timestamp()
+
+
+def _resolve_clock(hour: int, minute: int, ampm: str, *, src: str) -> tuple[int, int]:
+    """Normalise (hour, minute, ampm) → (hour_24, minute) with bounds check."""
+    ampm = (ampm or "").lower()
+    if ampm == "pm" and hour != 12:
+        hour += 12
+    elif ampm == "am" and hour == 12:
+        hour = 0
+    if not (0 <= hour <= 23) or not (0 <= minute <= 59):
+        raise ValueError(f"invalid hour/minute in natural phrase: {src!r}")
+    return hour, minute
+
+
+def _try_parse_weekday(s: str, *, now: float, tz: tzinfo) -> Optional[float]:
+    """Parse "Tuesday at 6 PM" / "next monday at 9am" / "wed at 14:30".
+
+    Resolution rule: target weekday + time → next future occurrence.
+    "next <weekday>" adds 7 days when the bare resolution would land
+    today or earlier this week, so it's always at least a week out.
+    """
+    m = _WEEKDAY_NATURAL.match(s)
+    if not m:
+        return None
+    next_prefix = bool(m.group("next"))
+    wday_word = m.group("wday").lower()
+    target_wday = _WEEKDAY_INDEX[wday_word]
+    hour, minute = _resolve_clock(
+        int(m.group("hour")), int(m.group("min") or "0"),
+        m.group("ampm") or "", src=s,
+    )
+
+    today_local = datetime.fromtimestamp(now, tz=tz)
+    today_wday = today_local.weekday()  # Mon=0..Sun=6
+    days_ahead = (target_wday - today_wday) % 7
+    # If it's the same weekday AND the requested time is already past
+    # today, push to next week.  ("Monday at 6 PM" said at 8 PM Monday
+    # means a week from now.)
+    if days_ahead == 0:
+        candidate = today_local.replace(
+            hour=hour, minute=minute, second=0, microsecond=0,
+        )
+        if candidate.timestamp() <= now:
+            days_ahead = 7
+    if next_prefix and days_ahead < 7:
+        days_ahead += 7
+    target_date = today_local.date() + timedelta(days=days_ahead)
+    target_dt = datetime(
+        target_date.year, target_date.month, target_date.day,
+        hour, minute, 0, tzinfo=tz,
+    )
+    return target_dt.timestamp()
+
+
+def _try_parse_time_of_day(s: str, *, now: float, tz: tzinfo) -> Optional[float]:
+    """Parse "tomorrow morning" / "tonight" / "today evening".
+
+    Default hours: morning=09:00, afternoon=13:00, evening=19:00,
+    night=21:00.  "tonight" is shorthand for "today evening".  Bare
+    "today" / "tomorrow" without a TOD alias is intentionally rejected
+    here so the caller falls through to a more explicit error than
+    "today" alone could carry.
+    """
+    m = _TOD_NATURAL.match(s)
+    if not m:
+        return None
+    day_word = m.group("day").lower()
+    tod_word = (m.group("tod") or "").lower()
+    # "tonight" implies evening even without a TOD suffix.
+    if day_word == "tonight":
+        target_hour = _TOD_DEFAULT_HOUR["evening"]
+        day_offset = 0
+    else:
+        if not tod_word:
+            return None  # "today" / "tomorrow" alone — too ambiguous
+        target_hour = _TOD_DEFAULT_HOUR[tod_word]
+        day_offset = 1 if day_word == "tomorrow" else 0
+    today_local = datetime.fromtimestamp(now, tz=tz).date()
+    target_date = today_local + timedelta(days=day_offset)
+    target_dt = datetime(
+        target_date.year, target_date.month, target_date.day,
+        target_hour, 0, 0, tzinfo=tz,
     )
     return target_dt.timestamp()
 

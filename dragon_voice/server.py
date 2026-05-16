@@ -1156,6 +1156,7 @@ class VoiceServer:
             media_pipeline=self._media_pipeline,
             ws_keepalive=self._ws_keepalive_during_inference,
             safe_send_json=self._safe_send_json,
+            message_store=self._message_store,
         ):
             return
 

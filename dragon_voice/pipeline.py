@@ -958,12 +958,28 @@ class VoicePipeline:
             # Choose LLM path
             if self._config.llm.backend == "tinkerclaw":
                 # TinkerClaw mode: bypass ConversationEngine entirely.
-                # Send only the latest user message — TinkerClaw owns context.
                 # Wave 21b (#204): isinstance(SupportsSessionKey) over hasattr.
-                if isinstance(self._llm, SupportsSessionKey) and self._session_id:
-                    self._llm.set_session_key(self._session_id)
+                #
+                # #336 follow-up: mic-input TC turns previously sent a bare
+                # `[{user: transcript}]` with no system prompt — so the
+                # model never saw the TOOL USE / VOICE FORMATTING
+                # directives and defaulted to its "I can't access live
+                # data" boilerplate.  Inject the same system prompt the
+                # text path uses (PR #337).  History forwarding is
+                # text-path-only because pipeline doesn't own MessageStore
+                # directly; the gateway-side `user` session key still
+                # provides per-device context continuity.
+                from dragon_voice.tinkerclaw_text_path import _TC_SYSTEM_PROMPT
+                if isinstance(self._llm, SupportsSessionKey):
+                    # Prefer device_id (stable across reconnects) over
+                    # session_id (rotates per WS connect).  Falls back
+                    # to session_id when device_id isn't plumbed.
+                    stable_key = getattr(self, "_device_id", "") or self._session_id or ""
+                    if stable_key:
+                        self._llm.set_session_key(stable_key)
                 llm_stream = self._llm.generate_stream_with_messages([
-                    {"role": "user", "content": transcript}
+                    {"role": "system", "content": _TC_SYSTEM_PROMPT},
+                    {"role": "user", "content": transcript},
                 ])
             elif self._conversation_engine and self._session_id:
                 # Multi-turn: routes through ConversationEngine which stores

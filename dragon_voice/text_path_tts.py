@@ -145,8 +145,26 @@ async def synthesize_and_stream_text_response(
         await ws.send_json({"type": "tts_start"})
         t0 = time.monotonic()
 
+        # #338 follow-up: strip markdown/bullets/code-fences/emojis
+        # BEFORE handing the text to any backend — otherwise Kokoro
+        # cheerfully reads "asterisk asterisk Geneva asterisk asterisk"
+        # out loud.  Was only wired into the voice-mic path
+        # (pipeline.py) and the REST /synthesize path (api/synthesize.py)
+        # in #339 — this is the third call site that synthesizes user-
+        # visible LLM replies, used for TEXT-INPUT TC turns.
+        cleaner_enabled = (
+            getattr(conn_config.tts, "text_cleaner_enabled", True)
+            if conn_config is not None else True
+        )
+        synth_text = response_text
+        if cleaner_enabled:
+            from dragon_voice.tts import clean_for_tts
+            cleaned = clean_for_tts(response_text)
+            if cleaned:
+                synth_text = cleaned
+
         audio_bytes = await asyncio.wait_for(
-            tts.synthesize(response_text),
+            tts.synthesize(synth_text),
             timeout=tts_timeout,
         )
         tts_ms = (time.monotonic() - t0) * 1000

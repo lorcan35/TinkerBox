@@ -1,11 +1,14 @@
-"""Voice-callable tools for Google Calendar (#341 / #342).
+"""Voice-callable tools for Google Calendar (#341 / #342 / #347).
 
 Thin `Tool` wrappers around `GoogleCalendarIntegration` so the LLM in
 any vmode can call `calendar_today`, `calendar_week`, `calendar_create`,
 `calendar_cancel` via the existing ToolRegistry mechanism.
 
-Return shape mirrors the rest of `dragon_voice/tools/` — plain dicts
-that the LLM injects back into context.  `error` key absent = success.
+Multi-account (#347): every tool accepts an optional ``account``
+argument.  When omitted the integration's default account is used.
+For multi-account providers the LLM is encouraged to infer the account
+from natural-language context ("what's on my work calendar tomorrow?"
+→ ``{"account": "<work email>"}``).
 """
 
 from __future__ import annotations
@@ -47,6 +50,17 @@ def _not_connected(action: str) -> dict[str, Any]:
     }
 
 
+_ACCOUNT_ARG_SCHEMA = {
+    "type": "string",
+    "description": (
+        "Optional account id (typically the email).  Omit to use the "
+        "default connected Google account.  Use the user's natural-"
+        "language hint to pick the right one — 'my work calendar' → "
+        "the work email; 'my personal calendar' → the personal email."
+    ),
+}
+
+
 class CalendarTodayTool(Tool):
     """List today's events."""
 
@@ -61,7 +75,8 @@ class CalendarTodayTool(Tool):
         return (
             "List today's events from the user's primary Google Calendar.  "
             "Use when the user asks 'what's on my calendar today' or 'what "
-            "do I have going on today'."
+            "do I have going on today'.  Accepts an optional `account` arg "
+            "for users with multiple connected Google accounts."
         )
 
     @property
@@ -73,12 +88,14 @@ class CalendarTodayTool(Tool):
                     "type": "integer",
                     "description": "Max events to return (default 10).",
                 },
+                "account": _ACCOUNT_ARG_SCHEMA,
             },
         }
 
     async def execute(self, args: dict) -> dict:
         integ = _shared_integration()
-        if not await integ.is_connected():
+        account = args.get("account")
+        if not await integ.is_connected(account_id=account):
             return _not_connected("read your calendar")
         now = datetime.now(timezone.utc)
         start = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -87,12 +104,14 @@ class CalendarTodayTool(Tool):
             events = await integ.list_events(
                 time_min=start, time_max=end,
                 max_results=int(args.get("max_results", 10)),
+                account_id=account,
             )
         except DeviceCodeError as e:
             return {"error": e.code, "message": e.description}
         return {
             "count": len(events),
             "events": events,
+            "account": account,
         }
 
 
@@ -108,7 +127,8 @@ class CalendarWeekTool(Tool):
         return (
             "List events for the next 7 days from the user's primary Google "
             "Calendar.  Use when the user asks 'what's on this week' or "
-            "'what's coming up'."
+            "'what's coming up'.  Accepts an optional `account` arg for "
+            "users with multiple connected Google accounts."
         )
 
     @property
@@ -120,12 +140,14 @@ class CalendarWeekTool(Tool):
                     "type": "integer",
                     "description": "Max events to return (default 20).",
                 },
+                "account": _ACCOUNT_ARG_SCHEMA,
             },
         }
 
     async def execute(self, args: dict) -> dict:
         integ = _shared_integration()
-        if not await integ.is_connected():
+        account = args.get("account")
+        if not await integ.is_connected(account_id=account):
             return _not_connected("read your calendar")
         now = datetime.now(timezone.utc)
         end = now + timedelta(days=7)
@@ -133,10 +155,11 @@ class CalendarWeekTool(Tool):
             events = await integ.list_events(
                 time_min=now, time_max=end,
                 max_results=int(args.get("max_results", 20)),
+                account_id=account,
             )
         except DeviceCodeError as e:
             return {"error": e.code, "message": e.description}
-        return {"count": len(events), "events": events}
+        return {"count": len(events), "events": events, "account": account}
 
 
 class CalendarCreateTool(Tool):
@@ -153,7 +176,9 @@ class CalendarCreateTool(Tool):
             "when the user explicitly asks to schedule / add / book a "
             "calendar event.  Confirm details with the user BEFORE calling; "
             "calendar writes are not undoable by voice except via "
-            "calendar_cancel."
+            "calendar_cancel.  Accepts an optional `account` arg for users "
+            "with multiple connected Google accounts — ask the user which "
+            "calendar to use if it's not obvious."
         )
 
     @property
@@ -182,12 +207,14 @@ class CalendarCreateTool(Tool):
                     "type": "string",
                     "description": "Optional longer description.",
                 },
+                "account": _ACCOUNT_ARG_SCHEMA,
             },
         }
 
     async def execute(self, args: dict) -> dict:
         integ = _shared_integration()
-        if not await integ.is_connected():
+        account = args.get("account")
+        if not await integ.is_connected(account_id=account):
             return _not_connected("create an event")
         try:
             start = datetime.fromisoformat(args["start_iso"])
@@ -201,10 +228,11 @@ class CalendarCreateTool(Tool):
                 end=end,
                 location=args.get("location"),
                 description=args.get("description"),
+                account_id=account,
             )
         except DeviceCodeError as e:
             return {"error": e.code, "message": e.description}
-        return {"event": ev, "created": True}
+        return {"event": ev, "created": True, "account": account}
 
 
 class CalendarCancelTool(Tool):
@@ -220,7 +248,9 @@ class CalendarCancelTool(Tool):
             "Delete an event from the user's primary Google Calendar.  Use "
             "when the user explicitly asks to cancel / delete / remove an "
             "event.  Confirm the event id (from a previous calendar_today "
-            "or calendar_week result) with the user before calling."
+            "or calendar_week result) with the user before calling.  "
+            "Accepts an optional `account` arg — match the account from "
+            "the event you're cancelling."
         )
 
     @property
@@ -233,14 +263,18 @@ class CalendarCancelTool(Tool):
                     "type": "string",
                     "description": "Event id from a previous calendar_today or calendar_week result.",
                 },
+                "account": _ACCOUNT_ARG_SCHEMA,
             },
         }
 
     async def execute(self, args: dict) -> dict:
         integ = _shared_integration()
-        if not await integ.is_connected():
+        account = args.get("account")
+        if not await integ.is_connected(account_id=account):
             return _not_connected("cancel an event")
-        ok = await integ.cancel_event(args["event_id"])
+        ok = await integ.cancel_event(args["event_id"], account_id=account)
         if not ok:
             return {"error": "cancel_failed", "event_id": args["event_id"]}
-        return {"cancelled": True, "event_id": args["event_id"]}
+        return {
+            "cancelled": True, "event_id": args["event_id"], "account": account,
+        }

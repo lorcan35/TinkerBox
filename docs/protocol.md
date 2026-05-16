@@ -704,7 +704,29 @@ Tab5 can request cloud mode toggle:
 3. Hot-swaps backends on the active pipeline.
 4. Sends confirmation `config_update` back to Tab5.
 
-### 6.6 config_update (Dragon -> Tab5)
+### 6.6 ready_ack (Tab5 -> Dragon)
+
+Tab5 notifies Dragon that the playback ring has fully drained and the
+voice state has returned to `READY` after a TTS playback.  Pure
+observability — Dragon logs the event but takes no other action.
+
+```json
+{
+  "type": "ready_ack",
+  "mode": 3
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `type` | string | `"ready_ack"` |
+| `mode` | int | Active voice_mode at end-of-turn (0=local, 1=hybrid, 2=cloud, 3=tinkerclaw, 4=onboard, 5=solo). |
+
+**When sent:** After Tab5's playback drain task transitions the orb back to `VOICE_STATE_READY` (TT #564 / PR #565).
+
+**Dragon behavior:** Logs the event.  No state change.  Future use: cross-stack observability (e.g. Dragon could verify Tab5 actually finished playback before sending the next turn's tts_start in pipelined scenarios).
+
+### 6.7 config_update (Dragon -> Tab5)
 
 Dragon confirms the configuration change (or can push config changes unprompted):
 

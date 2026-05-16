@@ -83,6 +83,19 @@ class KokoroBackend(TTSBackend):
         if self._kokoro is None:
             raise RuntimeError("KokoroBackend not initialized")
 
+        # #338 defense-in-depth: clean here too, in case a caller
+        # forgot.  Idempotent — running on already-cleaned text yields
+        # the same string.  Emits a single INFO log per call with the
+        # before/after delta so we can grep for it.
+        from dragon_voice.tts.text_cleaner import clean_for_tts
+        cleaned = clean_for_tts(text)
+        if cleaned and cleaned != text:
+            logger.info(
+                "#338 Kokoro cleaner: %d→%d chars (in=%r out=%r)",
+                len(text), len(cleaned), text[:80], cleaned[:80],
+            )
+        text = cleaned or text
+
         voice = self._config.kokoro_voice
 
         async with self._lock:

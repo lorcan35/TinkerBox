@@ -69,13 +69,30 @@ _RE_HR = re.compile(r"^[ \t]*(?:-{3,}|\*{3,}|_{3,})[ \t]*$", re.MULTILINE)
 # Emojis + common pictographs.  Conservative byte-range strip — we
 # don't want to nuke the "°" in "10°C" or the "€" sign, so this is
 # narrowed to the emoji blocks proper.
+#
+# #338 follow-up: must also strip the variation selector (U+FE0F),
+# skin-tone modifiers (U+1F3FB–U+1F3FF), and zero-width joiners
+# (U+200D) that travel with emoji.  Without these the cleaner would
+# leave behind orphan combining marks that TTS pronounces as "tofu"
+# or skips with an audible glitch.  The trailing `[\ufe0f\u200d]*`
+# and ZWJ term catch multi-codepoint emoji like "👨‍👩‍👧" too.
 _RE_EMOJI = re.compile(
+    "(?:"
     "[\U0001F300-\U0001F9FF"   # Misc symbols, pictographs, emoticons
     "\U0001FA70-\U0001FAFF"   # Symbols & pictographs extended-A
     "\U00002600-\U000026FF"   # Misc symbols (sun, snowflake, etc.)
-    "\U00002700-\U000027BF]", # Dingbats
+    "\U00002700-\U000027BF"   # Dingbats
+    "\U0001F3FB-\U0001F3FF"   # Skin-tone modifiers
+    "]"
+    "[\ufe0f\u200d]*"          # trailing VS16 / ZWJ joiners
+    "(?:\u200d[\U0001F300-\U0001F9FF\U0001FA70-\U0001FAFF"
+    "\U00002600-\U000026FF\U00002700-\U000027BF]"
+    "[\ufe0f\u200d]*)*"        # ZWJ-joined sequence chain
+    ")",
     flags=re.UNICODE,
 )
+# Belt-and-braces: any orphan VS16 / ZWJ from corrupted input.
+_RE_EMOJI_ORPHAN = re.compile("[\ufe0f\u200d]+")
 
 # Sentence flow: ". . ." or "..." → single ellipsis pause; multi
 # whitespace → single space; double-newline → sentence boundary.
@@ -122,8 +139,9 @@ def clean_for_tts(text: str) -> str:
     out = _RE_ITALIC_UNDER.sub(r"\1", out)
     out = _RE_INLINE_CODE.sub(r"\1", out)
 
-    # 3. Emojis + ellipses + colon-newline flow softening.
+    # 3. Emojis + orphan VS16/ZWJ + ellipses + colon-newline flow.
     out = _RE_EMOJI.sub("", out)
+    out = _RE_EMOJI_ORPHAN.sub("", out)
     out = _RE_MULTI_DOT.sub("…", out)
     out = _RE_TRAILING_COLON_LINE.sub(". ", out)
 

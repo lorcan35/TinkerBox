@@ -24,6 +24,7 @@ from dragon_voice.api.debug_channel import DebugChannelRoutes
 from dragon_voice.api.video_inject import VideoInjectRoutes
 from dragon_voice.api.coredumps import CoredumpRoutes  # W4-D
 from dragon_voice.api.logs_tail import LogsTailRoutes  # W4-C
+from dragon_voice.api.integrations import IntegrationRoutes  # #341 Phase 1
 
 logger = logging.getLogger(__name__)
 
@@ -138,5 +139,11 @@ def setup_all_routes(
             logger.info("Scheduler REST routes registered (5 endpoints)")
         except ImportError:
             logger.debug("Scheduler routes not available yet")
+
+    # #341 Phase 1: integrations REST surface (Google Calendar, etc.)
+    # Per-process singleton instances of each registered integration
+    # live inside IntegrationRoutes so in-flight OAuth device-code
+    # flows survive across requests.
+    IntegrationRoutes().register(app)
 
     logger.info("API routes registered (modular package)")

@@ -12,6 +12,7 @@ import numpy as np
 
 from dragon_voice.config import TTSConfig
 from dragon_voice.tts.base import TTSBackend
+from dragon_voice.tts.registry import register_tts
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,7 @@ _CACHE_DIR = Path.home() / ".cache" / "dragon_voice" / "kokoro"
 _KOKORO_SAMPLE_RATE = 24000
 
 
+@register_tts("kokoro")
 class KokoroBackend(TTSBackend):
     """TTS backend using kokoro-onnx."""
 
@@ -37,23 +39,34 @@ class KokoroBackend(TTSBackend):
                 "Install it: pip install kokoro-onnx"
             ) from err
 
-        model_path = self._config.kokoro_model_path
+        # #338: kokoro-onnx 0.5.0+ wants (model_path, voices_path)
+        # explicitly.  Default to the well-known cache location so a
+        # vanilla deploy can find the files dropped by the install
+        # script — see docs / TT #564 deploy notes.
+        model_path = self._config.kokoro_model_path or str(
+            _CACHE_DIR / "kokoro-v1.0.onnx"
+        )
+        voices_path = self._config.kokoro_voices_path or str(
+            _CACHE_DIR / "voices-v1.0.bin"
+        )
         voice = self._config.kokoro_voice
 
+        if not Path(model_path).exists() or not Path(voices_path).exists():
+            raise FileNotFoundError(
+                f"Kokoro model files missing — expected "
+                f"model={model_path} voices={voices_path}.  Download "
+                f"from github.com/thewh1teagle/kokoro-onnx/releases."
+            )
+
         logger.info(
-            "Initializing Kokoro TTS — voice=%s, path=%s",
-            voice,
-            model_path or "(default)",
+            "Initializing Kokoro TTS — voice=%s, model=%s",
+            voice, model_path,
         )
 
         loop = asyncio.get_running_loop()
 
         def _load():
-            if model_path and Path(model_path).exists():
-                return kokoro_onnx.Kokoro(model_path)
-            else:
-                # kokoro-onnx auto-downloads the default model
-                return kokoro_onnx.Kokoro.from_pretrained()
+            return kokoro_onnx.Kokoro(model_path, voices_path)
 
         try:
             self._kokoro = await loop.run_in_executor(None, _load)

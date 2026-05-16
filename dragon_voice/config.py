@@ -75,7 +75,13 @@ class TTSConfig:
     piper_model: str = "en_US-lessac-medium"
     piper_data_dir: str = ""
     kokoro_model_path: str = ""
-    kokoro_voice: str = "af_heart"
+    # #338: kokoro-onnx 0.5.0+ needs the voices bin separately.
+    kokoro_voices_path: str = ""
+    kokoro_voice: str = "af_bella"
+    # Pre-TTS text cleaner toggle (#338).  Strips markdown / bullets /
+    # code fences / emojis / bare URLs before the backend renders the
+    # text so the TTS doesn't read literal punctuation out loud.
+    text_cleaner_enabled: bool = True
     edge_voice: str = "en-US-AriaNeural"
     sample_rate: int = 22050
     # OpenRouter cloud TTS (key auto-populated from llm.openrouter_api_key)

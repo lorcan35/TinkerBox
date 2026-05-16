@@ -1342,6 +1342,17 @@ class VoicePipeline:
                 self._tts_started = True
 
             t0 = time.monotonic()
+            # #338: run the pre-TTS text cleaner so backends never get
+            # raw markdown / bullets / emojis / code fences / bare URLs.
+            # Toggle via `tts.text_cleaner_enabled` (default True).
+            # Applied uniformly across all 4 backends — a regression to
+            # the old "TTS reads asterisks and full stops aloud"
+            # behaviour shows up as a single config flip.
+            if getattr(self._config.tts, "text_cleaner_enabled", True):
+                from dragon_voice.tts import clean_for_tts
+                text = clean_for_tts(text)
+                if not text:
+                    return
             # Audit C3 (#137): mode-aware TTS budget.  Pre-fix the voice
             # path used a flat 30 s, which was OK for cloud but tight
             # for local Piper on a long sentence (Piper takes 15-25 s

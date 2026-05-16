@@ -9,7 +9,7 @@ from aiohttp import web
 
 from dragon_voice.config import VoiceConfig
 from dragon_voice.stt import _BACKENDS as STT_BACKENDS
-from dragon_voice.tts import _BACKENDS as TTS_BACKENDS
+from dragon_voice.tts import list_backends as _tts_list_backends
 from dragon_voice.llm import _BACKENDS as LLM_BACKENDS
 
 logger = logging.getLogger(__name__)
@@ -139,7 +139,7 @@ class SystemRoutes:
             },
             "tts": {
                 "active": self._config.tts.backend,
-                "available": sorted(TTS_BACKENDS.keys()),
+                "available": _tts_list_backends(),
             },
             "llm": {
                 "active": self._config.llm.backend,

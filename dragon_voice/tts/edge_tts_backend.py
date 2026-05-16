@@ -13,12 +13,14 @@ import numpy as np
 
 from dragon_voice.config import TTSConfig
 from dragon_voice.tts.base import TTSBackend
+from dragon_voice.tts.registry import register_tts
 
 logger = logging.getLogger(__name__)
 
 _EDGE_TTS_SAMPLE_RATE = 24000  # Edge TTS outputs 24kHz audio
 
 
+@register_tts("edge_tts")
 class EdgeTTSBackend(TTSBackend):
     """TTS backend using Microsoft Edge TTS (free, cloud-based)."""
 

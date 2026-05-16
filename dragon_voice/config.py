@@ -138,7 +138,7 @@ class AudioConfig:
     input_channels: int = 1
     output_sample_rate: int = 22050
     vad_enabled: bool = True
-    vad_silence_ms: int = 600
+    vad_silence_ms: int = 1500
 
 
 @dataclass

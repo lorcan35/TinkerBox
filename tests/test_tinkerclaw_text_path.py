@@ -544,3 +544,246 @@ class TestRichMediaGate:
         )
         assert receipt is not None
         assert receipt["cost_mils"] == 0
+
+
+# ─── TestContextRestore #336 ────────────────────────────────────
+
+
+def _make_message_store(history: list[dict] | None = None) -> MagicMock:
+    """Fake MessageStore that records add_message + replays a fixed
+    context from get_context.  Returned mock exposes:
+       - add_message_calls : list[(session_id, role, content, kwargs)]
+       - get_context_calls : list[kwargs]
+    """
+    ms = MagicMock()
+    add_calls: list[tuple] = []
+    ctx_calls: list[dict] = []
+
+    async def _add(session_id, role, content, **kwargs):
+        add_calls.append((session_id, role, content, kwargs))
+        return {}
+
+    async def _ctx(session_id, **kwargs):
+        ctx_calls.append({"session_id": session_id, **kwargs})
+        return list(history or []) + [
+            {"role": "user", "content": "<current>"},
+        ]
+
+    ms.add_message = _add
+    ms.get_context = _ctx
+    ms.add_message_calls = add_calls  # type: ignore[attr-defined]
+    ms.get_context_calls = ctx_calls  # type: ignore[attr-defined]
+    return ms
+
+
+class TestContextRestore336:
+    """#336: TC mode pulls conversation history + system prompt from
+    MessageStore instead of sending only the latest user turn."""
+
+    @pytest.mark.asyncio
+    async def test_gateway_receives_history_when_store_provided(self):
+        """When message_store is passed, the LLM stream is invoked
+        with [system, ...prior, current_user] not just [user]."""
+        ws = _make_ws()
+        send = _make_safe_send_json()
+        cfg = _make_conn_config()
+        captured: list[list[dict]] = []
+
+        llm = MagicMock()
+        llm.name = "tc"
+        llm._model = ""
+
+        async def _stream(messages):
+            captured.append(list(messages))
+            for tok in ("done",):
+                yield tok
+
+        llm.generate_stream_with_messages = _stream
+        convo = _make_conversation(llm)
+        ms = _make_message_store(history=[
+            {"role": "system", "content": "<TC SYSTEM>"},
+            {"role": "user", "content": "I live in Geneva."},
+            {"role": "assistant", "content": "Got it."},
+        ])
+
+        with patch(
+            "dragon_voice.tinkerclaw_text_path.emit_rich_media_for_text_turn",
+            new=AsyncMock(),
+        ):
+            await handle_tinkerclaw_text_path(
+                ws,
+                conn_state={"session_id": "s", "device_id": "dev42"},
+                conn_config=cfg,
+                text="what's the weather?",
+                session_id="s",
+                conversation=convo,
+                media_pipeline=MagicMock(),
+                ws_keepalive=_noop_keepalive,
+                safe_send_json=send,
+                message_store=ms,
+            )
+
+        # gateway saw a multi-message context (not just the bare user)
+        assert len(captured) == 1
+        msgs = captured[0]
+        roles = [m["role"] for m in msgs]
+        assert "system" in roles, f"no system message in {roles}"
+        assert roles.count("user") >= 1
+        # prior assistant + new user are both present
+        assert any(
+            m["role"] == "user" and "Geneva" in m["content"] for m in msgs
+        ), "prior user turn missing from forwarded context"
+        assert any(m["role"] == "assistant" for m in msgs), \
+            "prior assistant turn missing from forwarded context"
+
+    @pytest.mark.asyncio
+    async def test_user_turn_persisted_before_gateway_call(self):
+        ws = _make_ws()
+        cfg = _make_conn_config()
+        llm = _make_llm(tokens=["t"])
+        convo = _make_conversation(llm)
+        ms = _make_message_store()
+
+        with patch(
+            "dragon_voice.tinkerclaw_text_path.emit_rich_media_for_text_turn",
+            new=AsyncMock(),
+        ):
+            await handle_tinkerclaw_text_path(
+                ws,
+                conn_state={"session_id": "s", "device_id": "dev1"},
+                conn_config=cfg,
+                text="hello agent",
+                session_id="sess-1",
+                conversation=convo,
+                media_pipeline=MagicMock(),
+                ws_keepalive=_noop_keepalive,
+                safe_send_json=_make_safe_send_json(),
+                message_store=ms,
+            )
+
+        # The user's text was persisted with role=user
+        user_calls = [c for c in ms.add_message_calls if c[1] == "user"]
+        assert len(user_calls) == 1
+        assert user_calls[0][0] == "sess-1"
+        assert user_calls[0][2] == "hello agent"
+
+    @pytest.mark.asyncio
+    async def test_assistant_turn_persisted_after_streaming(self):
+        ws = _make_ws()
+        cfg = _make_conn_config()
+        llm = _make_llm(name="tc-claude", tokens=["Hel", "lo!"])
+        convo = _make_conversation(llm)
+        ms = _make_message_store()
+
+        with patch(
+            "dragon_voice.tinkerclaw_text_path.emit_rich_media_for_text_turn",
+            new=AsyncMock(),
+        ):
+            await handle_tinkerclaw_text_path(
+                ws,
+                conn_state={"device_id": "dev1"},
+                conn_config=cfg,
+                text="hi",
+                session_id="s",
+                conversation=convo,
+                media_pipeline=MagicMock(),
+                ws_keepalive=_noop_keepalive,
+                safe_send_json=_make_safe_send_json(),
+                message_store=ms,
+            )
+
+        asst_calls = [c for c in ms.add_message_calls if c[1] == "assistant"]
+        assert len(asst_calls) == 1
+        assert asst_calls[0][2] == "Hello!"  # concatenated tokens
+        # model field carries through so message DB has provenance
+        assert asst_calls[0][3].get("model") == "tc-claude"
+
+    @pytest.mark.asyncio
+    async def test_device_id_preferred_over_session_id_as_session_key(self):
+        """#336: stable per-device session key so the gateway
+        persists context across Tab5 reconnects."""
+        ws = _make_ws()
+        cfg = _make_conn_config()
+        llm = _make_llm(tokens=["t"])
+
+        # Mark the LLM as SupportsSessionKey-shaped
+        from dragon_voice.llm.base import SupportsSessionKey
+        recorded: list[str] = []
+
+        class _SK:
+            def set_session_key(self, key: str) -> None:
+                recorded.append(key)
+
+            async def generate_stream_with_messages(self, messages):
+                yield "ok"
+
+            @property
+            def name(self) -> str:
+                return "tc"
+
+        sk_llm = _SK()
+        SupportsSessionKey.register(_SK)  # type: ignore[arg-type]
+        convo = MagicMock()
+        convo.llm = sk_llm
+
+        with patch(
+            "dragon_voice.tinkerclaw_text_path.emit_rich_media_for_text_turn",
+            new=AsyncMock(),
+        ):
+            await handle_tinkerclaw_text_path(
+                ws,
+                conn_state={
+                    "session_id": "should-NOT-be-used",
+                    "device_id": "tab5-stable-id",
+                },
+                conn_config=cfg,
+                text="hi",
+                session_id="should-NOT-be-used",
+                conversation=convo,
+                media_pipeline=MagicMock(),
+                ws_keepalive=_noop_keepalive,
+                safe_send_json=_make_safe_send_json(),
+            )
+
+        assert recorded == ["tab5-stable-id"]
+
+    @pytest.mark.asyncio
+    async def test_fallback_when_no_message_store(self):
+        """No message_store wired → falls back to legacy
+        single-message context with a system prompt."""
+        ws = _make_ws()
+        cfg = _make_conn_config()
+        captured: list[list[dict]] = []
+
+        llm = MagicMock()
+        llm.name = "tc"
+        llm._model = ""
+
+        async def _stream(messages):
+            captured.append(list(messages))
+            yield "t"
+
+        llm.generate_stream_with_messages = _stream
+        convo = _make_conversation(llm)
+
+        with patch(
+            "dragon_voice.tinkerclaw_text_path.emit_rich_media_for_text_turn",
+            new=AsyncMock(),
+        ):
+            await handle_tinkerclaw_text_path(
+                ws,
+                conn_state={"session_id": "s"},
+                conn_config=cfg,
+                text="hi",
+                session_id="s",
+                conversation=convo,
+                media_pipeline=MagicMock(),
+                ws_keepalive=_noop_keepalive,
+                safe_send_json=_make_safe_send_json(),
+                message_store=None,  # explicitly missing
+            )
+
+        assert len(captured) == 1
+        msgs = captured[0]
+        assert msgs[0]["role"] == "system"
+        assert msgs[-1] == {"role": "user", "content": "hi"}

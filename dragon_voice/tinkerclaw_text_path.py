@@ -93,6 +93,27 @@ _TC_NO_TOOLS_FALLBACK = (
 )
 
 
+# #336: TC-specific system prompt.  The OpenClaw gateway already
+# injects its own skill-catalog system message, so this stays short:
+# it just establishes that the caller is the Tab5 voice assistant on
+# behalf of a recurring user, and reminds the agent to use whatever
+# memory / location / preferences are already known rather than
+# treating each turn as a blank slate.  The actual conversation
+# history (from MessageStore.get_context) carries the per-turn
+# context.
+_TC_SYSTEM_PROMPT = (
+    "You are TinkerClaw, the voice assistant running on a Tab5 device. "
+    "The user talks to you across many turns and reconnects — treat "
+    "this as a continuing conversation with the same person.  Use any "
+    "memory, skills, location, or preferences you already know about "
+    "them before asking them to repeat themselves.  Keep replies short "
+    "and friendly; the user hears them spoken aloud."
+)
+# Max prior turns from MessageStore to forward to the gateway.  20 is
+# what local ConvEngine uses by default; we mirror that.
+_TC_HISTORY_MAX = 20
+
+
 def _is_tinkerclaw_mode(conn_config: Any, conversation: Any) -> bool:
     """Return True iff this turn should bypass ConvEngine and go
     through the TinkerClaw gateway.
@@ -121,6 +142,7 @@ async def handle_tinkerclaw_text_path(
     media_pipeline: Optional[Any],   # MediaPipeline (Optional in test paths)
     ws_keepalive: WsKeepaliveFactory,
     safe_send_json: SafeSendJson,
+    message_store: Optional[Any] = None,  # MessageStore — #336 context restore
 ) -> bool:
     """Run the TinkerClaw bypass branch of `_handle_text_body`.
 
@@ -152,9 +174,17 @@ async def handle_tinkerclaw_text_path(
     logger.info("_handle_text TinkerClaw bypass via ConvEngine LLM: %s", llm.name)
 
     # Wave 21b (#204): isinstance(SupportsSessionKey) over hasattr.
+    # #336: use device_id (stable across reconnects) instead of
+    # session_id (rotates per WS connect).  Falls back to session_id
+    # if no device_id was registered on this connection so test paths
+    # and pre-#336 deployments still work.
     from dragon_voice.llm.base import SupportsSessionKey
     if isinstance(llm, SupportsSessionKey):
-        llm.set_session_key(conn_state.get("session_id", ""))
+        stable_key = (
+            conn_state.get("device_id", "")
+            or conn_state.get("session_id", "")
+        )
+        llm.set_session_key(stable_key)
 
     # Send a "thinking" indicator immediately to keep the WS alive.
     # TinkerClaw agent can take 10-30s before first token (memory
@@ -162,6 +192,45 @@ async def handle_tinkerclaw_text_path(
     # idle connection.
     if not ws.closed:
         await ws.send_json({"type": "llm", "text": ""})
+
+    # #336: persist the user turn + build a context-aware message
+    # list from MessageStore.  Pre-#336 the gateway only saw the
+    # latest user message, so it had no idea what the user said in
+    # earlier turns or what they previously told the system.
+    # MessageStore persistence is best-effort — if no store was
+    # wired (test path) we fall back to the legacy single-turn
+    # context.
+    messages_for_gateway: list[dict]
+    if message_store is not None and session_id:
+        try:
+            await message_store.add_message(
+                session_id, "user", text, input_mode="text",
+            )
+        except Exception:
+            logger.exception(
+                "#336: persisting user turn failed — continuing "
+                "with single-message context",
+            )
+        try:
+            messages_for_gateway = await message_store.get_context(
+                session_id,
+                max_messages=_TC_HISTORY_MAX,
+                system_prompt=_TC_SYSTEM_PROMPT,
+            )
+        except Exception:
+            logger.exception(
+                "#336: get_context failed — falling back to "
+                "single-message context",
+            )
+            messages_for_gateway = [
+                {"role": "system", "content": _TC_SYSTEM_PROMPT},
+                {"role": "user", "content": text},
+            ]
+    else:
+        messages_for_gateway = [
+            {"role": "system", "content": _TC_SYSTEM_PROMPT},
+            {"role": "user", "content": text},
+        ]
 
     # #75 phase 1a: WS-level PING every 5 s while the LLM is
     # generating.  5 s is safely under every Tab5 firmware's
@@ -172,9 +241,9 @@ async def handle_tinkerclaw_text_path(
     full_response: list[str] = []
     try:
         async with ws_keepalive(ws, label="tc_text"):
-            async for token in llm.generate_stream_with_messages([
-                {"role": "user", "content": text}
-            ]):
+            async for token in llm.generate_stream_with_messages(
+                messages_for_gateway,
+            ):
                 full_response.append(token)
                 if not ws.closed:
                     await ws.send_json({"type": "llm", "text": token})
@@ -213,6 +282,22 @@ async def handle_tinkerclaw_text_path(
         "TinkerClaw text response (%d chars): %s",
         len(response_text), response_text[:80],
     )
+
+    # #336: persist the assistant turn so the next call's
+    # get_context() sees it.  Best-effort.
+    if message_store is not None and session_id and response_text:
+        try:
+            await message_store.add_message(
+                session_id, "assistant", response_text,
+                input_mode="text",
+                model=getattr(llm, "name", "tinkerclaw"),
+            )
+        except Exception:
+            logger.exception(
+                "#336: persisting assistant turn failed — next "
+                "turn will be missing this exchange",
+            )
+
     if not ws.closed:
         await ws.send_json({
             "type": "llm_done", "llm_ms": 0, "text": response_text,

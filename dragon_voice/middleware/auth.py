@@ -31,6 +31,12 @@ PUBLIC_PREFIXES: tuple[str, ...] = (
     # under /api/v1/* which still gates auth.
     "/call",
     "/static/",
+    # #341 Phase 1: OAuth callback target.  Google redirects the
+    # user's phone browser here after consent — the browser has no
+    # bearer token, but the PKCE `state` parameter is what
+    # authenticates the request (Dragon process holds the only copy
+    # of the matching code_verifier).
+    "/api/v1/oauth/callback",
 )
 
 

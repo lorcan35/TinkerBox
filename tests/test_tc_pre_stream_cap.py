@@ -44,9 +44,10 @@ def test_payload_includes_max_tokens_pre_stream() -> None:
                     return b"data: [DONE]\n"
             return _Reader()
 
-    def _fake_post(url: str, json: dict) -> _FakeResponse:
+    def _fake_post(url: str, json: dict, headers: dict | None = None) -> _FakeResponse:
         captured["url"] = url
         captured["json"] = json
+        captured["headers"] = headers or {}
         return _FakeResponse()
 
     session = MagicMock()

@@ -159,4 +159,26 @@ def clean_for_tts(text: str) -> str:
     out = re.sub(r"\.\s*\.", ".", out)
     out = re.sub(r",\s*\.", ".", out)
 
+    # 6. #338 follow-up: NUCLEAR strip of any surviving markdown
+    # markers.  User report: still hearing "asterisk" and "lines"
+    # spoken aloud — means a markdown variant escaped the structured
+    # regexes above (e.g. odd-count `**` from a streamed sentence
+    # split mid-pair, lone `*` from `Step *` lists, `---` not on its
+    # own line, table pipes, etc.).  At this point in the pipeline
+    # ALL legitimate uses of these characters are already preserved
+    # in their respective handlers — anything left is markdown noise
+    # the TTS would speak literally.
+    #
+    # Survivors:
+    #   * `*` and `_` outside bold/italic pairs (lone markers)
+    #   * `#` outside a heading-at-line-start (mid-line tags)
+    #   * `~` strikethrough markers (never paired by Markdown anyway)
+    #   * `|` table cell separators that escaped row-by-row stripping
+    #   * `---` or longer dashes that weren't on their own line
+    #   * `>` blockquote markers mid-string
+    #   * Backticks (defense against partial-fence inputs)
+    out = re.sub(r"---+", " ", out)        # inline horizontal-rule fragments
+    out = re.sub(r"[*_~`#|>]+", "", out)    # naked markdown markers
+    out = re.sub(r"[ \t]{2,}", " ", out)    # collapse the gaps just opened
+
     return out.strip()

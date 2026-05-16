@@ -84,6 +84,128 @@ _COT_PREAMBLE_PATTERNS = [
 ]
 
 
+# #334 (vmode=3 chip-dark): the OpenClaw gateway's /v1/chat/completions
+# SSE stream emits only text deltas — never the OpenAI `tool_calls` delta
+# shape — even when the embedded Pi agent does invoke tools (web_search,
+# weather, browser, etc.).  As a result Dragon's W7-A delta-accumulator
+# path at L498-519 below never fires, and Tab5's agent_log chips stay
+# dark in TC mode.
+#
+# Workaround: scan the assistant's streamed text for narration phrases
+# the agent reliably emits when it actually used a tool ("Based on my
+# weather skill, let me fetch live data for Geneva: ..."), match the
+# captured token against a known-tool allowlist, and synthesize a
+# tool_call event through the existing `_on_tool_call` callback.  The
+# heuristic is gated by the allowlist so plain-language phrases like
+# "based on my knowledge" don't false-fire.
+_TC_TEXT_TOOL_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # "Based on my weather skill", "Using the browser tool", "Found the
+    # weather skill", "Let me use my web_search extension", "fetched
+    # from my memory skill", "Ran the web_search tool"
+    re.compile(
+        r"\b(?:based\s+on|using|with|fetched?\s+(?:from|via)|found|loaded|"
+        r"invoked?|called|ran|executed|"
+        r"let\s+me\s+(?:use|check\s+with|query|fetch\s+from))\s+"
+        r"(?:my\s+|the\s+|its\s+)?"
+        r"([a-z][a-z0-9_\- ]{1,30}?)"
+        r"\s+(?:tool|skill|extension|service)\b",
+        re.IGNORECASE,
+    ),
+    # "searching the web for ...", "fetching weather data", "looking up
+    # the date", "querying memory" — verb + known-subject form
+    re.compile(
+        r"\b(?:searching|querying|fetching|looking\s+up|checking|invoking)\s+"
+        r"(?:the\s+|my\s+|via\s+)?"
+        r"\b(web(?:\s+search)?|google|wikipedia|memory|weather|email|"
+        r"telegram|whatsapp|discord|slack|signal|browser|calendar|news|"
+        r"youtube|gmail|stock\s+ticker|date(?:time)?)\b",
+        re.IGNORECASE,
+    ),
+    # Skill-path references — OpenClaw agents commonly cite their own
+    # skill manifests in narration, like
+    # "~/tinkerclaw/skills/weather/SKILL.md".  The path segment between
+    # `skills/` and the next `/` is the canonical skill name and a much
+    # higher-precision signal than free-text "X skill" phrasing.
+    re.compile(
+        r"(?:tinkerclaw|\.tinkerclaw|openclaw)/skills?/([a-z][a-z0-9_-]{1,30})/",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bskills?/([a-z][a-z0-9_-]{1,30})/SKILL\.md\b",
+        re.IGNORECASE,
+    ),
+)
+
+# Allowlist of tool names that the synthetic tool_call surface is
+# willing to emit.  Heuristic matches whose normalized name is NOT in
+# this set are silently dropped so phrases like "based on my knowledge"
+# / "let me try a different approach" don't show up as tool calls.
+#
+# Names are normalized via `_normalize_tool_name` before lookup
+# (lowercase, spaces → underscores, hyphens → underscores).  The set
+# mirrors the merged catalog the W7-B `/api/v1/agent_skills` endpoint
+# returns: 8 OpenClaw core tools + the Dragon ToolRegistry built-ins +
+# the common channel plugin names (so Telegram/WhatsApp/etc. narration
+# surfaces a chip too).
+_TC_KNOWN_TOOLS: frozenset[str] = frozenset({
+    # OpenClaw core (per W7-B static catalog)
+    "bash", "browser", "edit_file", "memory", "read_file",
+    "search_files", "task", "web_search",
+    # Dragon ToolRegistry built-ins
+    "web", "search", "weather", "calculator", "unit_converter",
+    "stock_ticker", "datetime", "date", "remember", "recall",
+    "forget", "note", "system", "timesense", "quick_poll",
+    # Channel plugins (so "fetching from telegram" → telegram chip)
+    "telegram", "whatsapp", "discord", "slack", "signal",
+    "imessage", "matrix", "email", "gmail",
+    # Common skill family aliases
+    "google", "wikipedia", "calendar", "news", "youtube",
+})
+
+
+def _normalize_tool_name(raw: str) -> str:
+    """Fold a regex-captured tool name to the allowlist's canonical form."""
+    out = (raw or "").strip().lower()
+    # "stock ticker" → "stock_ticker"; "web search" → "web_search"
+    out = re.sub(r"\s+", "_", out)
+    # "datetime" / "date" both map to "datetime" in the allowlist
+    if out == "date":
+        out = "datetime"
+    return out
+
+
+def extract_inferred_tool_invocations(
+    text: str, already_fired: frozenset[str] | set[str] = frozenset(),
+) -> list[str]:
+    """Return canonical tool names inferred from agent narration.
+
+    Scans `text` for phrases the OpenClaw embedded agent reliably emits
+    when it uses a tool, maps captured names through the
+    `_TC_KNOWN_TOOLS` allowlist, and returns each new name in match
+    order.  Names already in `already_fired` are skipped so the caller
+    can stream-scan an accumulator without re-emitting earlier matches.
+
+    Public (module-level rather than `_`-prefixed) so the unit test
+    suite at `tests/test_tinkerclaw_text_tool_inference.py` can drive
+    it directly without instantiating a backend.
+    """
+    if not text:
+        return []
+    seen_this_pass: set[str] = set()
+    out: list[str] = []
+    for pat in _TC_TEXT_TOOL_PATTERNS:
+        for match in pat.finditer(text):
+            raw = match.group(1)
+            norm = _normalize_tool_name(raw)
+            if norm not in _TC_KNOWN_TOOLS:
+                continue
+            if norm in already_fired or norm in seen_this_pass:
+                continue
+            seen_this_pass.add(norm)
+            out.append(norm)
+    return out
+
+
 def sanitize_tinkerclaw_reply(text: str) -> str:
     """Strip leading chain-of-thought / tool-loop preamble from a TC reply.
 
@@ -444,6 +566,18 @@ class TinkerClawBackend(LLMBackend):
                 # boundary on /v1/chat/completions).
                 _pending_results: list[str] = []
 
+                # #334: text-narration tool inference.  The gateway never
+                # emits structured tool_calls deltas, so we rebuild a
+                # surface for Tab5's W7-A chips by scanning the streamed
+                # assistant text for known skill-invocation phrases.
+                # `_text_scan_buf` accumulates ALL streamed text
+                # regardless of the passthrough/buffer state above; the
+                # scanner runs at sentence boundaries to keep per-token
+                # cost low.  `_text_inferred_tools` is the dedupe set —
+                # each tool name fires at most once per turn.
+                _text_scan_buf: list[str] = []
+                _text_inferred_tools: set[str] = set()
+
                 # W14-M07: use readline with explicit byte cap so one
                 # pathologically long SSE frame can't blow memory.
                 while True:
@@ -524,6 +658,21 @@ class TinkerClawBackend(LLMBackend):
                     # synthesized tool_result event per pending tool.
                     if token and _pending_results:
                         await self._emit_synthetic_results(_pending_results)
+
+                    # #334: scan streamed text for tool-narration markers
+                    # ("based on my weather skill", "searching the web",
+                    # etc.) and emit synthesized tool_call events through
+                    # the same `_on_tool_call` pipeline W7-A uses for
+                    # real deltas.  Throttled to sentence boundaries to
+                    # keep per-token cost negligible.
+                    if token:
+                        _text_scan_buf.append(token)
+                        if any(c in token for c in (".", "!", "?", "\n", ":")):
+                            await self._scan_text_for_inferred_tools(
+                                "".join(_text_scan_buf),
+                                already_fired=_text_inferred_tools,
+                                pending_results=_pending_results,
+                            )
                     if token:
                         token_count += 1
                         if token_count > _SSE_MAX_TOKENS:
@@ -586,6 +735,16 @@ class TinkerClawBackend(LLMBackend):
                                 yield cleaned
                                 accumulated.clear()
                                 passthrough = True
+
+                # #334: final scan of the full accumulated text — catch
+                # narration that landed in the last chunk without a
+                # sentence-ending punctuation.
+                if _text_scan_buf:
+                    await self._scan_text_for_inferred_tools(
+                        "".join(_text_scan_buf),
+                        already_fired=_text_inferred_tools,
+                        pending_results=_pending_results,
+                    )
 
                 # W7-A: end-of-stream flush — any tool calls that the
                 # upstream never gave a finish_reason for (some servers
@@ -813,6 +972,56 @@ class TinkerClawBackend(LLMBackend):
                     "agent_log record_result suppressed for gateway tool %s",
                     name, exc_info=True,
                 )
+
+    async def _scan_text_for_inferred_tools(
+        self,
+        buffered_text: str,
+        already_fired: set[str],
+        pending_results: list[str],
+    ) -> None:
+        """#334: emit synthetic `tool_call` events from narration text.
+
+        Runs `extract_inferred_tool_invocations` against the accumulated
+        assistant text, fires `_on_tool_call` for each new name, and
+        registers the name in `pending_results` so the existing W7-A.2
+        synthetic-result machinery flips the chip to "done" on the next
+        content burst (or at end of stream).
+
+        Callback failures are logged + swallowed so a misbehaving
+        downstream consumer never tears down the LLM stream.
+        """
+        inferred = extract_inferred_tool_invocations(
+            buffered_text, already_fired=already_fired,
+        )
+        if inferred:
+            logger.debug(
+                "#334: inferred tools from narration: %s", inferred,
+            )
+        for name in inferred:
+            already_fired.add(name)
+            payload = {"tool": name, "args": {"_inferred": True}}
+            if self._on_tool_call is not None:
+                try:
+                    await self._on_tool_call(payload)
+                except Exception:
+                    logger.exception(
+                        "#334: on_tool_call callback raised for inferred "
+                        "tool (tool=%s) — swallowed",
+                        name,
+                    )
+            try:
+                from dragon_voice.api.agent_log import record_call as _alog
+                _alog(
+                    name,
+                    {"_inferred": True},
+                    source=_classify_gateway_source(name),
+                )
+            except Exception:
+                logger.debug(
+                    "agent_log record_call suppressed for inferred tool %s",
+                    name, exc_info=True,
+                )
+            pending_results.append(name)
 
     @property
     def name(self) -> str:

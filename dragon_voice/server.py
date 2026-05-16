@@ -826,6 +826,19 @@ class VoiceServer:
                         # will swap the stub for a real WS-RPC dispatch.
                         await handle_channel_reply(cmd, ws, ws_id, logger)
 
+                    elif cmd_type == "ready_ack":
+                        # #334: end-of-turn observability.  Tab5 emits this
+                        # after the TTS playback ring drains and the orb
+                        # transitions back to READY in voice.c, so Dragon
+                        # can see that the turn actually completed on the
+                        # device side (vs Dragon's old assumption that
+                        # tts_end == done).  Pure observability: log +
+                        # cheap, no state change.
+                        logger.debug(
+                            "Connection %s: ready_ack mode=%s",
+                            ws_id, cmd.get("mode"),
+                        )
+
                     else:
                         logger.warning("Unknown command from %s: %s", ws_id, cmd_type)
 

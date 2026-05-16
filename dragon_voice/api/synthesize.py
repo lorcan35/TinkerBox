@@ -99,6 +99,12 @@ class SynthesizeRoutes:
 
         try:
             t0 = time.monotonic()
+            # #338: pre-TTS cleaner — strips markdown / bullets / code
+            # fences before synthesis so REST /synthesize callers get
+            # the same spoken-flow benefits the WS-voice path gets.
+            if getattr(self._config.tts, "text_cleaner_enabled", True):
+                from dragon_voice.tts import clean_for_tts
+                text = clean_for_tts(text) or text
             audio_bytes = await tts.synthesize(text)
             tts_ms = (time.monotonic() - t0) * 1000
 

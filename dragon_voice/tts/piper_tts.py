@@ -16,8 +16,17 @@ from pathlib import Path
 import numpy as np
 
 from dragon_voice.config import TTSConfig
-from dragon_voice.pipeline import inference_executor
 from dragon_voice.tts.base import TTSBackend
+from dragon_voice.tts.registry import register_tts
+
+# #338: lazy-imported below to break the
+# dragon_voice.tts.__init__ ↔ dragon_voice.pipeline import cycle that
+# the new registry-driven package init exposed.  `inference_executor`
+# is the shared sync-call thread pool from `pipeline.py`; it doesn't
+# change after first import so caching it at first call is fine.
+def _get_inference_executor():
+    from dragon_voice.pipeline import inference_executor as _ie
+    return _ie
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +34,7 @@ _DATA_DIR = Path.home() / ".cache" / "dragon_voice" / "piper"
 _PIPER_VOICES_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
 
 
+@register_tts("piper")
 class PiperBackend(TTSBackend):
     """TTS backend using Piper (piper-tts Python package or binary).
 
@@ -67,14 +77,14 @@ class PiperBackend(TTSBackend):
             # when the voice isn't cached yet. Offload so cold-boot doesn't
             # stall the event loop for up to 2×120 s.
             model_path = await loop.run_in_executor(
-                inference_executor, self._ensure_model, model_name, data_dir,
+                _get_inference_executor(), self._ensure_model, model_name, data_dir,
             )
 
             def _load():
                 voice = piper.PiperVoice.load(str(model_path))
                 return voice
 
-            self._voice = await loop.run_in_executor(inference_executor, _load)
+            self._voice = await loop.run_in_executor(_get_inference_executor(), _load)
             self._model_path = model_path
             # Piper voices declare their sample rate in config.
             # Wave 14 W14-H08: offload the small config read to a thread
@@ -107,7 +117,7 @@ class PiperBackend(TTSBackend):
         self._binary_path = binary
         loop = asyncio.get_running_loop()
         self._model_path = await loop.run_in_executor(
-            inference_executor, self._ensure_model, model_name, data_dir,
+            _get_inference_executor(), self._ensure_model, model_name, data_dir,
         )
         logger.info("Piper will use binary at %s", binary)
 
@@ -175,9 +185,9 @@ class PiperBackend(TTSBackend):
             loop = asyncio.get_running_loop()
 
             if self._use_binary:
-                return await loop.run_in_executor(inference_executor, self._synthesize_binary, text)
+                return await loop.run_in_executor(_get_inference_executor(), self._synthesize_binary, text)
             else:
-                return await loop.run_in_executor(inference_executor, self._synthesize_python, text)
+                return await loop.run_in_executor(_get_inference_executor(), self._synthesize_python, text)
 
     def _synthesize_python(self, text: str) -> bytes:
         """Synthesize using piper-tts Python package."""

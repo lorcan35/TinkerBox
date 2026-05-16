@@ -115,14 +115,19 @@ def select_backends_for_mode(
     # 0 after a SOLO session we want LOCAL-shaped backends already
     # selected rather than CLOUD-shaped ones from a stale prior swap.
     if vmode.is_local() or vmode.is_solo():
-        stt_be, tts_be = "moonshine", "piper"
+        # #338: Kokoro is the new local default — much higher MOS than
+        # Piper at modest CPU cost on Q6A.  Piper stays available as
+        # an explicit override via `tts.backend` in config.yaml for
+        # very low-end deploys or where the 350 MB Kokoro model isn't
+        # acceptable.
+        stt_be, tts_be = "moonshine", "kokoro"
     elif vmode.is_tinkerclaw():
-        # TinkerClaw mode: default local STT/TTS.
+        # TinkerClaw mode: default local STT/TTS (Kokoro since #338).
         # "cloud" suffix in llm_model → use OpenRouter STT/TTS.
         if llm_model and "cloud" in llm_model.lower():
             stt_be, tts_be = "openrouter", "openrouter"
         else:
-            stt_be, tts_be = "moonshine", "piper"
+            stt_be, tts_be = "moonshine", "kokoro"
     else:
         stt_be, tts_be = "openrouter", "openrouter"
 

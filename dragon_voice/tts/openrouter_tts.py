@@ -16,12 +16,14 @@ import aiohttp
 from dragon_voice.config import TTSConfig
 from dragon_voice.errors import DragonError, Scope, Severity
 from dragon_voice.tts.base import TTSBackend
+from dragon_voice.tts.registry import register_tts
 
 logger = logging.getLogger(__name__)
 
 MODEL = "openai/gpt-audio-mini"
 
 
+@register_tts("openrouter")
 class OpenRouterTTSBackend(TTSBackend):
     """Cloud TTS via OpenRouter's audio-capable models."""
 

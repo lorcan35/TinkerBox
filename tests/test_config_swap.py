@@ -51,12 +51,12 @@ class _StubVoiceCfg:
 class SelectBackendsTests(unittest.TestCase):
     # ── LOCAL ────────────────────────────────────────────────────
 
-    def test_local_picks_moonshine_piper_ollama(self):
+    def test_local_picks_moonshine_kokoro_ollama(self):
         cfg = _StubVoiceCfg()
         sel = select_backends_for_mode(VoiceMode.LOCAL, cfg)
 
         self.assertEqual(sel.stt_backend, "moonshine")
-        self.assertEqual(sel.tts_backend, "piper")
+        self.assertEqual(sel.tts_backend, "kokoro")
         self.assertEqual(sel.llm_backend, "ollama")
         self.assertEqual(cfg.llm.system_prompt, SYSTEM_PROMPT_LOCAL)
         self.assertEqual(cfg.llm.max_tokens, MAX_TOKENS_LOCAL)
@@ -127,7 +127,7 @@ class SelectBackendsTests(unittest.TestCase):
         sel = select_backends_for_mode(VoiceMode.TINKERCLAW, cfg)
 
         self.assertEqual(sel.stt_backend, "moonshine")
-        self.assertEqual(sel.tts_backend, "piper")
+        self.assertEqual(sel.tts_backend, "kokoro")
         self.assertEqual(sel.llm_backend, "tinkerclaw")
 
     def test_tinkerclaw_with_cloud_suffix_overrides_to_openrouter_stt_tts(self):
@@ -191,7 +191,7 @@ class SelectBackendsTests(unittest.TestCase):
         cfg = _StubVoiceCfg()
         sel = select_backends_for_mode(VoiceMode.SOLO, cfg)
         self.assertEqual(sel.stt_backend, "moonshine")
-        self.assertEqual(sel.tts_backend, "piper")
+        self.assertEqual(sel.tts_backend, "kokoro")
         self.assertEqual(sel.llm_backend, "ollama")
         # Dragon's system_prompt/max_tokens untouched — SOLO branch
         # is `pass` (Tab5 owns prompts for its direct OpenRouter calls).

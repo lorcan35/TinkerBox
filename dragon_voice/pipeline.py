@@ -69,7 +69,17 @@ from dragon_voice.token_flush import (  # noqa: F401  (re-exports preserve names
 
 
 # VAD constants
-_SILENCE_THRESHOLD = 500  # RMS amplitude below this = silence (int16 range)
+# TT #563: bumped 500 → 900 because touch / audio-routing transients at
+# the start of LISTENING were crossing 500 briefly, tripping _is_speaking,
+# and then silence detection fired after vad_silence_ms — net result was
+# the user got "Couldn't hear you" before they could speak.  900 rejects
+# the transients but still catches normal speech (typical RMS 1200-3000).
+_SILENCE_THRESHOLD = 900
+# TT #563: require N consecutive frames above threshold before flipping
+# _is_speaking.  Debounces single-spike noise (touch artifacts, audio
+# device routing transients).  ~20 ms chunks → 3 frames = 60 ms of
+# sustained voice required.
+_MIN_SPEECH_FRAMES = 3
 
 # P06: Max audio buffer size — 5 minutes at 16kHz 16-bit mono = 9.6MB.
 # Prevents unbounded memory growth from long dictation sessions or stuck clients.
@@ -202,6 +212,8 @@ class VoicePipeline:
         self._audio_buffer = bytearray()
         self._last_voice_time = 0.0
         self._is_speaking = False
+        # TT #563: consecutive above-threshold frame counter for debounce.
+        self._consec_voice_frames = 0
 
         # #173 / TinkerTab #262: per-direction audio codec.  Default
         # PCM (raw int16 binary frames as today).  set_uplink_codec()
@@ -494,9 +506,18 @@ class VoicePipeline:
         now = time.monotonic()
 
         if rms > _SILENCE_THRESHOLD:
-            self._is_speaking = True
-            self._last_voice_time = now
-        elif self._is_speaking:
+            # TT #563: debounce — require N consecutive above-threshold
+            # frames before flipping _is_speaking.  Rejects single-frame
+            # transients (touch artifacts, audio-routing pops).
+            self._consec_voice_frames += 1
+            if self._consec_voice_frames >= _MIN_SPEECH_FRAMES:
+                self._is_speaking = True
+                self._last_voice_time = now
+        else:
+            # Below threshold — reset the consecutive counter so non-
+            # consecutive spikes don't accumulate into a false trigger.
+            self._consec_voice_frames = 0
+        if not (rms > _SILENCE_THRESHOLD) and self._is_speaking:
             # Check if silence duration exceeds threshold
             silence_ms = (now - self._last_voice_time) * 1000
             if silence_ms >= self._config.audio.vad_silence_ms:
@@ -506,6 +527,7 @@ class VoicePipeline:
                     len(self._audio_buffer),
                 )
                 self._is_speaking = False
+                self._consec_voice_frames = 0
                 # Trigger processing
                 audio_data = bytes(self._audio_buffer)
                 self._audio_buffer.clear()
@@ -555,6 +577,7 @@ class VoicePipeline:
         self._audio_buffer.clear()
 
         self._is_speaking = False
+        self._consec_voice_frames = 0
         self._process_task = asyncio.create_task(
             self._process_with_timeout(audio_data)
         )

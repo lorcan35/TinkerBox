@@ -136,4 +136,8 @@ jobs:
             tests/test_channel_reply_handler.py \
             tests/test_debug_channel_push.py \
             tests/test_channels_mock.py \
-            tests/test_gateway_connector.py
+            tests/test_gateway_connector.py \
+            tests/test_integrations_registry.py \
+            tests/test_integrations_credentials.py \
+            tests/test_oauth_device_code.py \
+            tests/test_google_calendar_integration.py

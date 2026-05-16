@@ -1,21 +1,26 @@
-"""REST API routes for integrations (#341 / #342).
+"""REST API routes for integrations (#341 / #342 / #347).
 
 Tab5's Settings → Integrations surface calls these:
 
-  * GET  /api/v1/integrations                     — list + connection state
-  * POST /api/v1/integrations/{name}/connect      — start auth flow
-  * GET  /api/v1/integrations/{name}/status/{request_id}  — poll flow
-  * POST /api/v1/integrations/{name}/disconnect   — revoke + delete
-  * GET  /api/v1/integrations/{name}/test         — smoke test
+  * GET    /api/v1/integrations                          — list + connected accounts
+  * POST   /api/v1/integrations/{name}/connect           — start auth flow
+  * GET    /api/v1/integrations/{name}/status/{request_id}  — poll flow
+  * POST   /api/v1/integrations/{name}/disconnect        — disconnect ALL accounts
+  * DELETE /api/v1/integrations/{name}/accounts/{account_id}  — disconnect one (#347)
+  * PATCH  /api/v1/integrations/{name}/accounts/{account_id}  — set default (#347)
+  * GET    /api/v1/integrations/{name}/test              — smoke test default account
+  * GET    /api/v1/integrations/{name}/accounts/{account_id}/test  — per-account smoke test
 
-All routes require bearer auth (the standard middleware covers it; no
-extra check here).  Errors are surfaced as JSON with a sensible HTTP
-status — Tab5 turns them into modal text.
+OAuth callback:
+  * GET    /api/v1/oauth/callback  — Google redirect target (public)
+
+All non-callback routes require bearer auth.
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import asdict
 from typing import Any, Optional
 
 from aiohttp import web
@@ -61,7 +66,6 @@ class IntegrationRoutes:
     in-flight auth flows survive across requests."""
 
     def __init__(self) -> None:
-        # name -> backend instance (per-process singleton)
         self._instances: dict[str, IntegrationBackend] = {}
 
     def _get(self, name: str) -> IntegrationBackend:
@@ -73,42 +77,46 @@ class IntegrationRoutes:
         return self._instances[key]
 
     def register(self, app: web.Application) -> None:
+        app.router.add_get("/api/v1/integrations", self.list_all)
+        app.router.add_post(
+            "/api/v1/integrations/{name}/connect", self.connect,
+        )
         app.router.add_get(
-            "/api/v1/integrations",
-            self.list_all,
+            "/api/v1/integrations/{name}/status/{request_id}", self.status,
         )
         app.router.add_post(
-            "/api/v1/integrations/{name}/connect",
-            self.connect,
+            "/api/v1/integrations/{name}/disconnect", self.disconnect_all,
         )
         app.router.add_get(
-            "/api/v1/integrations/{name}/status/{request_id}",
-            self.status,
+            "/api/v1/integrations/{name}/test", self.test,
         )
-        app.router.add_post(
-            "/api/v1/integrations/{name}/disconnect",
-            self.disconnect,
+        # #347 — per-account routes.
+        app.router.add_delete(
+            "/api/v1/integrations/{name}/accounts/{account_id}",
+            self.disconnect_account,
+        )
+        app.router.add_patch(
+            "/api/v1/integrations/{name}/accounts/{account_id}",
+            self.update_account,
         )
         app.router.add_get(
-            "/api/v1/integrations/{name}/test",
-            self.test,
+            "/api/v1/integrations/{name}/accounts/{account_id}/test",
+            self.test_account,
         )
-        # OAuth callback — public route (bearer-auth bypassed by the
-        # middleware's PUBLIC_PREFIXES list; the auth happens via the
-        # PKCE state parameter which only the originating Dragon
-        # process can decrypt).  Google posts the user here after
-        # consent.  Walks every registered integration to find the one
-        # holding this state.
+        # OAuth callback — public (PKCE state authenticates).  See
+        # middleware/auth.py PUBLIC_PREFIXES.  Walks every registered
+        # integration to find the one holding this state.
         app.router.add_get("/api/v1/oauth/callback", self.oauth_callback)
 
     # ── handlers ────────────────────────────────────────────────
 
     async def list_all(self, request: web.Request) -> web.Response:
-        del request  # unused
+        del request
         out: list[dict[str, Any]] = []
         for name in list_integrations():
             integ = self._get(name)
             connected = await integ.is_connected()
+            accounts = await integ.list_accounts()
             state = (
                 IntegrationState.CONNECTED.value
                 if connected else IntegrationState.DISCONNECTED.value
@@ -119,6 +127,8 @@ class IntegrationRoutes:
                 "description": integ.description,
                 "auth_kind": integ.auth_kind,
                 "state": state,
+                "supports_multi_account": integ.supports_multi_account,
+                "accounts": [asdict(a) for a in accounts],
             })
         return web.json_response({"integrations": out})
 
@@ -170,9 +180,11 @@ class IntegrationRoutes:
             "state": status.state,
             "request_id": status.request_id,
             "error": status.error,
+            "account_id": status.account_id,
+            "account_label": status.account_label,
         })
 
-    async def disconnect(self, request: web.Request) -> web.Response:
+    async def disconnect_all(self, request: web.Request) -> web.Response:
         name = request.match_info["name"]
         try:
             integ = self._get(name)
@@ -181,9 +193,56 @@ class IntegrationRoutes:
         try:
             await integ.disconnect()
         except Exception as e:  # noqa: BLE001
-            logger.exception("integration %s disconnect failed", name)
+            logger.exception("integration %s disconnect-all failed", name)
             return json_error(f"Disconnect failed: {e}", 500)
         return web.json_response({"disconnected": True, "name": name})
+
+    async def disconnect_account(self, request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        account_id = request.match_info["account_id"]
+        try:
+            integ = self._get(name)
+        except KeyError:
+            return json_error(f"Unknown integration '{name}'", 404)
+        if not await integ.is_connected(account_id):
+            return json_error(
+                f"Account '{account_id}' is not connected for '{name}'", 404,
+            )
+        try:
+            await integ.disconnect(account_id=account_id)
+        except Exception as e:  # noqa: BLE001
+            logger.exception(
+                "integration %s disconnect %s failed", name, account_id,
+            )
+            return json_error(f"Disconnect failed: {e}", 500)
+        return web.json_response({
+            "disconnected": True, "name": name, "account_id": account_id,
+        })
+
+    async def update_account(self, request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        account_id = request.match_info["account_id"]
+        try:
+            integ = self._get(name)
+        except KeyError:
+            return json_error(f"Unknown integration '{name}'", 404)
+        body, err = await parse_json_body(request)
+        if err:
+            return err
+        if body.get("default") is True:
+            try:
+                await integ.set_default_account(account_id)
+            except DeviceCodeError as e:
+                return web.json_response(
+                    {"error": e.code, "message": e.description}, status=404,
+                )
+            return web.json_response({
+                "name": name, "account_id": account_id, "default": True,
+            })
+        return json_error(
+            "PATCH body must contain {\"default\": true} — no other fields supported",
+            400,
+        )
 
     async def test(self, request: web.Request) -> web.Response:
         name = request.match_info["name"]
@@ -192,10 +251,18 @@ class IntegrationRoutes:
         except KeyError:
             return json_error(f"Unknown integration '{name}'", 404)
         ok, detail = await integ.health_check()
+        return web.json_response({"ok": ok, "detail": detail, "name": name})
+
+    async def test_account(self, request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        account_id = request.match_info["account_id"]
+        try:
+            integ = self._get(name)
+        except KeyError:
+            return json_error(f"Unknown integration '{name}'", 404)
+        ok, detail = await integ.health_check(account_id=account_id)
         return web.json_response({
-            "ok": ok,
-            "detail": detail,
-            "name": name,
+            "ok": ok, "detail": detail, "name": name, "account_id": account_id,
         })
 
     async def oauth_callback(self, request: web.Request) -> web.Response:
@@ -203,12 +270,8 @@ class IntegrationRoutes:
 
         Google sends the user here after consent:
         ``?code=...&state=...`` on success or ``?error=...&state=...``
-        on denial.  We walk every instantiated integration looking for
-        one that recognizes the state, then hand the code off.
-
-        Responds with a tiny HTML page so the user's phone shows a
-        success/error message.  Tab5 has its own polling loop and
-        flips the modal independently.
+        on denial.  Walks every instantiated integration looking for
+        one that recognizes the state, then hands the code off.
         """
         params = request.query
         state = params.get("state", "")
@@ -220,7 +283,6 @@ class IntegrationRoutes:
                 "Missing state parameter — link may be malformed.", success=False,
             )
 
-        # Find the integration holding this state.
         matched: Optional[IntegrationBackend] = None
         for integ in self._instances.values():
             handler = getattr(integ, "handle_callback", None)

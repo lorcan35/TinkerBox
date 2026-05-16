@@ -140,4 +140,6 @@ jobs:
             tests/test_integrations_registry.py \
             tests/test_integrations_credentials.py \
             tests/test_oauth_device_code.py \
+            tests/test_oauth_auth_code.py \
+            tests/test_integrations_init.py \
             tests/test_google_calendar_integration.py

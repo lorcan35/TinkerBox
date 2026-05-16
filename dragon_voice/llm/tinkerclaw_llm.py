@@ -503,8 +503,19 @@ class TinkerClawBackend(LLMBackend):
                 scope=Scope.GATEWAY,
             )
 
+        # #336 follow-up: OpenClaw's /v1/chat/completions endpoint runs
+        # through the same codepath as the native agent runtime — BUT
+        # only when the `model` field targets an OpenClaw agent ID
+        # (`openclaw`, `openclaw/default`, `openclaw/<agentId>`).
+        # Passing the raw provider name (e.g. "minimax/MiniMax-M2.5")
+        # bypasses the agent layer and runs as a thin LLM proxy with
+        # no MCP servers, skills, memory, or tool catalog.  Switching
+        # to `openclaw/default` routes through the full agent runtime.
+        # The actual upstream model is selected by the gateway's agent
+        # config; clients can override via the `x-openclaw-model`
+        # header if needed.
         payload = {
-            "model": self._model,
+            "model": "openclaw/default",
             "messages": messages,
             "stream": True,
             # Audit C7 (#137): pre-stream cap so the upstream model
@@ -514,10 +525,19 @@ class TinkerClawBackend(LLMBackend):
         if self._session_key:
             payload["user"] = self._session_key
 
+        # If the legacy config set a specific upstream model name (e.g.
+        # `minimax/MiniMax-M2.5` or `anthropic/claude-sonnet-4.5`), send
+        # it via the OpenClaw-specific header so the agent runtime picks
+        # that backend.  Skip when the config already names an agent id.
+        request_headers = {}
+        if self._model and not self._model.startswith("openclaw/"):
+            request_headers["x-openclaw-model"] = self._model
+
         try:
             async with self._session.post(
                 f"{self._url}/v1/chat/completions",
                 json=payload,
+                headers=request_headers,
             ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()

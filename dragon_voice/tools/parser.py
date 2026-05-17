@@ -113,6 +113,14 @@ _ANCHOR_LEGACY = re.compile(
     r'[<\[]tool[>\]](\w+)</tool>\s*<args>\s*', re.DOTALL,
 )
 _ANCHOR_STD = re.compile(r'<tool_call>\s*', re.DOTALL)
+# Dialect 4 — Gemma family (gemma-3-it, gemma-4-E4B-it).  Format:
+#   `<|tool_call>call:NAME{json}<tool_call|>`
+# Note the `|` is INSIDE the angle brackets on both open + close —
+# these are special Gemma sentinel tokens, not standard XML tags.
+# Verified live with `lmstudio-community/gemma-4-E4B-it-GGUF` 2026-05-17.
+_ANCHOR_GEMMA = re.compile(
+    r'<\|tool_call>\s*call:\s*([a-z_][a-z0-9_]*)\s*', re.DOTALL,
+)
 
 
 def _walk_json(text: str, start: int) -> int:
@@ -224,6 +232,42 @@ def parse_tool_calls_with_errors(
             args = {}
         calls.append({"tool": name, "args": args})
 
+    # ── Dialect 4 — Gemma <|tool_call>call:NAME{...}<tool_call|> ─
+    # Gemma-3/4 family emits its own sentinel tokens that look like
+    # XML but aren't (the `|` is *inside* the angles).  Same JSON
+    # body shape as Dialect 1; closing `<tool_call|>` is encouraged
+    # but accepted truncated.
+    for m in _ANCHOR_GEMMA.finditer(text):
+        name = m.group(1)
+        i = m.end()
+        if i >= len(text) or text[i] != "{":
+            # Some Gemma turns emit `call:name()` with no JSON.  Treat
+            # as empty args when the name is in registered_names AND
+            # the immediate suffix is "()" or "<tool_call|>".
+            tail = text[i:i + 16]
+            if tail.startswith("()") or tail.startswith("<tool_call|>"):
+                if not registered_names or name in registered_names:
+                    calls.append({"tool": name, "args": {}})
+            continue
+        end = _walk_json(text, i)
+        if end < 0:
+            continue
+        args_str = text[i:end].strip()
+        try:
+            args = json.loads(args_str)
+        except json.JSONDecodeError:
+            logger.warning(
+                "Failed to parse Gemma tool args for %s: %s",
+                name, args_str[:100],
+            )
+            errors.append({
+                "dialect": 4, "name": name, "reason": "json_decode",
+            })
+            continue
+        if not isinstance(args, dict):
+            args = {}
+        calls.append({"tool": name, "args": args})
+
     # ── Dialect 3 — bracketed-name (xLAM quirk, #82) ─────────────
     # Skip the pass entirely if no tools registered (the validation
     # gate would reject everything anyway).
@@ -320,7 +364,8 @@ def has_tool_call(
         and "</tool>" in text
     )
     has_std = "<tool_call>" in text and "</tool_call>" in text
-    if has_legacy or has_std:
+    has_gemma = "<|tool_call>" in text  # Dialect 4
+    if has_legacy or has_std or has_gemma:
         return True
 
     if not registered_names:

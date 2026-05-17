@@ -358,16 +358,47 @@ prompt + memory + tool execution + NL wrap.
 |---|---|---|---|---|---|---|
 | **ministral-3-3b** | 2.1 GB Q4 | 7.6 s | 3 min | ✅ `<tool>NAME</tool>` | Dragon-standard | default |
 | MiniCPM-V-4.6 (752M base) | 504 MB Q4 | 3 s | 2.5 min | ✅ `<tool>NAME</tool>` | Dragon-standard | thinking blocks eat tokens, needs MAX_TOKENS_LOCAL≥1024 |
-| **Gemma-4-E4B-it** (7.5B) | 5.3 GB Q4 | 33 s | not E2E | ✅ best **accuracy** (picked `calendar_week` for "this week", others picked `_today`) | **`<\|tool_call>call:NAME{}<tool_call\|>` (4th dialect)** | Parser doesn't recognize the format yet; needs registry.py extension before usable through Dragon |
+| **Gemma-4-E4B-it** (7.5B) | 5.3 GB Q4 | 33 s | not E2E | ✅ best **accuracy** on small probes (picked `calendar_week` for "this week", others picked `_today`) | **`<\|tool_call>call:NAME{}<tool_call\|>` (4th dialect)** | Parser now supports Dialect 4 (`parser.py` 2026-05-17), but the model is too slow + verbose to be practical on Q6A — see gauntlet below |
 | MiniCPM-V-4.5 (8.2B) | 5.0 GB Q4 | timeout >90 s | — | — | — | too big for Q6A interactive |
 | Ministral via Ollama | 2.8 GB | 78 s | 2.5 min | ✅ | Dragon-standard | 10× slower client overhead |
 
-Gemma-4-E4B's parser-mismatch is the cleanest path to upgrading
-Local quality: add `<|tool_call>...<tool_call|>` as a 4th dialect in
-`dragon_voice/tools/registry.py` (alongside the existing 3 per the
-module docstring) and Gemma becomes the new winner — faster than
-MiniCPM-V's 3-min turn AND picks the right tool name on the first
-shot.  Tracked for a follow-up wave.
+Gemma-4-E4B's Dialect-4 parser is now LIVE in
+`dragon_voice/tools/parser.py` (27/27 unit tests still green).  The
+remaining problem is the model itself, not the plumbing — see gauntlet.
+
+### Gemma-4-E4B gauntlet (2026-05-17)
+
+Ran 10 tough user-story scenarios direct against llama-server on Q6A
+(temperature=0.0, max_tokens=80, no Dragon middleware).  System prompt
+included `calendar_today/week`, `gmail_unread/search`, `tasks_list/add`
+tool defs.  Per-query latency in parentheses.
+
+| # | Latency | Query | Result |
+|---|---|---|---|
+| 1 | 74 s | "What's my morning look like?" | `<tool>calendar_today{}</tool>` — no `<args>` block |
+| 2 | 47 s | "What's my schedule for the rest of this week?" | (empty — token overflow during `<think>`) |
+| 3 | 34 s | "Do I have any unread emails right now?" | `<tool>gmail_unread{}</tool>` — malformed |
+| 4 | 34 s | "Find emails about LangChain" | ✅ `<tool>gmail_search</tool><args>{"query":"LangChain"}</args>` — **perfect** |
+| 5 | 30 s | "What's on my todo list?" | `<tool>tasks_list{}</tool>` — malformed |
+| 6 | 50 s | "Add 'buy milk' to my todo list" | `<tool>tasks_add` — truncated |
+| 7-10 | — | (mixed: drafting email, summarising calendar, reading task) | empty or overflowed |
+
+**Score:**  4/10 emitted any tool token, 1/10 fully Dragon-standard
+format.  Note Gemma defaulted to the OLD `<tool>NAME</tool>` shape
+under this gauntlet's system prompt, NOT the `<|tool_call>` sentinel
+form it used during the direct-probe row above — both are accepted by
+parser.py.  The real problem is throughput: 30-75 s per turn with
+only 80 tokens of headroom is unworkable for a voice assistant; even
+the perfect Q4 took 34 s.
+
+### Verdict
+
+- **Default Local model stays `ministral-3:3b`** — 7.6 s probe, fires
+  on first shot, no thinking tax, Dragon-standard format on rails.
+- **Gemma-4-E4B parked** until either (a) the Q6A gets a meaningful
+  ARM64 NPU lane, or (b) a Q3/Q2 quant brings cold-start under ~10 s.
+- Parser Dialect 4 lives on regardless — it's harmless for non-Gemma
+  models and earned its keep through the gauntlet.
 
 ### Multimodal (audio / vision) is parked, not skipped
 

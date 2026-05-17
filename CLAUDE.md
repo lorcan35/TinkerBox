@@ -359,6 +359,7 @@ prompt + memory + tool execution + NL wrap.
 | **ministral-3-3b** | 2.1 GB Q4 | 7.6 s | 3 min | ✅ `<tool>NAME</tool>` | Dragon-standard | default |
 | MiniCPM-V-4.6 (752M base) | 504 MB Q4 | 3 s | 2.5 min | ✅ `<tool>NAME</tool>` | Dragon-standard | thinking blocks eat tokens, needs MAX_TOKENS_LOCAL≥1024 |
 | **Gemma-4-E4B-it** (7.5B) | 5.3 GB Q4 | 33 s | not E2E | ✅ best **accuracy** on small probes (picked `calendar_week` for "this week", others picked `_today`) | **`<\|tool_call>call:NAME{}<tool_call\|>` (4th dialect)** | Parser now supports Dialect 4 (`parser.py` 2026-05-17), but the model is too slow + verbose to be practical on Q6A — see gauntlet below |
+| Gemma-4-E2B-it (5.1B total / 2.3B effective) | 3.4 GB Q4 | 7-8 s warm | not E2E | partial: 8/10 tool emit, 0/10 with `<args>` | Dragon-standard (but truncated) | Speed matches ministral; accuracy fails — defaults to `calendar_today` regardless of intent; **native-format prompt = 0/10 + hallucinates fake calendar data + repetition loops** |
 | MiniCPM-V-4.5 (8.2B) | 5.0 GB Q4 | timeout >90 s | — | — | — | too big for Q6A interactive |
 | Ministral via Ollama | 2.8 GB | 78 s | 2.5 min | ✅ | Dragon-standard | 10× slower client overhead |
 
@@ -391,14 +392,50 @@ parser.py.  The real problem is throughput: 30-75 s per turn with
 only 80 tokens of headroom is unworkable for a voice assistant; even
 the perfect Q4 took 34 s.
 
+### Gemma-4-E2B gauntlet (2026-05-17)
+
+Smaller sibling (5.1 B total, 2.3 B "effective" via Per-Layer
+Embeddings).  `mradermacher/gemma-4-E2B-GGUF` Q4_K_M, llama-server
+with `--jinja`, explicit stop tokens `["<|im_end|>","<end_of_turn>","<eos>"]`
+(this Q4 quant emits ChatML-style stops, NOT Gemma's native
+`<end_of_turn>`).
+
+| # | Latency | Query | Got | Expected |
+|---|---|---|---|---|
+| 1 | 22.7 s cold | morning look | `<tool>calendar_today</tool>` | calendar_today ✓-name -args |
+| 2 | 7.3 s | rest of this week | `<tool>calendar_today</tool>` | calendar_week ✗ |
+| 3 | 7.6 s | unread emails | `<tool>gmail_unread</tool>` | gmail_unread ✓-name -args |
+| 4 | 7.5 s | search LangChain | `<tool>gmail_unread()</tool>` | gmail_search ✗ |
+| 5 | 7.8 s | todo list | `<tool>tasks_list()</tool>` | tasks_list ✓-name -args |
+| 6 | 8.1 s | add 'buy milk' | `<tool>tasks_add</tool>` | tasks_add ✓-name -args |
+| 7 | 8.2 s | draft email | `<tool>calendar_today</tool>` | gmail_send ✗ |
+| 8 | 4.9 s | summarise week | empty | calendar_week ✗ |
+| 9 | 4.7 s | last note | empty | notes_last ✗ |
+| 10 | 8.0 s | mark task done | `<tool>calendar_today</tool>` | tasks_complete ✗ |
+
+**Score:**  8/10 emitted a tool token, **0/10 included an `<args>` block**,
+4/10 picked the correct tool name.  Speed is excellent (warm = 7-8 s,
+ministral-class) but the model defaults to `calendar_today` whenever
+intent is even slightly ambiguous and never emits args.
+
+A second run with Gemma's *native* `<|tool_call>call:NAME{}<tool_call|>`
+sentinel format went **0/10 tool-emit** and produced hallucinated
+calendar entries + multi-line "milk milk milk" repetition loops.  The
+mradermacher Q4 quant does not follow multi-rule system prompts well.
+
 ### Verdict
 
 - **Default Local model stays `ministral-3:3b`** — 7.6 s probe, fires
-  on first shot, no thinking tax, Dragon-standard format on rails.
+  on first shot, no thinking tax, Dragon-standard format on rails,
+  picks the right tool 7/10 + emits `<args>` reliably.
 - **Gemma-4-E4B parked** until either (a) the Q6A gets a meaningful
   ARM64 NPU lane, or (b) a Q3/Q2 quant brings cold-start under ~10 s.
+- **Gemma-4-E2B parked** despite ministral-class speed — accuracy
+  + format failures stack to "unusable for tool-routing".  Worth
+  retrying with a bartowski/lmstudio-community Q4 if/when they publish
+  one (mradermacher's may have a damaged instruction-following layer).
 - Parser Dialect 4 lives on regardless — it's harmless for non-Gemma
-  models and earned its keep through the gauntlet.
+  models and earned its keep through both gauntlets.
 
 ### Multimodal (audio / vision) is parked, not skipped
 

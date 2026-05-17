@@ -32,17 +32,48 @@ class _FakeRegistry:
 
 
 @pytest.mark.asyncio
-async def test_registers_all_four_calendar_tools_on_clean_registry():
+async def test_registers_all_calendar_and_gmail_tools_on_clean_registry():
     server = MagicMock()
     server._tool_registry = _FakeRegistry()
 
     await init_integration_tools(server)
 
     names = server._tool_registry.names
+    # Calendar — 4 tools.
     assert "calendar_today" in names
     assert "calendar_week" in names
     assert "calendar_create" in names
     assert "calendar_cancel" in names
+    # Gmail — 5 tools (Phase 2).
+    assert "gmail_unread" in names
+    assert "gmail_search" in names
+    assert "gmail_read" in names
+    assert "gmail_send" in names
+    assert "gmail_archive" in names
+
+
+@pytest.mark.asyncio
+async def test_gmail_import_failure_does_not_block_calendar(monkeypatch, caplog):
+    """If Gmail's tool module fails to import, Calendar tools still
+    register — each integration block is independently failure-isolated."""
+    monkeypatch.delitem(sys.modules, "dragon_voice.tools.gmail_tool", raising=False)
+    real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __import__
+
+    def _raising_import(name, *args, **kwargs):
+        if name == "dragon_voice.tools.gmail_tool":
+            raise ImportError("simulated: gmail tool unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.__import__", _raising_import)
+    server = MagicMock()
+    server._tool_registry = _FakeRegistry()
+    with caplog.at_level("WARNING"):
+        await init_integration_tools(server)
+
+    names = server._tool_registry.names
+    assert "calendar_today" in names  # Calendar still landed.
+    assert "gmail_unread" not in names
+    assert any("Gmail tools not available" in r.message for r in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -56,15 +87,13 @@ async def test_no_tool_registry_is_silent_noop():
 
 
 @pytest.mark.asyncio
-async def test_calendar_module_import_failure_is_swallowed(monkeypatch, caplog):
-    """Simulate the google_calendar_tool module being missing — boot
-    must continue, with a single WARNING.  Confirms the try/except
-    failure-isolation invariant lives at the right boundary."""
-    # Drop the module from cache so the next import sees our stub.
+async def test_calendar_import_failure_does_not_block_gmail(monkeypatch, caplog):
+    """Simulate the google_calendar_tool module being missing.  Boot
+    must continue with a single WARNING AND the Gmail tools still
+    register — each integration block is independently failure-isolated."""
     monkeypatch.delitem(
         sys.modules, "dragon_voice.tools.google_calendar_tool", raising=False,
     )
-
     real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __import__
 
     def _raising_import(name, *args, **kwargs):
@@ -79,8 +108,9 @@ async def test_calendar_module_import_failure_is_swallowed(monkeypatch, caplog):
     with caplog.at_level("WARNING"):
         await init_integration_tools(server)
 
-    # No tools registered, no exception escaped.
-    assert server._tool_registry.registered == []
+    names = server._tool_registry.names
+    assert "calendar_today" not in names
+    assert "gmail_unread" in names  # Gmail still landed.
     assert any(
         "Google Calendar tools not available" in rec.message
         for rec in caplog.records

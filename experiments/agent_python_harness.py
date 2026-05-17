@@ -1,19 +1,7 @@
 #!/usr/bin/env python3
-"""LFM2.5-VL driving browser-harness-js on Dragon.
-
-Verb registry (5 verbs total — narrow surface, not raw CDP):
-  browser_navigate(url)
-  browser_read(selector?)          - selector defaults to body
-  browser_click(selector)
-  browser_screenshot()
-  browser_done(answer)
-
-Loop:
-  user_goal → LFM emits a verb → execute via SSH'd browser-harness-js
-            → feed observation back as next turn → repeat until done
-            (or step_limit reached).
-
-All transport via SSH to Dragon; LFM lives on the same box at :1234.
+"""Same verb registry as agent_lfm.py, but executes via the Python
+browser-harness on Dragon (high-level helpers: goto_url, page_info,
+js, capture_screenshot, etc.) instead of browser-harness-js raw CDP.
 """
 from __future__ import annotations
 import argparse, json, re, subprocess, sys, time
@@ -38,8 +26,6 @@ RE_LFM = re.compile(
     r"<\|tool_call_start\|>\s*\[?\s*([a-z_]+)\s*\(([^)]*)\)",
     re.I | re.DOTALL,
 )
-# Follow-up turns often drop the sentinel tokens.  Accept a bare
-# `verb_name(args)` IF the name is one of our registered verbs.
 VERB_NAMES = {
     "browser_navigate", "browser_read", "browser_click",
     "browser_screenshot", "browser_done",
@@ -82,17 +68,15 @@ def llm_step(history: list[dict]) -> tuple[str, float]:
         "messages": history,
         "max_tokens": 120,
         "temperature": 0.1,
-        "min_p": 0.15,
-        "repetition_penalty": 1.05,
     })
     cmd = [
         "sshpass", "-p", SSH_PASS, "ssh", "-o", "StrictHostKeyChecking=no",
         DRAGON,
-        f"curl -s -m 120 -X POST http://127.0.0.1:1234/v1/chat/completions "
+        f"curl -s -m 180 -X POST http://127.0.0.1:1234/v1/chat/completions "
         f"-H 'Content-Type: application/json' -d {json.dumps(body)!s}",
     ]
     t0 = time.monotonic()
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=140)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=200)
     dt = time.monotonic() - t0
     try:
         return json.loads(r.stdout)["choices"][0]["message"]["content"], dt
@@ -100,91 +84,65 @@ def llm_step(history: list[dict]) -> tuple[str, float]:
         return f"<<ERROR {e}: {r.stdout[:200]}>>", dt
 
 
-def harness_eval(js: str) -> tuple[str, int]:
-    """Run a JS snippet through browser-harness-js on Dragon. Returns (stdout, returncode)."""
+def harness_exec(py_src: str) -> tuple[str, int]:
+    """Execute a Python snippet through browser-harness on Dragon."""
+    remote = (
+        "export PATH=$HOME/.local/bin:$PATH && "
+        "BU_CDP_URL=http://127.0.0.1:9222 "
+        "browser-harness"
+    )
     cmd = [
         "sshpass", "-p", SSH_PASS, "ssh", "-o", "StrictHostKeyChecking=no",
         DRAGON,
-        f"PATH=$HOME/.bun/bin:$HOME/.local/bin:$PATH browser-harness-js {json.dumps(js)}",
+        f"{remote} <<'PYEOF'\n{py_src}\nPYEOF",
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-    return (r.stdout.rstrip() if r.returncode == 0 else r.stderr.rstrip()), r.returncode
-
-
-def ensure_attached() -> None:
-    """Connect harness to chromium if not already."""
-    # The harness CLI server is persistent; once connected, subsequent
-    # calls reuse the session. But after a chromium restart we MUST
-    # re-connect with a fresh wsUrl.
-    cmd = [
-        "sshpass", "-p", SSH_PASS, "ssh", DRAGON,
-        "WS=$(curl -s http://127.0.0.1:9222/json/version "
-        "| python3 -c 'import sys,json; print(json.load(sys.stdin)[\"webSocketDebuggerUrl\"])') "
-        "&& PATH=$HOME/.bun/bin:$HOME/.local/bin:$PATH "
-        "browser-harness-js \"await session.connect({wsUrl: '$WS'}); "
-        "const tabs=await listPageTargets(); "
-        "if(tabs.length>0){await session.use(tabs[0].targetId);} "
-        "await session.Page.enable(); return 'attached';\"",
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    print(f"[setup] {r.stdout.strip()}", file=sys.stderr)
+    out = r.stdout.rstrip() if r.returncode == 0 else r.stderr.rstrip()
+    return out, r.returncode
 
 
 def execute_verb(name: str, args: dict) -> str:
-    """Map a verb to a CDP-driving JS snippet, return observation text."""
     if name == "browser_navigate":
-        url = args.get("url", "").strip()
+        url = (args.get("url") or "").strip()
         if not url:
             return "ERROR: browser_navigate requires url arg"
         if not url.startswith(("http://", "https://")):
             url = "https://" + url
-        js = (
-            f"await session.Page.navigate({{url: {json.dumps(url)}}}); "
-            "await new Promise(r => setTimeout(r, 2000)); "
-            "const {result} = await session.Runtime.evaluate("
-            "{expression: 'document.title', returnByValue: true}); "
-            "return 'navigated to ' + " + json.dumps(url) + " + '; title: ' + result.value;"
-        )
-        out, rc = harness_eval(js)
-        return out if rc == 0 else f"ERROR: {out}"
+        py = f"goto_url({url!r}); wait_for_load(timeout=8); print(page_info())"
+        out, rc = harness_exec(py)
+        return f"navigated; {out}" if rc == 0 else f"ERROR: {out}"
 
     if name == "browser_read":
         sel = args.get("selector") or "body"
-        js = (
-            "const {result} = await session.Runtime.evaluate({"
-            f"expression: 'document.querySelector({json.dumps(sel)})?.innerText?.slice(0, 800) ?? \"<not found>\"', "
-            "returnByValue: true}); return result.value;"
+        js_expr = (
+            f"(document.querySelector({json.dumps(sel)})?.innerText ?? "
+            "'<not found>').slice(0, 800)"
         )
-        out, rc = harness_eval(js)
+        py = f"print(js({json.dumps(js_expr)}))"
+        out, rc = harness_exec(py)
         return f"text from {sel!r}: {out}" if rc == 0 else f"ERROR: {out}"
 
     if name == "browser_click":
         sel = args.get("selector", "")
         if not sel:
             return "ERROR: browser_click requires selector arg"
-        js = (
-            "const {result} = await session.Runtime.evaluate({"
-            f"expression: '(()=>{{const el=document.querySelector({json.dumps(sel)}); "
-            "if(!el)return\"not found\"; el.click(); return\"clicked\";}})()', "
-            "returnByValue: true}); return result.value;"
+        js_expr = (
+            "(()=>{const el=document.querySelector("
+            f"{json.dumps(sel)}); if(!el)return'not found'; "
+            "el.click(); return'clicked';})()"
         )
-        out, rc = harness_eval(js)
-        # Settle for JS-triggered nav
+        py = f"print(js({json.dumps(js_expr)}))"
+        out, rc = harness_exec(py)
         time.sleep(2)
         return f"click {sel!r}: {out}" if rc == 0 else f"ERROR: {out}"
 
     if name == "browser_screenshot":
-        js = (
-            "const shot = await session.Page.captureScreenshot({format: 'png'}); "
-            "const buf = Buffer.from(shot.data, 'base64'); "
-            "await Bun.write('/tmp/agent_screenshot.png', buf); "
-            "return 'screenshot saved (' + buf.length + ' bytes)';"
-        )
-        out, rc = harness_eval(js)
+        py = "p = capture_screenshot('/tmp/agent_py.png'); print('saved', p)"
+        out, rc = harness_exec(py)
         return out if rc == 0 else f"ERROR: {out}"
 
     if name == "browser_done":
-        return f"__DONE__::{args.get('answer', '(no answer provided)')}"
+        return f"__DONE__::{args.get('answer', '(no answer)')}"
 
     return f"ERROR: unknown verb {name!r}"
 
@@ -216,8 +174,6 @@ def run_goal(goal: str) -> None:
             return
         print(f"  obs: {obs[:300]}")
         history.append({"role": "assistant", "content": text})
-        # Track which verbs+args have already been called and inject
-        # a no-repeat hint, since LFM-Q4 oscillates on the same call.
         history.append({"role": "user", "content": (
             f"Result: {obs[:600]}\n\n"
             f"GOAL: {goal}\n"
@@ -231,9 +187,6 @@ def run_goal(goal: str) -> None:
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
-    p.add_argument("goal", help="User goal in natural language")
-    p.add_argument("--no-attach", action="store_true")
+    p.add_argument("goal")
     a = p.parse_args()
-    if not a.no_attach:
-        ensure_attached()
     run_goal(a.goal)

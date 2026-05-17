@@ -1,10 +1,55 @@
-# browser-harness-js on Dragon (2026-05-17)
+# Browser harnesses on Dragon (2026-05-17)
 
-[browser-use/browser-harness-js](https://github.com/browser-use/browser-harness-js)
-installed on Dragon Q6A.  It's a Bun HTTP server that exposes Chrome
-DevTools Protocol — 56 domains, 652 typed methods — as JavaScript
-callable through a CLI.  No LLM loop is wired yet; the harness is
-parked ready for an agent to drive it.
+Two harnesses installed on Dragon Q6A, both functional:
+
+| Harness | Lang | CLI | Strengths |
+|---|---|---|---|
+| [`browser-harness-js`](https://github.com/browser-use/browser-harness-js) | Bun/TypeScript | `browser-harness-js` | Raw CDP surface (56 domains, 652 methods); persistent session reused across calls; minimal abstractions |
+| [`browser-harness`](https://github.com/browser-use/browser-harness) | Python (uv) | `browser-harness` | High-level helpers (`goto_url`, `page_info`, `js`, `capture_screenshot`, `click_at_xy`, `fill_input`, `wait_for_element`, etc.); designed for Claude Code / Codex skill registration; ~100 domain-specific recipes in `agent-workspace/domain-skills/` (Gmail, GitHub, YouTube, Amazon, Reddit, LinkedIn, etc.) |
+
+Both connect to the same headless Chromium kept up by
+`dragon-chromium.service` on `:9222`.  Use `BU_CDP_URL=http://127.0.0.1:9222`
+to point the Python harness at it (auto-detect doesn't work because
+our profile dir is non-standard).
+
+## End-to-end success (Gemma 3 4B, 2026-05-17)
+
+After LFM-VL Q4/Q8 both failed the multi-turn loop, swapped llama-
+server to **Gemma 3 4B IT Q4_K_M** (2.49 GB weights + 851 MB mmproj,
+~2.5× LFM's effective params).  Both harnesses now drive successfully:
+
+| Story | Harness | Result |
+|---|---|---|
+| "Go to example.com and tell me what the page says" | JS | ✅ 3 steps, 96 s — navigate → read body → done |
+| "Go to example.com, then click the 'Learn more' link, and tell me where it took you" | JS | ⚠️ 4 steps, closed loop but with hallucinated click (`#more` selector didn't match) and hallucinated answer `https://www.iana.org/domains/example` (correct from training data, NOT from observed nav) |
+| "Go to example.com and tell me what the page says" | Python | ✅ 3 steps, 100 s — same nav-read-done shape |
+
+**Why Gemma 3 works where LFM-VL didn't:** at 4 B params Gemma 3
+reliably calls `browser_done(answer="...")` once an observation
+contains the answer.  LFM-VL at 1.6 B kept emitting more verbs past
+the obvious stopping point.  The capacity ceiling for multi-turn
+state tracking on Q6A appears to sit between 2 B and 4 B effective
+params.
+
+**Gotchas observed on Gemma 3 4B:**
+- Slower per-turn than LFM Q8 — 14-50 s/verb instead of 5-10 s
+- Click strategy is naive: invents selectors like `#more` for a "Learn
+  more" link without verifying.  When click silently no-ops, it doesn't
+  re-check; reads the still-same page and hallucinates the destination
+  from training data.
+
+## Agent implementations
+
+Both live in `experiments/`:
+
+- `agent_js_harness.py` — Gemma 3 4B drives `browser-harness-js` via
+  raw CDP calls.  5 verbs (navigate / read / click / screenshot / done).
+- `agent_python_harness.py` — Gemma 3 4B drives the Python harness via
+  high-level helpers (`goto_url`, `js`, `capture_screenshot`).  Same 5
+  verbs.
+
+Both use Dialect 5 sentinel-token parsing with a bare-verb fallback
+because Gemma 3 sometimes drops the sentinels on follow-up turns.
 
 ## Why install with no agent
 

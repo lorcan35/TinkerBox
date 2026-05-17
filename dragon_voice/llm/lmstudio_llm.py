@@ -31,7 +31,7 @@ class LMStudioBackend(LLMBackend):
     async def initialize(self) -> None:
         """Verify LM Studio is reachable."""
         self._session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=120, sock_read=60),
+            timeout=aiohttp.ClientTimeout(total=600, sock_read=300),
             headers={"Content-Type": "application/json"},
         )
 
@@ -65,7 +65,7 @@ class LMStudioBackend(LLMBackend):
         """Stream tokens from LM Studio using SSE."""
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=120, sock_read=60),
+                timeout=aiohttp.ClientTimeout(total=600, sock_read=300),
                 headers={"Content-Type": "application/json"},
             )
 
@@ -164,7 +164,7 @@ class LMStudioBackend(LLMBackend):
         """
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=120, sock_read=60),
+                timeout=aiohttp.ClientTimeout(total=600, sock_read=300),
                 headers={"Content-Type": "application/json"},
             )
 

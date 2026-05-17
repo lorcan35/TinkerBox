@@ -41,7 +41,11 @@ SYSTEM_PROMPT_CLOUD = (
 )
 
 # Mode-aware max tokens
-MAX_TOKENS_LOCAL = 128   # Small model, keep fast
+MAX_TOKENS_LOCAL = 1024  # Was 128 — bumped for thinking-mode models
+                         # (MiniCPM-V-4.6, qwen3-thinking) which spend
+                         # tokens in <think>...</think> before answering.
+                         # Non-thinking models (ministral-3:3b) still
+                         # stop naturally well under the cap.
 MAX_TOKENS_HYBRID = 256  # Local LLM with cloud STT/TTS
 MAX_TOKENS_CLOUD = 512   # Cloud LLM can handle more
 

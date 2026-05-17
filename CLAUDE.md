@@ -263,6 +263,129 @@ Tab5 firmware can ignore `fleet_summary` (legacy `vision_capability` event keeps
 - `tests/test_capability_declaration.py` — 31 per-backend cap assertions
 - `tests/test_multimodal_persistence.py` — 14 marker + hydration tests
 
+## Local-first Inference on Dragon (LM Studio-compat via llama-server, May 2026)
+
+**Principle: Local mode is Dragon-only.**  Never propose workstation-LAN
+inference servers as a Local-first path even when Dragon ARM64 + Ollama
+can't run a model — wait for upstream support, or have the user opt
+into Cloud / Hybrid explicitly.  Introducing a workstation dependency
+breaks both privacy + the "Tab5 + Dragon, nothing else" product story.
+(User directive, captured to memory `feedback_dragon_only_local.md`.)
+
+### Why we swapped Ollama → llama-server for the Local LLM path
+
+Same hardware (Q6A ARM64), same `ministral-3:3b` model:
+
+| Path | Direct tool-call probe | End-to-end through Dragon |
+|---|---|---|
+| Ollama | ~78 s | ~140 s |
+| llama-server | **~7.6 s** | **~191 s** (tool exec + LLM wrap) |
+
+The direct-probe ~10× speedup is the load + sampler overhead Ollama
+adds; end-to-end is closer because most of the time is consumed by
+the same llama.cpp eval underneath.  Net product win: MiniCPM-V family
+loads + serves cleanly via llama-server (Ollama 500'd on V-4.6 blobs),
+LM Studio-compatible API gives us a richer ecosystem of tooling +
+clients, and we're no longer paying Ollama's Go-wrapper overhead.
+
+### Dragon-side wiring
+
+- **Inference server:**  `/home/radxa/llama.cpp/build/bin/llama-server`
+  serves OpenAI-compatible `/v1/chat/completions` on `localhost:1234`.
+  Built ARM64-native from llama.cpp master (b8696 verified working).
+- **Persistent via systemd:**  `tinkerclaw-llama-server.service` (unit
+  shipped in `deploy/systemd/`).  Survives reboot, restart-on-failure,
+  swap model via the unit's `--model` arg + `systemctl restart`.
+- **Dragon LLM backend:**  `dragon_voice/llm/lmstudio_llm.py` —
+  un-changed, just point the URL at `localhost:1234`.  Config:
+  ```yaml
+  llm:
+    backend: "lmstudio"          # was "ollama"
+    local_backend: "lmstudio"    # was implicit "ollama"
+    lmstudio_url: "http://localhost:1234/v1"
+    lmstudio_model: "default"    # llama-server reports its loaded GGUF
+  ```
+- **Token cap:**  `MAX_TOKENS_LOCAL = 1024` (was 128).  Required for
+  thinking-mode models (MiniCPM-V-4.6, qwen3-thinking) which spend
+  budget inside `<think>...</think>` and emit zero visible content
+  when capped low.  Non-thinking models (ministral-3:3b) stop
+  naturally well under the cap — no-op cost.
+- **HTTP timeouts:**  `lmstudio_llm.py` uses
+  `ClientTimeout(total=600, sock_read=300)` — bumped from 120/60
+  because Local-mode turns on Q6A routinely hit 90-180 s.
+
+### Default Local LLM: `ministral-3:3b`
+
+Per the 2026-04-25 gauntlet AND the 2026-05-17 llama-server bench:
+- Tool-call accuracy: emits clean `<tool>NAME</tool><args>{}</args>`
+  markers, fires 7/10 on the gauntlet, 100 % on the new Calendar /
+  Gmail / Tasks integration set.
+- Latency: ~7-8 s direct probe, ~3 min end-to-end through Dragon's
+  full prompt (system + tools + memory + history).
+- Reply quality: specific + actionable ("3 standups May 17 at 7 AM,
+  1 PM, 4 PM" beats MiniCPM-V's "three scheduled events").
+- No thinking tax.
+
+### Backend priority + fallback chain (2026-05-17)
+
+`create_llm()` in `dragon_voice/llm/__init__.py` does a synchronous
+TCP probe to `lmstudio_url` when `backend="lmstudio"`.  If the
+llama-server socket isn't reachable at process-start, it transparently
+falls back to Ollama for the rest of that session.
+
+Implications:
+- Restart of `tinkerclaw-llama-server` mid-Dragon-session is NOT
+  picked up automatically.  After fixing llama-server, also
+  `systemctl restart tinkerclaw-voice` to re-evaluate.
+- The fallback is one-shot at instance creation — not per-request —
+  so warm-path latency is unaffected.
+
+Order of preference (Local mode):
+1. `lmstudio` (llama-server) — when reachable on 127.0.0.1:1234
+2. `ollama` — automatic fallback when (1) is down
+
+To force pure Ollama without removing llama-server, set
+`llm.backend: "ollama"` + `llm.local_backend: "ollama"` in `config.yaml`.
+
+### Other Local models benchmarked (2026-05-17)
+
+All probed via llama-server on Q6A, same system prompt + tool defs.
+Direct probe is "emit a tool call for a single fixed query"; the
+end-to-end column is through Dragon's ConversationEngine with full
+prompt + memory + tool execution + NL wrap.
+
+| Model | Quant size | Direct | End-to-end | Tool fired | Tool format | Notes |
+|---|---|---|---|---|---|---|
+| **ministral-3-3b** | 2.1 GB Q4 | 7.6 s | 3 min | ✅ `<tool>NAME</tool>` | Dragon-standard | default |
+| MiniCPM-V-4.6 (752M base) | 504 MB Q4 | 3 s | 2.5 min | ✅ `<tool>NAME</tool>` | Dragon-standard | thinking blocks eat tokens, needs MAX_TOKENS_LOCAL≥1024 |
+| **Gemma-4-E4B-it** (7.5B) | 5.3 GB Q4 | 33 s | not E2E | ✅ best **accuracy** (picked `calendar_week` for "this week", others picked `_today`) | **`<\|tool_call>call:NAME{}<tool_call\|>` (4th dialect)** | Parser doesn't recognize the format yet; needs registry.py extension before usable through Dragon |
+| MiniCPM-V-4.5 (8.2B) | 5.0 GB Q4 | timeout >90 s | — | — | — | too big for Q6A interactive |
+| Ministral via Ollama | 2.8 GB | 78 s | 2.5 min | ✅ | Dragon-standard | 10× slower client overhead |
+
+Gemma-4-E4B's parser-mismatch is the cleanest path to upgrading
+Local quality: add `<|tool_call>...<tool_call|>` as a 4th dialect in
+`dragon_voice/tools/registry.py` (alongside the existing 3 per the
+module docstring) and Gemma becomes the new winner — faster than
+MiniCPM-V's 3-min turn AND picks the right tool name on the first
+shot.  Tracked for a follow-up wave.
+
+### Multimodal (audio / vision) is parked, not skipped
+
+Mainline llama.cpp doesn't yet support MiniCPM-V-4.6's `minicpmv4_6`
+projector or MiniCPM-o's audio encoder.  When we need audio/vision
+on Dragon:
+
+- **Vision via MiniCPM-V family:**  wait for projector support to land
+  upstream, OR rebuild llama.cpp from a feature branch that has it.
+- **Audio via MiniCPM-o:**  the realistic path is `tc-mb/llama.cpp-omni`
+  (openbmb maintainer's fork) — clean build (~15 min on Q6A), use the
+  fork's converter to GGUF-ify MiniCPM-o-4.5 from safetensors.  Tracked
+  for a future session.
+
+In the meantime, **Cloud mode (vmode=2)** already handles audio +
+vision via OpenRouter — the right answer when the user explicitly
+opts in to cloud.
+
 ## TinkerClaw Integration (Optional Sidecar)
 
 When `voice_mode=3` is active, Dragon delegates all intelligence to the TinkerClaw gateway running on the same machine. Dragon becomes an audio pipe only — STT captures speech, the transcript is forwarded to TinkerClaw, and the response is spoken back via TTS.

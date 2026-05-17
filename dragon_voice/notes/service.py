@@ -18,6 +18,32 @@ from dragon_voice.notes.db import Note, NotesDB
 logger = logging.getLogger(__name__)
 
 
+def _placeholder_title(text: str, max_words: int = 8) -> str:
+    """First N non-empty words from the transcript as a placeholder title.
+
+    Used as the initial title at note-create time so the HTTP response
+    can return immediately; the real LLM-generated title overwrites it
+    when the background task finishes.
+    """
+    if not text:
+        return "Untitled note"
+    words = text.strip().split()
+    if not words:
+        return "Untitled note"
+    head = " ".join(words[:max_words])
+    if len(words) > max_words:
+        head += "…"
+    return head[:80]
+
+
+def _placeholder_summary(text: str, max_chars: int = 200) -> str:
+    """First N chars of the transcript as a placeholder summary."""
+    s = (text or "").strip()
+    if len(s) <= max_chars:
+        return s
+    return s[:max_chars].rstrip() + "…"
+
+
 class NotesService:
     """Orchestrates note creation from audio or text, with STT + LLM + embeddings."""
 
@@ -91,51 +117,85 @@ class NotesService:
     async def create_from_audio(
         self, pcm_data: bytes, sample_rate: int = 16000
     ) -> Note:
-        """Full pipeline: audio → STT → summarize → embed → store."""
+        """Full pipeline: audio → STT → store → (background) summarize + embed.
+
+        Title/summary generation is offloaded so the HTTP response
+        comes back in <1 s instead of blocking on a ~2 min Genie/Ollama
+        turn.  The note lands with a quick-and-dirty placeholder title
+        (first words of the transcript); the real title arrives via
+        ``update_note`` once the background task completes.
+        """
         duration_s = len(pcm_data) / (sample_rate * 2)  # 16-bit mono
         logger.info(
             "Processing audio note: %.1fs, %d bytes", duration_s, len(pcm_data)
         )
 
-        # Step 1: Transcribe
         transcript = await self._transcribe(pcm_data, sample_rate)
         if not transcript or transcript.strip() == "":
             transcript = "(empty recording)"
 
-        # Step 2: Generate title + summary with NPU LLM
-        title, summary = await self._summarize(transcript)
-
-        # Step 3: Create note
+        placeholder_title = _placeholder_title(transcript)
+        placeholder_summary = _placeholder_summary(transcript)
         note = Note(
-            title=title,
+            title=placeholder_title,
             transcript=transcript,
-            summary=summary,
+            summary=placeholder_summary,
             source="audio",
             duration_s=duration_s,
         )
         note = await self._db.create(note)
 
-        # Step 4: Generate embedding (background — don't block response)
-        # Tracked via _spawn_bg so shutdown can cancel in-flight embeds.
+        # Background: real title/summary via LLM + semantic embedding.
+        # Neither blocks the HTTP response — the network-error chip on
+        # Tab5 was Dragon holding the POST for the full LLM duration.
+        self._spawn_bg(self._fill_title_summary(note.id, transcript))
         self._spawn_bg(self._embed_note(note.id, transcript))
 
         return note
 
     async def create_from_text(self, text: str, title: str = "") -> Note:
-        """Create a note from text input (no audio)."""
-        if not title:
-            title, _ = await self._summarize(text)
-        _, summary = await self._summarize(text)
+        """Create a note from text input (no audio).
 
+        Same async pattern as ``create_from_audio`` — the LLM title +
+        summary fill in later; the HTTP response comes back fast.
+        """
+        initial_title = title or _placeholder_title(text)
+        initial_summary = _placeholder_summary(text)
         note = Note(
-            title=title,
+            title=initial_title,
             transcript=text,
-            summary=summary,
+            summary=initial_summary,
             source="text",
         )
         note = await self._db.create(note)
+        # Only fire title/summary in the background when the caller
+        # didn't already supply a title — they may be authoring it
+        # explicitly (e.g. typed Notes flow).
+        if not title:
+            self._spawn_bg(self._fill_title_summary(note.id, text))
+        else:
+            self._spawn_bg(self._fill_summary_only(note.id, text))
         self._spawn_bg(self._embed_note(note.id, text))
         return note
+
+    async def _fill_title_summary(self, note_id: str, text: str) -> None:
+        """Background task: generate real title+summary and update note."""
+        try:
+            title, summary = await self._summarize(text)
+        except Exception:  # noqa: BLE001
+            logger.warning("Background title+summary failed for %s", note_id, exc_info=True)
+            return
+        await self._db.update(note_id, {"title": title, "summary": summary})
+
+    async def _fill_summary_only(self, note_id: str, text: str) -> None:
+        """Background task: leave the user-supplied title alone, just
+        fill in the summary."""
+        try:
+            _, summary = await self._summarize(text)
+        except Exception:  # noqa: BLE001
+            logger.warning("Background summary failed for %s", note_id, exc_info=True)
+            return
+        await self._db.update(note_id, {"summary": summary})
 
     # ── Semantic search ─────────────────────────────────────────────────
 

@@ -549,20 +549,32 @@ class VoiceServer:
         if rejection is not None:
             return rejection
 
-        # v4·D connectivity audit -- ROOT CAUSE FIX #3.
+        # WS heartbeat budget (2026-05-17 dictation regression fix).
         #
-        # Enable aiohttp's built-in WS heartbeat at 30 s with a 60 s
-        # pong-wait window.  Previously heartbeat=None meant the
-        # server never sent WS-level pings -- dead sockets could only
-        # be detected by a failed send.  With heartbeat enabled, aiohttp
-        # emits a PING every `heartbeat` seconds and closes the
-        # connection if the peer hasn't replied within `receive_timeout`.
-        # Paired with Tab5's new TCP-level keepalive, both sides now
-        # notice a half-open socket in well under 60 s instead of
-        # waiting for the app layer to try a write and fail.
+        # Background: aiohttp's `heartbeat=N` sends a server-initiated
+        # PING every N seconds AND silently uses N/2 as the PONG-wait
+        # window.  At heartbeat=60 that's a 30 s PONG budget — which
+        # turned out to be tight enough to bite during long-form
+        # dictation: Tab5's esp_websocket_client serves RX + TX + auto-
+        # PONG on a single task, and while a 30 s audio segment is
+        # streaming up the TX queue can starve PONG handling.  The
+        # journal smoking-gun: `WebSocket error for ws12: No PONG
+        # received after 30.0 seconds`, after which Tab5 reconnects
+        # and the in-flight transcribe POST fails with "network error"
+        # on the Tab5 UI.
+        #
+        # Fix: bump heartbeat to 180 s so the implicit PONG-watch
+        # window is 90 s — well outside any realistic TX-backpressure
+        # delay on Tab5.  Receive_timeout stays at 600 s (10 min idle
+        # → drop) as the dead-socket guard.  Tab5 still sends its own
+        # 15-s PINGs which Dragon auto-PONGs via aiohttp, so liveness
+        # detection works both directions.  The bigger window only
+        # affects how aggressively Dragon probes silent connections;
+        # half-open sockets are still caught by TCP keepalive on the
+        # Tab5 side (10 s idle + 5 s × 3 probes ≈ 25 s).
         ws = web.WebSocketResponse(
             max_msg_size=10 * 1024 * 1024,
-            heartbeat=60.0,
+            heartbeat=180.0,
             # 2026-04-23 (#58): 120 → 600 s.  Previously Tab5 WS got dropped
             # mid-turn when TC was running a long agent task — heartbeat
             # PING goes out every 60 s but if the TC response hasn't started

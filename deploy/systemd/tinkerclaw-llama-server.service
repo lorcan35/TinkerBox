@@ -5,10 +5,14 @@
 # (dragon_voice/llm/lmstudio_llm.py) talks to this on Local + Hybrid
 # voice-mode paths.
 #
-# Default model (2026-05-17): **LFM2.5-VL-1.6B** (LiquidAI).
+# Default model (2026-05-17): **LFM2.5-VL-1.6B Q8_0** (LiquidAI).
 # - Aced the tool-routing gauntlet 10/10 with directive system prompt
 #   (vs ministral 7/10), and brings vision for free.
-# - 696 MB Q4_0 + 583 MB Q8_0 mmproj.
+# - 1.25 GB Q8_0 + 583 MB Q8_0 mmproj.  Bumped from Q4_0 (696 MB)
+#   2026-05-17 — Q8 emits cleaner verbs per-turn but doesn't fix the
+#   multi-turn state-tracking gap (browser-agent loop still can't
+#   reliably issue browser_done — that's a 1.6 B param ceiling, not
+#   a precision issue).  See docs/BROWSER-HARNESS.md.
 # - ~14 s/turn warm on Q6A, ~40 s for image-prompts.
 # - Tool dialect 5: `<|tool_call_start|>[name(arg="v")]<|tool_call_end|>`
 #   parsed by `dragon_voice/tools/parser.py` (Dialect 5, 2026-05-17).
@@ -43,7 +47,7 @@ Type=simple
 User=radxa
 WorkingDirectory=/home/radxa/llama.cpp
 ExecStart=/home/radxa/llama.cpp/build/bin/llama-server \
-  --model /home/radxa/llama.cpp/models/lfm25_vl/model-q4_0.gguf \
+  --model /home/radxa/llama.cpp/models/lfm25_vl/model-q8_0.gguf \
   --mmproj /home/radxa/llama.cpp/models/lfm25_vl/mmproj-q8.gguf \
   --port 1234 \
   --host 127.0.0.1 \

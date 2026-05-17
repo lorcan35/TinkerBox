@@ -110,6 +110,15 @@ threshold for reliable multi-turn state tracking.  This matches the
 hard-gauntlet 7/20 finding — arg extraction and state tracking are
 the model's weakest axes, and a browser agent needs both.
 
+**Q8_0 bump (2026-05-17, same session):** pulled the 1.25 GB Q8_0
+quant, restarted llama-server, re-ran the example.com story.  Result:
+Q8 is cleaner per-call (no dropped `https://`, picks `selector="title"`
+first which is smarter than blindly reading `body`) BUT exhibits the
+SAME structural failure — never calls `browser_done`, devolves to
+empty `browser_navigate()` after step 3.  Same trace with temp=0 +
+repetition_penalty=1.3.  The gap is the model's parameter count
+(1.6 B), not its precision.
+
 **Path forward (still deferred — none of these is a 30-min wire-up):**
 - Try LFM Q8_0 (1.25 GB vs 696 MB) — quality lift may close the gap
 - Try LFM2-2.6B if/when a GGUF lands — 60% more effective params

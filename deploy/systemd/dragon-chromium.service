@@ -1,0 +1,42 @@
+# Dragon-chromium — headless Chrome for browser-harness-js
+#
+# Keeps Chromium 146 alive on localhost:9222 with CDP remote-
+# debugging enabled, so the `browser-harness-js` CLI can attach via
+# `await session.connect({wsUrl: ...})`.
+#
+# Why we invoke the chromium binary directly (instead of /snap/bin/chromium):
+#   - snapd is masked on Dragon (deliberately, to keep memory + boot
+#     time low).  /snap/bin/chromium is just a wrapper that calls
+#     `snap run chromium` which needs snapd.
+#   - The actual ELF binary lives at /snap/chromium/current/usr/lib/
+#     chromium-browser/chrome and works fine in isolation.
+#
+# Profile dir is wiped on each start to avoid stale "DevToolsActivePort"
+# files confusing future auto-detect attempts.  The browser-harness-js
+# CLI on Dragon must connect via explicit wsUrl, since auto-detect
+# scans well-known profile dirs and ours is non-standard.
+#
+# Live state captured in ~/browser-harness-js/DEMOS.md on Dragon
+# (and TinkerBox docs/BROWSER-HARNESS.md).
+
+[Unit]
+Description=Headless Chromium for browser-harness-js (CDP on :9222)
+After=network.target
+
+[Service]
+Type=simple
+User=radxa
+Environment=HOME=/home/radxa
+ExecStartPre=/bin/bash -c "rm -rf /home/radxa/chrome-profile && mkdir -p /home/radxa/chrome-profile"
+ExecStart=/snap/chromium/current/usr/lib/chromium-browser/chrome \
+  --headless=new \
+  --disable-gpu \
+  --no-sandbox \
+  --remote-debugging-port=9222 \
+  --user-data-dir=/home/radxa/chrome-profile \
+  about:blank
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

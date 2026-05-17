@@ -1,8 +1,16 @@
 # PLAN: TinkerBox-native Integrations Layer
 
-**Status:** Planning · 2026-05-16
+Status: **Shipped (Phases 1 & 2)** · last updated 2026-05-17
 **Owner:** lorcan35
 **Tracking:** TBD (parent issue) · child issues per integration
+
+## Shipped
+
+- [x] Phase 1: Google Calendar (#344)
+- [x] Phase 1: Gmail single-account (#346) — pivoted from device-code to PKCE
+- [x] Phase 2: Gmail multi-account with email-keyed credentials (#353)
+- [x] Phase 2: Google Tasks (#102 backend + tools)
+- [ ] Phase 3: Slack, Discord, Home Assistant (TBD)
 
 ## Why this exists
 
@@ -210,3 +218,62 @@ After Phase 3 (the "tonight feels different" milestone):
 * Feedback: `~/.claude/projects/-home-rebelforce/memory/feedback_tinkerbox_not_fully_openclaw_dependent.md`
 * Open issue: [TBD parent tracking issue]
 * Sister doc: `docs/protocol.md` will need new Tab5 → Dragon WS messages if integrations need to push to Tab5 (e.g. incoming-call event from HA doorbell).
+
+## Architecture (as shipped — Phases 1 & 2)
+
+The plan above describes the original device-code design.  The
+shipped surface diverged on a few key points; this section is the
+canonical reference for what actually exists on Dragon today.
+
+### OAuth flow — PKCE, not device-code
+
+Google's device-code grant proved fragile against the
+unverified-app verification wall (issue #103) and the production
+Calendar / Gmail / Tasks scopes — Google required public-client +
+PKCE for the scope combinations we wanted.  All three Google
+integrations (Calendar, Gmail, Tasks) ship with **PKCE + loopback
+redirect** instead:
+
+1. Tab5 taps "Connect" → Dragon `POST /api/v1/integrations/connect`
+   returns an `authorization_url` with `code_verifier` retained
+   server-side.
+2. The URL contains a `state` nonce + a loopback redirect URI
+   (`http://127.0.0.1:<port>/oauth/callback`) that Dragon binds
+   ephemerally for the flow.
+3. User completes the consent flow in a browser; Google redirects to
+   Dragon's loopback listener with the auth code.
+4. Dragon exchanges the code + `code_verifier` for tokens, persists
+   them under the email-keyed credentials layout below, and emits
+   a connection-state event.
+
+### Multi-account credential storage layout
+
+`~/.tinkerclaw/integrations/<provider>/` per-provider directory.
+Inside each provider directory:
+
+- `<email>.json` — one credentials file per Google account
+  (mode `0o600`, atomic write).  Token-refresh writes back through
+  the same path.
+- `_legacy.json` — migration shim that captures the original
+  single-account credentials format from Phase 1 (#346) so a Dragon
+  upgrading from single-account → multi-account (#353) doesn't lose
+  its existing connection.  Loader checks `_legacy.json` first and
+  promotes it to `<email>.json` on first successful refresh.
+
+This shape supports the user's "connect both my work and personal
+Gmail" use case without forcing a re-pair on upgrade.
+
+### REST endpoint family
+
+Routes live at `/api/v1/integrations/*`:
+
+- `POST /api/v1/integrations/connect` — start a connect flow for
+  the given `provider`.  Returns `authorization_url` (PKCE) or the
+  device-code triple (for providers that still use device-code).
+- `POST /api/v1/integrations/disconnect` — revoke tokens + delete
+  the credentials file for `<provider, email>`.
+- `GET  /api/v1/integrations/list` — list available integrations
+  with connection state (per-email for multi-account providers).
+- `GET  /api/v1/integrations/test/{provider}` — smoke-test the
+  active connection (read calendar / list unread / list tasks /
+  etc.).  Returns `{ok: bool, detail: "..."}`.

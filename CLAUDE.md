@@ -139,6 +139,14 @@ Tab5 sends `{"type":"config_update","voice_mode":0|1|2|3,"llm_model":"..."}`. Dr
 - **Pipeline init resets to local defaults on reconnect:** When a device reconnects, the pipeline is re-initialized with local defaults (voice_mode 0) regardless of the previous session's mode. The client must re-send `config_update` to restore cloud mode.
 - **Per-connection config (deep copy):** Each WebSocket connection gets a deep copy of the global config via `copy.deepcopy()`. This prevents one device's config_update (e.g., switching to cloud mode) from corrupting another device's pipeline config. Without deep copy, two Tab5s connected simultaneously would share the same mutable config object.
 
+**Note on vmode=4 / vmode=5:**  These are Tab5-side-only modes.
+Tab5 auto-downconverts to vmode=0 on the wire so Dragon never
+sees them as live state.  Treat this as a protocol feature.
+
+**Note on config_update rate-limit semantics:**  Rapid config_update
+sends from Tab5 are coalesced server-side; expect 500-1000 ms ACK
+latency under back-pressure.
+
 ## Multi-Model Router (#183, April 2026)
 
 **The single voice-mode-picks-one-backend assumption is gone.** Dragon now supports a *fleet* of LLM backends declared in `LLMConfig.fleet`, with a `CapabilityAwareRouter` that picks per-turn based on the modalities present in the message and the active voice_mode tier.
@@ -580,6 +588,12 @@ in one shot.
 you, can't wait to see you Saturday'" → `gmail_send(to="mom@example.com", subject="Happy Birthday", body="love you, can't wait to see you Saturday")`.
 LFM emitted `gmail_send(to, subject, body)` with positional placeholders.
 
+**NOTE:** These browser-agent gauntlets (UI-TARS-1.5-7B, Gemma 3 4B
+browser-loop, Qwen3.5-4B as next browser-agent candidate) ran on the
+`feat/browser-agent` branch (commits 0521db4, 7a76461, 9bed41b,
+7a3f76c, 51580a7) and are **NOT on main**.  The bench results inform
+model-selection decisions but the agent infrastructure itself is parked.
+
 **The catch: latency.** Per-turn mean is ~96 s (range 79-123 s) on
 Q6A.  LFM-VL Q8 is ~20 s; Gemma 3 4B Q4 is ~14-50 s.  Qwen3.5-4B
 is roughly 5× slower for ~3× more accuracy.  For a real-time voice
@@ -811,16 +825,17 @@ etc.) stay below as durable design rules.
 ### Schema
 See `schema.sql` — **11 tables**: 6 foundation (devices, sessions, messages, notes, events, config), 3 memory (memory_facts, memory_documents, memory_chunks), and 2 scheduler (scheduled_notifications, notification_queue).
 
-## API-First Architecture (58 REST endpoints + 1 WebSocket)
+## API-First Architecture (62+ REST endpoints + 1 WebSocket)
 
-_Counted 2026-05-13 via:
-`grep -c 'app.router.add_' dragon_voice/api/*.py dragon_voice/notes/api.py | awk -F: '{s+=$2} END {print s}'` → 58.
-W7 sprint added 4 endpoints: `/api/v1/spend` (W5-A cross-stack audit),
-`/api/v1/agent_skills` (W7-B catalog), `/api/v1/debug/channel_message` (W7-F stub
-push), `/api/video/inject` (#178 debug injector — pre-W7 but missed in prior count).
-Prior count was 54 (post-#187 multi-model router); 53 was the count before #178;
-52 before TT #328 Wave 12 added `/api/v1/agent_log`; 47 before Phase 5 ε1b added
-the 5 scheduler endpoints._
+_Last updated 2026-05-17: integrations layer (Phases 1 & 2 — Calendar #344,
+Gmail single-account #346, Gmail multi-account #353, Tasks #102) added the
+`/api/v1/integrations/{connect,disconnect,list,test/{provider}}` family on
+top of the prior 58-endpoint surface.  Re-count with
+`grep -c 'app.router.add_' dragon_voice/api/*.py dragon_voice/notes/api.py | awk -F: '{s+=$2} END {print s}'`
+when planning further additions.  Prior milestones: 58 post-W7 sprint
+(`/api/v1/spend` W5-A, `/api/v1/agent_skills` W7-B, `/api/v1/debug/channel_message`
+W7-F, `/api/video/inject` #178); 54 post-#187 multi-model router; 53 pre-#178;
+52 pre-TT #328 Wave 12 `/api/v1/agent_log`; 47 pre-Phase 5 ε1b scheduler family._
 
 Dragon is an API-first server. Every capability is accessible via REST so any hardware client can use it.
 
@@ -885,6 +900,14 @@ Dragon is an API-first server. Every capability is accessible via REST so any ha
 | **Agent skills** | GET | `/api/v1/agent_skills` | W7-B: merged catalog of OpenClaw core tools (static 8) + tool names observed in `agent_log`.  Tab5 fetches on Agents-overlay open + on voice-mode change (when overlay visible). |
 | **Channel push (debug)** | POST | `/api/v1/debug/channel_message?device_id=X` | W7-F stub: fan a synthetic `channel_message` JSON frame to a connected Tab5 over the existing voice WS.  Mirrors `video_inject` shape.  Real gateway-driven push lives in W7-F.2's `GatewayConnector` (`dragon_voice/channels/gateway.py`). |
 | **Video (debug)** | POST | `/api/video/inject?device_id=X` | #178: push a JPEG frame as if from a paired Tab5 — exercises the downlink decode + ui_video_pane render path without a second device.  Body = raw JPEG; wraps with VID0 magic + 4-byte BE length. |
+| **Integrations** | POST | `/api/v1/integrations/connect` | Start an OAuth/PKCE (or device-code) connect flow for a third-party provider (Calendar / Gmail / Tasks).  Returns `authorization_url` or device-code triple. |
+| | POST | `/api/v1/integrations/disconnect` | Revoke tokens + delete the email-keyed credentials file for the given `provider, email`. |
+| | GET | `/api/v1/integrations/list` | List available integrations + connection state (per-email for multi-account providers). |
+| | GET | `/api/v1/integrations/test/{provider}` | Smoke-test the active connection (read calendar, list unread mail, list tasks).  Returns `{ok, detail}`. |
+| **Channels** | POST | `/api/v1/debug/channel_message` | W7-F synthetic-push helper: fans a `channel_message` JSON frame to a connected Tab5 over the existing voice WS — drives Tab5-side UX testing without a real OpenClaw channel plugin loaded.  Real reply round-trip: Tab5 → `channel_reply` WS frame → `channel_reply_handler` → `GatewayConnector.send_reply` → OpenClaw → platform API → `channel_reply_ack` back to Tab5. |
+| **Agent Skills** | GET | `/api/v1/agent_skills` | W7-B catalog of available agentic skills: merged OpenClaw core tools (static 8) + tool names observed in `agent_log`.  This is the endpoint Tab5 displays via `ui_agents.c` on the Agents overlay; refetched on overlay open + on voice-mode change. |
+| **Spend Tracker** | GET | `/api/v1/spend?day=YYYY-MM-DD` | W5-A daily LLM cost roll-up over the `events` table; empty `day` = today UTC.  Backed by `dragon_voice/billing/spend_tracker.py`. |
+| **Scheduler (notifications)** | POST | `/api/v1/scheduler/notifications` | Async push for time-deferred reminders: schedules a `notification` for `(device_id, when, message)`.  Delivered through the voice-WS at fire time; replayable from the sqlite-backed store across reboots. |
 
 ### Agentic Pipeline
 

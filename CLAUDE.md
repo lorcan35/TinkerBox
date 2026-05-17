@@ -544,6 +544,71 @@ distribution; the hard gauntlet (7/20) covers the messy half.
 - Parser Dialect 4 lives on regardless — it's harmless for non-Gemma
   models and earned its keep through both gauntlets.
 
+### Qwen3.5-4B HARD gauntlet (2026-05-17) — new leader
+
+`lmstudio-community/Qwen3.5-4B-GGUF` Q4_K_M (2.7 GB).  Gated DeltaNet
++ sparse MoE 4 B params, native multimodal, function-calling tuned.
+llama-server args same as LFM-VL minus `--mmproj` (different vision
+arch) and `--jinja` removed (the GGUF carries its own template that
+llama-server picks up).
+
+Same 20-scenario gauntlet, same directive system prompt.  Critical:
+each request passes `chat_template_kwargs: {"enable_thinking": false}`
+to disable Qwen's default `<think>` block — without this the model
+burns the entire token budget on reasoning and emits empty content.
+
+Recommended sampling for non-thinking mode (per the Qwen model card):
+`temp 0.7, top_p 0.8, top_k 20, presence_penalty 1.5`.
+
+| Axis | Score | Notes |
+|---|---|---|
+| A Happy-path | 1/2 | Q2 `music_play(query="lo-fi beats")` is BETTER than my hardcoded `lo-fi` — scoring artifact |
+| B Disambiguation | **4/4** | "Sarah lease" extracted cleanly as gmail_search; "ping boss late 15 min" → full email draft with subject + body |
+| C Complex args | 2/3 | Q9 chose `calendar_create(title="Renew Passport", when_iso="2027-03-13...")` instead of `tasks_add` — defensibly correct, scoring artifact |
+| D Red herrings | **3/3** | Including "what does notes_last() do?" → none() — all other models triggered the named tool |
+| E Out-of-scope | **3/3** | Venmo, swallow airspeed, kitchen lights all rejected with none() |
+| F Multi-step | **2/2** | Picks first reasonable step, same as Gemma 3 |
+| G Chitchat | **3/3** | "you're awesome, thanks!" correctly silent (LFM and Gemma both wrongly fired here) |
+| **Overall** | **18/20 strict, effectively 20/20** | Both misses are scoring artifacts |
+
+**Q6 highlight** (the killer): "ping the boss I'll be late by 15 min"
+→ `gmail_send(to="boss@example.com", subject="Late Arrival Notification", body="Hi Boss, I'm running a bit behind schedule and will be arriving 15 minutes later than planned. I'll make up for it ASAP. Best, [Your Name]")`.
+LFM-VL chose `timer_set(900)` here.  Qwen drafted a real email body
+in one shot.
+
+**Q8 highlight:** "email mom — subject 'Happy Birthday' — body 'love
+you, can't wait to see you Saturday'" → `gmail_send(to="mom@example.com", subject="Happy Birthday", body="love you, can't wait to see you Saturday")`.
+LFM emitted `gmail_send(to, subject, body)` with positional placeholders.
+
+**The catch: latency.** Per-turn mean is ~96 s (range 79-123 s) on
+Q6A.  LFM-VL Q8 is ~20 s; Gemma 3 4B Q4 is ~14-50 s.  Qwen3.5-4B
+is roughly 5× slower for ~3× more accuracy.  For a real-time voice
+assistant 96 s is too slow; for batched / background / agentic
+workloads it's the new leader.
+
+| Model | Hard-gauntlet score | Per-turn (mean) |
+|---|---|---|
+| ministral-3:3b | (untested on hard 20) | 3-8 s |
+| LFM2.5-VL-1.6B Q4 | 7/20 | ~14-20 s |
+| LFM2.5-VL-1.6B Q8 | (close to Q4 — same param ceiling) | ~14-20 s |
+| Gemma 3 4B IT Q4 | (only browser-loop tested) | 14-50 s |
+| **Qwen3.5-4B Q4_K_M** | **18/20 (effectively 20/20)** | **~96 s** |
+
+### Verdict refinement
+
+- **Real-time voice (LFM-VL stays default)** — sub-second TTFB
+  matters more than tool-routing perfection.  LFM hits 10/10 on the
+  easy gauntlet which covers the common case; we eat the 7/20 hard
+  failures as the cost of speed.
+- **Agentic / background tasks (Qwen3.5-4B candidate)** — when the
+  user explicitly invokes a "do this thing" mode where multiple
+  tool calls chain and quality matters more than latency, route to
+  Qwen.  Need to add a second llama-server slot on a different port,
+  OR add a runtime model-swap path (much slower).
+- **Browser-agent (when we revisit `feat/browser-agent`)** — Qwen3.5
+  is the obvious next try for the loop closure that Gemma 3 4B
+  almost-but-not-quite cracked.
+
 ### Multimodal (audio / vision) is parked, not skipped
 
 Mainline llama.cpp doesn't yet support MiniCPM-V-4.6's `minicpmv4_6`

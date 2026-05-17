@@ -9,13 +9,21 @@
 # same model is 45× faster on the same hardware and supports
 # tool-call markers reliably for ministral, MiniCPM-V, qwen3 etc.
 #
+# Default model: ministral-3-3b-instruct-2512.  Verified 2026-05-17
+# direct-probe 7.6 s, end-to-end through Dragon ~3 min, fires the
+# Calendar/Gmail/Tasks tools correctly + emits cleaner natural-
+# language replies than MiniCPM-V on the same hardware.  See
+# CLAUDE.md "Local-first Inference on Dragon" for the bench matrix.
+#
 # Pre-reqs (one-time install on Dragon):
 #   - llama.cpp built at /home/radxa/llama.cpp/build/bin/llama-server
-#   - GGUF model + (optional) mmproj at /home/radxa/llama.cpp/models/minicpm/
+#   - GGUF at /home/radxa/llama.cpp/models/ministral/model-q4_k_m.gguf
 #   - This unit copied to /etc/systemd/system/, daemon-reload, enable + start
 #
 # To swap the model: edit ExecStart's --model arg, run
 #   sudo systemctl restart tinkerclaw-llama-server
+# Models known to work: ministral-3:3b (winner), MiniCPM-V-4.6 (slower,
+# thinking-block tax), MiniCPM-V-4.5 (8B → too slow on Q6A).
 #
 # Pair-with: edit /home/radxa/dragon_voice/config.yaml so
 #   llm.backend = "lmstudio"
@@ -24,7 +32,7 @@
 # then restart tinkerclaw-voice.
 
 [Unit]
-Description=TinkerClaw llama-server (LM Studio compatible, MiniCPM-V on ARM64)
+Description=TinkerClaw llama-server (LM Studio compat, ministral default on ARM64)
 After=network.target
 Wants=network.target
 
@@ -33,7 +41,7 @@ Type=simple
 User=radxa
 WorkingDirectory=/home/radxa/llama.cpp
 ExecStart=/home/radxa/llama.cpp/build/bin/llama-server \
-  --model /home/radxa/llama.cpp/models/minicpm/model-q4_k_m.gguf \
+  --model /home/radxa/llama.cpp/models/ministral/model-q4_k_m.gguf \
   --port 1234 \
   --host 127.0.0.1 \
   --ctx-size 16384 \

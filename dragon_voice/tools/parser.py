@@ -71,6 +71,7 @@ backward-compatible `parse_tool_calls` swallows errors for the
 """
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
@@ -120,6 +121,15 @@ _ANCHOR_STD = re.compile(r'<tool_call>\s*', re.DOTALL)
 # Verified live with `lmstudio-community/gemma-4-E4B-it-GGUF` 2026-05-17.
 _ANCHOR_GEMMA = re.compile(
     r'<\|tool_call>\s*call:\s*([a-z_][a-z0-9_]*)\s*', re.DOTALL,
+)
+# Dialect 5 — LiquidAI LFM2 family (LFM2.5-VL, LFM2.5-1.2B).  Format:
+#   `<|tool_call_start|>[name(arg="value", arg2="value2")]<|tool_call_end|>`
+# Python-call syntax inside square brackets, NOT JSON.  We tolerate
+# the `[...]` being optional (some LFM variants omit it).
+# Verified live with `LiquidAI/LFM2.5-VL-1.6B-GGUF` 2026-05-17.
+_ANCHOR_LFM = re.compile(
+    r'<\|tool_call_start\|>\s*\[?\s*([a-z_][a-z0-9_]*)\s*\(',
+    re.DOTALL,
 )
 
 
@@ -268,6 +278,67 @@ def parse_tool_calls_with_errors(
             args = {}
         calls.append({"tool": name, "args": args})
 
+    # ── Dialect 5 — LFM2 <|tool_call_start|>[name(k="v",...)]<|...|> ─
+    # LFM emits Python keyword-argument syntax inside the call.  Parse
+    # by capturing the inside-paren region and feeding it to ast.parse
+    # as a synthetic call expression.  Robust to nested quotes, commas
+    # inside string values, and missing closing brackets.
+    for m in _ANCHOR_LFM.finditer(text):
+        name = m.group(1)
+        i = m.end()  # cursor just past the opening `(`
+        depth = 1
+        in_str: Optional[str] = None
+        esc = False
+        j = i
+        while j < len(text):
+            ch = text[j]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == in_str:
+                    in_str = None
+            elif ch in ('"', "'"):
+                in_str = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        if depth != 0:
+            errors.append({
+                "dialect": 5, "name": name, "reason": "paren_unbalanced",
+            })
+            continue
+        args_src = text[i:j]
+        args: dict = {}
+        if args_src.strip():
+            try:
+                tree = ast.parse(f"_({args_src})", mode="eval")
+                call = tree.body
+                if isinstance(call, ast.Call):
+                    for kw in call.keywords:
+                        if kw.arg is None:
+                            continue
+                        try:
+                            val = ast.literal_eval(kw.value)
+                        except (ValueError, SyntaxError):
+                            continue
+                        args[kw.arg] = val
+            except SyntaxError:
+                logger.warning(
+                    "Failed to parse LFM tool args for %s: %s",
+                    name, args_src[:100],
+                )
+                errors.append({
+                    "dialect": 5, "name": name, "reason": "syntax",
+                })
+                continue
+        calls.append({"tool": name, "args": args})
+
     # ── Dialect 3 — bracketed-name (xLAM quirk, #82) ─────────────
     # Skip the pass entirely if no tools registered (the validation
     # gate would reject everything anyway).
@@ -365,7 +436,8 @@ def has_tool_call(
     )
     has_std = "<tool_call>" in text and "</tool_call>" in text
     has_gemma = "<|tool_call>" in text  # Dialect 4
-    if has_legacy or has_std or has_gemma:
+    has_lfm = "<|tool_call_start|>" in text  # Dialect 5
+    if has_legacy or has_std or has_gemma or has_lfm:
         return True
 
     if not registered_names:

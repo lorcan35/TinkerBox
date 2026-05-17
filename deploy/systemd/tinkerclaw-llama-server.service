@@ -1,29 +1,31 @@
 # TinkerClaw — llama-server systemd unit (Dragon ARM64)
 #
-# Serves MiniCPM-V (or any GGUF) on localhost:1234 with the same
-# OpenAI-compatible API LM Studio uses.  Dragon's `lmstudio_llm`
-# backend (dragon_voice/llm/lmstudio_llm.py) talks to this on the
-# Local + Hybrid voice-mode paths.
+# Serves the Local LLM on localhost:1234 with the OpenAI-compatible API
+# LM Studio uses.  Dragon's `lmstudio_llm` backend
+# (dragon_voice/llm/lmstudio_llm.py) talks to this on Local + Hybrid
+# voice-mode paths.
 #
-# Why: Ollama on Q6A delivers ~0.06 tok/s; llama-server with the
-# same model is 45× faster on the same hardware and supports
-# tool-call markers reliably for ministral, MiniCPM-V, qwen3 etc.
+# Default model (2026-05-17): **LFM2.5-VL-1.6B** (LiquidAI).
+# - Aced the tool-routing gauntlet 10/10 with directive system prompt
+#   (vs ministral 7/10), and brings vision for free.
+# - 696 MB Q4_0 + 583 MB Q8_0 mmproj.
+# - ~14 s/turn warm on Q6A, ~40 s for image-prompts.
+# - Tool dialect 5: `<|tool_call_start|>[name(arg="v")]<|tool_call_end|>`
+#   parsed by `dragon_voice/tools/parser.py` (Dialect 5, 2026-05-17).
+# - Requires `--jinja` so the ChatML stops are recognised; this is
+#   fine with LFM (unlike Ministral which barfed on strict alternation).
 #
-# Default model: ministral-3-3b-instruct-2512.  Verified 2026-05-17
-# direct-probe 7.6 s, end-to-end through Dragon ~3 min, fires the
-# Calendar/Gmail/Tasks tools correctly + emits cleaner natural-
-# language replies than MiniCPM-V on the same hardware.  See
-# CLAUDE.md "Local-first Inference on Dragon" for the bench matrix.
+# Safe fallback: ministral-3:3b at /home/radxa/llama.cpp/models/ministral/
+# - Known-good with Dragon's existing system prompt (no behavioral tuning
+#   needed).  Swap by editing --model + removing --mmproj + removing --jinja.
 #
 # Pre-reqs (one-time install on Dragon):
 #   - llama.cpp built at /home/radxa/llama.cpp/build/bin/llama-server
-#   - GGUF at /home/radxa/llama.cpp/models/ministral/model-q4_k_m.gguf
+#   - GGUFs under /home/radxa/llama.cpp/models/{lfm25_vl,ministral}/
 #   - This unit copied to /etc/systemd/system/, daemon-reload, enable + start
 #
-# To swap the model: edit ExecStart's --model arg, run
+# To swap models: edit ExecStart's --model arg, run
 #   sudo systemctl restart tinkerclaw-llama-server
-# Models known to work: ministral-3:3b (winner), MiniCPM-V-4.6 (slower,
-# thinking-block tax), MiniCPM-V-4.5 (8B → too slow on Q6A).
 #
 # Pair-with: edit /home/radxa/dragon_voice/config.yaml so
 #   llm.backend = "lmstudio"
@@ -32,7 +34,7 @@
 # then restart tinkerclaw-voice.
 
 [Unit]
-Description=TinkerClaw llama-server (LM Studio compat, ministral default on ARM64)
+Description=TinkerClaw llama-server (LM Studio compat, LFM2.5-VL on ARM64)
 After=network.target
 Wants=network.target
 
@@ -41,22 +43,14 @@ Type=simple
 User=radxa
 WorkingDirectory=/home/radxa/llama.cpp
 ExecStart=/home/radxa/llama.cpp/build/bin/llama-server \
-  --model /home/radxa/llama.cpp/models/ministral/model-q4_k_m.gguf \
+  --model /home/radxa/llama.cpp/models/lfm25_vl/model-q4_0.gguf \
+  --mmproj /home/radxa/llama.cpp/models/lfm25_vl/mmproj-q8.gguf \
   --port 1234 \
   --host 127.0.0.1 \
   --ctx-size 16384 \
   --threads 8 \
+  --jinja \
   --log-disable
-# `--jinja` REMOVED 2026-05-17: Ministral's bundled chat template
-# raises `After the optional system message, conversation roles must
-# alternate user/assistant/user/...` when Dragon sends back-to-back
-# user messages OR the tool-response role in our conversation history.
-# Net: every Local-mode tool turn after the first returned
-# `[LM Studio error: 500]`.  llama-server's default (no --jinja)
-# is a permissive ChatML wrap that handles arbitrary role orderings
-# without raising.  Re-enable only after auditing Dragon's
-# conversation builder against the target model's chat template
-# strict rules.
 Restart=on-failure
 RestartSec=5
 

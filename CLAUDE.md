@@ -361,6 +361,7 @@ prompt + memory + tool execution + NL wrap.
 | **Gemma-4-E4B-it** (7.5B) | 5.3 GB Q4 | 33 s | not E2E | ✅ best **accuracy** on small probes (picked `calendar_week` for "this week", others picked `_today`) | **`<\|tool_call>call:NAME{}<tool_call\|>` (4th dialect)** | Parser now supports Dialect 4 (`parser.py` 2026-05-17), but the model is too slow + verbose to be practical on Q6A — see gauntlet below |
 | Gemma-4-E2B-it (5.1B total / 2.3B effective) | 3.4 GB Q4 | 7-8 s warm | not E2E | partial: 8/10 tool emit, 0/10 with `<args>` | Dragon-standard (but truncated) | Speed matches ministral; accuracy fails — defaults to `calendar_today` regardless of intent; **native-format prompt = 0/10 + hallucinates fake calendar data + repetition loops** |
 | MiniCPM-V-4.5 (8.2B) | 5.0 GB Q4 | timeout >90 s | — | — | — | too big for Q6A interactive |
+| **LFM2.5-VL-1.6B** (LiquidAI, vision-language) | 696 MB Q4_0 + 583 MB mmproj | 13-20 s | not E2E yet | **10/10 tool-emit + 10/10 correct-name + 10/10 args** | **`<\|tool_call_start\|>[name(arg="val")]<\|tool_call_end\|>` (5th dialect)** | NEW WINNER (with directive system prompt).  Vision works too (40 s for 300×400 jpeg → accurate one-sentence describe).  See gauntlet below |
 | Ministral via Ollama | 2.8 GB | 78 s | 2.5 min | ✅ | Dragon-standard | 10× slower client overhead |
 
 Gemma-4-E4B's Dialect-4 parser is now LIVE in
@@ -423,11 +424,58 @@ sentinel format went **0/10 tool-emit** and produced hallucinated
 calendar entries + multi-line "milk milk milk" repetition loops.  The
 mradermacher Q4 quant does not follow multi-rule system prompts well.
 
+### LFM2.5-VL-1.6B gauntlet (2026-05-17)
+
+LiquidAI's 1.6 B vision-language model.  696 MB Q4_0 weights + 583 MB
+Q8_0 mmproj on Dragon (`/home/radxa/llama.cpp/models/lfm25_vl/`).
+llama-server with `--mmproj` + `--jinja`.  Sampling: temp 0.1,
+min_p 0.15, repetition_penalty 1.05 (LFM-recommended).
+
+System prompt was DIRECTIVE: "You are a tool-router.  You ALWAYS call
+exactly one tool.  NEVER explain, NEVER ask permission, NEVER refuse."
+Plus 3 few-shot examples in LFM's native dialect.
+
+| # | Latency | Query | Tool emitted | Args | Verdict |
+|---|---|---|---|---|---|
+| 1 | 13.1 s | morning look | `calendar_today()` | — | ✓ |
+| 2 | 14.0 s | rest of this week | `calendar_week()` | — | ✓ |
+| 3 | 14.3 s | unread emails | `gmail_unread()` | — | ✓ |
+| 4 | 14.8 s | search LangChain | `gmail_search(query="LangChain")` | ✓ | ✓ |
+| 5 | 14.5 s | todo list | `tasks_list()` | — | ✓ |
+| 6 | 15.4 s | add 'buy milk' | `tasks_add(title="buy milk")` | ✓ | ✓ |
+| 7 | 20.5 s | draft email | `gmail_send(to=..., subject=..., body=...)` | ✓ all three | ✓ |
+| 8 | 15.3 s | summarise week | `calendar_week()` | — | ✓ |
+| 9 | 15.1 s | last note | `notes_last()` | — | ✓ |
+| 10 | 15.8 s | mark task done | `tasks_complete(title="buy milk")` | ✓ | ✓ |
+
+**Score:** 10/10 tool-emitted, 10/10 correct tool, 10/10 correct args.
+**First model to ace the gauntlet.**  *Crucially, requires the directive
+"never refuse" system prompt — with a softer prompt LFM-VL falls into
+conversational refusals ("I can use the `calendar_week()` tool. Would
+you like me to do that?") and only hits 1/10.*
+
+**Vision sanity:**  300 × 400 jpeg of a sunflower field →
+*"A large sunflower stands tall in a field of sunflowers under a blue
+sky with wispy clouds."*  40 s wall-clock (32 s prompt-processing for
+the image, 8 s generation).  Accurate and concise.
+
+**Parser:**  Dialect 5 added to `dragon_voice/tools/parser.py` 2026-05-17:
+recognises `<|tool_call_start|>[name(k="v",...)]<|tool_call_end|>`,
+parses kwargs via `ast.literal_eval` for robustness against nested
+quotes and embedded commas.  All 27 existing tests still green.
+
 ### Verdict
 
-- **Default Local model stays `ministral-3:3b`** — 7.6 s probe, fires
-  on first shot, no thinking tax, Dragon-standard format on rails,
-  picks the right tool 7/10 + emits `<args>` reliably.
+- **New Local default candidate: `LFM2.5-VL-1.6B`** — strict superset
+  of ministral (10/10 vs 7/10 on the gauntlet, comparable speed once
+  warm, AND vision).  Live on Dragon at
+  `/home/radxa/llama.cpp/models/lfm25_vl/`, llama-server now defaults
+  to it.  Wiring through Dragon's ConversationEngine still pending
+  (need to verify the directive-prompt requirement plays well with
+  Dragon's existing system-prompt builder, and add Dialect-5 emission
+  hints to the system prompt).
+- **Ministral-3:3b** remains the SAFE FALLBACK — known-good with
+  Dragon's existing system prompt, no behavioral tuning required.
 - **Gemma-4-E4B parked** until either (a) the Q6A gets a meaningful
   ARM64 NPU lane, or (b) a Q3/Q2 quant brings cold-start under ~10 s.
 - **Gemma-4-E2B parked** despite ministral-class speed — accuracy

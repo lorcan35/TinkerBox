@@ -361,7 +361,7 @@ prompt + memory + tool execution + NL wrap.
 | **Gemma-4-E4B-it** (7.5B) | 5.3 GB Q4 | 33 s | not E2E | ✅ best **accuracy** on small probes (picked `calendar_week` for "this week", others picked `_today`) | **`<\|tool_call>call:NAME{}<tool_call\|>` (4th dialect)** | Parser now supports Dialect 4 (`parser.py` 2026-05-17), but the model is too slow + verbose to be practical on Q6A — see gauntlet below |
 | Gemma-4-E2B-it (5.1B total / 2.3B effective) | 3.4 GB Q4 | 7-8 s warm | not E2E | partial: 8/10 tool emit, 0/10 with `<args>` | Dragon-standard (but truncated) | Speed matches ministral; accuracy fails — defaults to `calendar_today` regardless of intent; **native-format prompt = 0/10 + hallucinates fake calendar data + repetition loops** |
 | MiniCPM-V-4.5 (8.2B) | 5.0 GB Q4 | timeout >90 s | — | — | — | too big for Q6A interactive |
-| **LFM2.5-VL-1.6B** (LiquidAI, vision-language) | 696 MB Q4_0 + 583 MB mmproj | 13-20 s | not E2E yet | **10/10 tool-emit + 10/10 correct-name + 10/10 args** | **`<\|tool_call_start\|>[name(arg="val")]<\|tool_call_end\|>` (5th dialect)** | NEW WINNER (with directive system prompt).  Vision works too (40 s for 300×400 jpeg → accurate one-sentence describe).  See gauntlet below |
+| **LFM2.5-VL-1.6B** (LiquidAI, vision-language) | 696 MB Q4_0 + 583 MB mmproj | 13-20 s text · 40 s vision | not E2E yet | 10/10 easy gauntlet · **7/20 hard gauntlet** | **`<\|tool_call_start\|>[name(arg="val")]<\|tool_call_end\|>` (5th dialect)** | Aces happy-path + brings vision for free; breaks on red herrings / arg extraction / chitchat.  See both gauntlets below |
 | Ministral via Ollama | 2.8 GB | 78 s | 2.5 min | ✅ | Dragon-standard | 10× slower client overhead |
 
 Gemma-4-E4B's Dialect-4 parser is now LIVE in
@@ -464,18 +464,81 @@ recognises `<|tool_call_start|>[name(k="v",...)]<|tool_call_end|>`,
 parses kwargs via `ast.literal_eval` for robustness against nested
 quotes and embedded commas.  All 27 existing tests still green.
 
+### LFM2.5-VL-1.6B HARD gauntlet (2026-05-17)
+
+After the 10/10 happy-path win, ran a tougher 20-scenario set across
+7 axes: happy-path, disambiguation, complex args, red herrings,
+out-of-scope, multi-step, chitchat.  Larger tool registry (16 tools
+incl. `weather`, `timer_set`, `music_play`, `calendar_create`,
+`gmail_reply`, `notes_search`, `contacts_find`, plus a synthetic
+`none()` escape hatch for chitchat / OOS).
+
+| Axis | Score | Pattern |
+|---|---|---|
+| A Happy-path | 0/2 (1 scoring artifact) | Picked `calendar_week` for "what's on my plate today?" |
+| B Disambiguation | 2/4 | "did Sarah email me about lease?" → `gmail_reply` (should be search); "ping boss late 15 min" → `timer_set(900)` (took the 15 min literally) |
+| C Complex args | 0/3 | `gmail_send(to, subject, body)` emitted *positional placeholders* instead of values; hallucinated `tasks_create` tool with a `when_iso` arg |
+| D Red herrings | 0/3 | "calendar joke" → `calendar_today`; "tasks are killing me" → `tasks_list` |
+| E Out-of-scope | 1/3 | "Venmo $200" → `tasks_create(title="buy bread")` — leaked "buy bread" from few-shot |
+| F Multi-step | 2/2 | Picks the first reasonable step |
+| G Chitchat | 2/3 | "you're awesome, thanks!" → `tasks_list()` |
+| **Overall** | **7/20** | **20/20 fired a tool — none() escape hatch only used 4/8 times when warranted** |
+
+**Failure modes that matter for production:**
+
+1. **Red-herring trigger** — any word matching a tool name will fire
+   that tool, even in chitchat ("calendar joke", "tasks are killing
+   me"). The model treats tool names as keywords, not as semantic
+   intent.
+
+2. **Verb confusion** — "ping the boss" became `timer_set`, "did X
+   email me" became `gmail_reply`.  Action verbs near a duration or
+   subject get misread.
+
+3. **Few-shot contamination** — "buy bread" appeared in the system
+   prompt example, and leaked verbatim into the Venmo answer.  Tiny
+   models echo the exemplars.
+
+4. **Arg-extraction brittleness** — `gmail_send(to, subject, body)`
+   emitted the parameter NAMES as positional placeholders rather
+   than extracting "mom", "Happy Birthday", "love you..." from
+   the prompt.  The mental model "now fill in this template" doesn't
+   hold under prose pressure.
+
+**Interpretation:** at 1.6 B the model has enough capacity for clean
+happy-path routing but not enough to robustly distinguish "use the
+word X" from "invoke tool X", or to extract args from messy prose.
+The easy gauntlet (10/10) covered the well-formed half of the
+distribution; the hard gauntlet (7/20) covers the messy half.
+
+**Mitigations to try before giving up:**
+- Lower temperature to 0 (was 0.1).
+- Use llama-server's native `tools=[...]` API instead of prose-listing
+  tools in the system prompt — this gives the model a more structured
+  signal.
+- Drop the synthetic `none()` tool; rely on the API's
+  `tool_choice="auto"` to let the model emit plain text for chitchat.
+- Use the BF16 mmproj or Q8_0 model variants (Q4_0 may be hurting
+  quality more than expected).
+- Add explicit negative examples to the system prompt ("`thanks!` →
+  emit no tool; just reply normally").
+
 ### Verdict
 
-- **New Local default candidate: `LFM2.5-VL-1.6B`** — strict superset
-  of ministral (10/10 vs 7/10 on the gauntlet, comparable speed once
-  warm, AND vision).  Live on Dragon at
-  `/home/radxa/llama.cpp/models/lfm25_vl/`, llama-server now defaults
-  to it.  Wiring through Dragon's ConversationEngine still pending
-  (need to verify the directive-prompt requirement plays well with
-  Dragon's existing system-prompt builder, and add Dialect-5 emission
-  hints to the system prompt).
-- **Ministral-3:3b** remains the SAFE FALLBACK — known-good with
-  Dragon's existing system prompt, no behavioral tuning required.
+- **LFM2.5-VL-1.6B is a CANDIDATE, not a confirmed default.**  Wins
+  10/10 on the easy gauntlet (where ministral was 7/10) and adds
+  vision for free, but only scores 7/20 on the harder messy-prose
+  set.  llama-server defaults to it on Dragon now, but Dragon's
+  ConversationEngine is NOT yet pointed at it — keep ministral
+  pointed-at until the mitigations above (temp=0, structured `tools=`,
+  better few-shots) actually close the hard-gauntlet gap, OR until
+  E2E testing through Dragon's real system prompt shows the messy
+  half is rarer than the gauntlet implies.
+- **Ministral-3:3b remains the production SAFE FALLBACK** — known-
+  good with Dragon's existing system prompt, no behavioral tuning
+  required.  Weights still live at
+  `/home/radxa/llama.cpp/models/ministral/model-q4_k_m.gguf`.
+  One-line rollback in the systemd unit.
 - **Gemma-4-E4B parked** until either (a) the Q6A gets a meaningful
   ARM64 NPU lane, or (b) a Q3/Q2 quant brings cold-start under ~10 s.
 - **Gemma-4-E2B parked** despite ministral-class speed — accuracy

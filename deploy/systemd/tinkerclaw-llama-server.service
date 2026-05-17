@@ -46,8 +46,17 @@ ExecStart=/home/radxa/llama.cpp/build/bin/llama-server \
   --host 127.0.0.1 \
   --ctx-size 16384 \
   --threads 8 \
-  --jinja \
   --log-disable
+# `--jinja` REMOVED 2026-05-17: Ministral's bundled chat template
+# raises `After the optional system message, conversation roles must
+# alternate user/assistant/user/...` when Dragon sends back-to-back
+# user messages OR the tool-response role in our conversation history.
+# Net: every Local-mode tool turn after the first returned
+# `[LM Studio error: 500]`.  llama-server's default (no --jinja)
+# is a permissive ChatML wrap that handles arbitrary role orderings
+# without raising.  Re-enable only after auditing Dragon's
+# conversation builder against the target model's chat template
+# strict rules.
 Restart=on-failure
 RestartSec=5
 

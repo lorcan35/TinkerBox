@@ -525,20 +525,16 @@ distribution; the hard gauntlet (7/20) covers the messy half.
 
 ### Verdict
 
-- **LFM2.5-VL-1.6B is a CANDIDATE, not a confirmed default.**  Wins
-  10/10 on the easy gauntlet (where ministral was 7/10) and adds
-  vision for free, but only scores 7/20 on the harder messy-prose
-  set.  llama-server defaults to it on Dragon now, but Dragon's
-  ConversationEngine is NOT yet pointed at it — keep ministral
-  pointed-at until the mitigations above (temp=0, structured `tools=`,
-  better few-shots) actually close the hard-gauntlet gap, OR until
-  E2E testing through Dragon's real system prompt shows the messy
-  half is rarer than the gauntlet implies.
-- **Ministral-3:3b remains the production SAFE FALLBACK** — known-
-  good with Dragon's existing system prompt, no behavioral tuning
-  required.  Weights still live at
-  `/home/radxa/llama.cpp/models/ministral/model-q4_k_m.gguf`.
-  One-line rollback in the systemd unit.
+- **LFM2.5-VL-1.6B is the Local default (2026-05-17 user decision).**
+  Wins 10/10 on the easy gauntlet (where ministral was 7/10) and
+  adds vision for free.  Hard-gauntlet brittleness (7/20 on messy-
+  prose / red-herrings / arg-extraction) is documented and accepted
+  as the cost of switching; the mitigations above are tracked as
+  follow-up tuning, not blockers.
+- **Ministral-3:3b kept as one-line rollback** at
+  `/home/radxa/llama.cpp/models/ministral/model-q4_k_m.gguf` for
+  emergency revert if LFM-VL E2E exposes a worse-than-expected
+  regression — but Dragon goes to production on LFM-VL.
 - **Gemma-4-E4B parked** until either (a) the Q6A gets a meaningful
   ARM64 NPU lane, or (b) a Q3/Q2 quant brings cold-start under ~10 s.
 - **Gemma-4-E2B parked** despite ministral-class speed — accuracy

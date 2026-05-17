@@ -1,28 +1,39 @@
-"""OAuth 2.0 Device Authorization Grant (RFC 8628) client (#341).
+"""OAuth 2.0 helpers for TinkerBox integrations (#341).
 
-Dragon runs headless — there's no browser, no local web server with a
-redirect URI for the standard OAuth code flow.  The device
-authorization grant is designed exactly for this case:
+Two flows supported:
 
-  1. Client (Dragon) hits the provider's device-code endpoint, gets
-     back a `device_code`, a `user_code`, and a `verification_url`.
-  2. Dragon shows the user the URL + code (Tab5 renders as QR).
-  3. User completes the OAuth dance on their phone.
-  4. Dragon polls the token endpoint with `device_code` until the
-     provider returns access + refresh tokens.
+* **Authorization Code with PKCE** (RFC 7636) — used for Google
+  Calendar / Gmail / most modern providers.  Dragon hosts a public
+  ``/api/v1/oauth/callback`` route (reached via the existing ngrok
+  tunnel) so the user can complete consent on their phone browser.
+  No client-secret required for PKCE, but Google's web-app client
+  ships with one — we include it when present.
 
-Supported by Google, Spotify, GitHub, and many others.
+* **Device Authorization Grant** (RFC 8628) — used by providers that
+  support it without scope restrictions (some Spotify scopes, etc.).
+  Dragon polls the token endpoint; user enters a code on their phone.
+  KEPT for future integrations that prefer it.
 
-This module is provider-agnostic — provider-specific bits
-(client_id, scopes, endpoint URLs) are passed in.  See
-``google/auth.py`` for the Google-specific wrapper.
+Both flows produce the same ``OAuthTokens`` dataclass.
+
+### Why we pivoted from device-code to auth-code for Google
+
+Google's device-code flow restricts the allowed scopes to a small set
+(email/profile/openid/Drive/Photos/YouTube).  Calendar + Gmail are NOT
+in that list — Google forces these scopes through the
+authorization-code flow.  See:
+https://developers.google.com/identity/protocols/oauth2/limited-input-device#allowedscopes
 """
 
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import logging
+import secrets
 import time
+import urllib.parse
 from dataclasses import dataclass
 from typing import Optional
 
@@ -32,11 +43,9 @@ logger = logging.getLogger(__name__)
 
 
 class DeviceCodeError(Exception):
-    """Raised when the device-code flow fails terminally.
-
-    Distinct from `aiohttp.ClientError` so callers can catch only the
-    flow-specific errors (`expired_token`, `access_denied`, etc.).
-    """
+    """Raised when an OAuth flow fails terminally.  Name kept for
+    backward compat with the existing API + tests; covers both
+    device-code and auth-code failures."""
 
     def __init__(self, code: str, description: str) -> None:
         self.code = code
@@ -44,48 +53,26 @@ class DeviceCodeError(Exception):
         super().__init__(f"{code}: {description}")
 
 
-@dataclass
-class DeviceCodeChallenge:
-    """The triple returned by the device-code endpoint.
-
-    All fields per RFC 8628 §3.2.  `interval` is the recommended poll
-    interval (seconds); providers can ask the client to back off by
-    returning `slow_down` from the token endpoint, but we honor the
-    initial `interval` unless slow_down arrives.
-    """
-
-    device_code: str
-    user_code: str
-    verification_url: str
-    expires_in: int
-    interval: int = 5
-    # Some providers (Google) also return verification_url_complete
-    # which embeds the user_code as a query param — convenient for QR.
-    verification_url_complete: Optional[str] = None
+# ─── Tokens ────────────────────────────────────────────────────────
 
 
 @dataclass
 class OAuthTokens:
-    """Token bundle returned by the token endpoint.
+    """Provider-agnostic token bundle.
 
-    `expires_at` is an absolute unix timestamp so refresh logic doesn't
-    need to track issue time separately.  `refresh_token` may be None
-    if the provider doesn't issue one (rare for device flow).  `scopes`
-    is the granted scope set returned by the provider — may differ from
-    requested if the user denied some scopes.
-    """
+    `expires_at` is an absolute unix timestamp.  `refresh_token` may
+    be None when the provider doesn't issue one or when a refresh
+    response omitted it (callers preserve the prior value in that
+    case)."""
 
     access_token: str
     refresh_token: Optional[str]
     token_type: str
-    expires_at: int  # absolute unix timestamp
+    expires_at: int
     scopes: list[str]
     extra: dict = None  # type: ignore[assignment]
 
     def is_expired(self, skew_s: int = 60) -> bool:
-        """Treat the token as expired `skew_s` seconds before its
-        actual expiry to avoid in-flight 401s during a refresh window.
-        """
         return time.time() + skew_s >= self.expires_at
 
     def to_dict(self) -> dict:
@@ -110,13 +97,278 @@ class OAuthTokens:
         )
 
 
+def _tokens_from_response(data: dict) -> OAuthTokens:
+    expires_in = int(data.get("expires_in", 3600))
+    scope_str = data.get("scope", "")
+    scopes = scope_str.split() if scope_str else []
+    return OAuthTokens(
+        access_token=data["access_token"],
+        refresh_token=data.get("refresh_token"),
+        token_type=data.get("token_type", "Bearer"),
+        expires_at=int(time.time()) + expires_in,
+        scopes=scopes,
+        extra={
+            k: v for k, v in data.items()
+            if k not in {
+                "access_token", "refresh_token", "token_type",
+                "expires_in", "scope",
+            }
+        },
+    )
+
+
+# ─── PKCE helpers (RFC 7636) ──────────────────────────────────────
+
+
+def _pkce_pair() -> tuple[str, str]:
+    """Generate a (code_verifier, code_challenge) pair.
+
+    code_verifier:  43-128 char [A-Za-z0-9-._~] random string.
+    code_challenge: BASE64URL-NOPAD(SHA256(code_verifier)).
+    """
+    verifier = secrets.token_urlsafe(64)  # ~86 chars after urlsafe
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+    return verifier, challenge
+
+
+# ─── Authorization Code with PKCE ─────────────────────────────────
+
+
+@dataclass
+class AuthCodeChallenge:
+    """What `OAuthAuthCodeClient.start` returns.
+
+    Tab5 displays a QR with `authorization_url`; user opens it on
+    their phone, signs in + consents; Google redirects to our
+    ngrok-tunneled callback URL; the callback handler calls
+    `OAuthAuthCodeClient.exchange_code(state, code)` to mint tokens.
+    """
+
+    authorization_url: str
+    state: str
+    code_verifier: str
+    expires_in: int = 600  # PKCE state TTL; we expire after 10 min
+
+
+class OAuthAuthCodeClient:
+    """Authorization Code flow with PKCE.
+
+    One instance per provider.  Holds the in-flight PKCE state
+    (`state` → `code_verifier`) so the callback can find it.
+
+    Typical use:
+
+        client = OAuthAuthCodeClient(
+            client_id=..., client_secret=..., scope=...,
+            auth_url="https://accounts.google.com/o/oauth2/v2/auth",
+            token_url="https://oauth2.googleapis.com/token",
+            redirect_uri="https://tinkerclaw-voice.ngrok.dev/api/v1/oauth/callback",
+        )
+        chal = await client.start(extra_params={"access_type": "offline", "prompt": "consent"})
+        # ... Tab5 shows QR, user authorizes ...
+        # callback receives ?code=...&state=...
+        tokens = await client.exchange_code(state=..., code=...)
+    """
+
+    def __init__(
+        self,
+        *,
+        client_id: str,
+        scope: str,
+        auth_url: str,
+        token_url: str,
+        redirect_uri: str,
+        client_secret: Optional[str] = None,
+        session: Optional[aiohttp.ClientSession] = None,
+    ) -> None:
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._scope = scope
+        self._auth_url = auth_url
+        self._token_url = token_url
+        self._redirect_uri = redirect_uri
+        self._session = session
+        self._owns_session = session is None
+        # state -> {code_verifier, expires_at, future, completed}
+        self._pending: dict[str, dict] = {}
+
+    async def __aenter__(self) -> "OAuthAuthCodeClient":
+        if self._session is None:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30),
+            )
+            self._owns_session = True
+        return self
+
+    async def __aexit__(self, *exc_info) -> None:  # noqa: ANN001
+        if self._owns_session and self._session is not None and not self._session.closed:
+            await self._session.close()
+
+    def start(self, extra_params: Optional[dict] = None) -> AuthCodeChallenge:
+        """Generate PKCE pair + return the authorization URL.
+
+        Doesn't hit the network — just builds the URL.  Caller passes
+        provider-specific extras (e.g. Google needs
+        `access_type=offline` + `prompt=consent` to mint a
+        refresh_token on the first turn).
+        """
+        verifier, challenge = _pkce_pair()
+        state = secrets.token_urlsafe(24)
+        params = {
+            "client_id": self._client_id,
+            "redirect_uri": self._redirect_uri,
+            "response_type": "code",
+            "scope": self._scope,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+        }
+        if extra_params:
+            params.update(extra_params)
+        url = f"{self._auth_url}?{urllib.parse.urlencode(params)}"
+        self._pending[state] = {
+            "code_verifier": verifier,
+            "expires_at": time.time() + 600,
+            "future": asyncio.get_event_loop().create_future(),
+        }
+        return AuthCodeChallenge(
+            authorization_url=url,
+            state=state,
+            code_verifier=verifier,
+        )
+
+    def resolve_callback(self, state: str, code: Optional[str], error: Optional[str]) -> None:
+        """Called from the HTTP callback handler.  Wakes the
+        `wait_for_callback` future."""
+        entry = self._pending.get(state)
+        if entry is None:
+            logger.warning("OAuth callback for unknown state %r — ignoring", state[:12])
+            return
+        future = entry["future"]
+        if future.done():
+            return
+        if error:
+            future.set_exception(DeviceCodeError(code=error, description=error))
+        else:
+            future.set_result(code)
+
+    async def wait_for_callback(self, state: str, timeout_s: int = 600) -> str:
+        """Block until the callback completes the flow for this state.
+
+        Returns the auth code on success; raises DeviceCodeError on
+        provider-side denial or timeout.
+        """
+        entry = self._pending.get(state)
+        if entry is None:
+            raise DeviceCodeError("unknown_state", "no pending flow for state")
+        try:
+            code = await asyncio.wait_for(entry["future"], timeout=timeout_s)
+            return code
+        except asyncio.TimeoutError:
+            raise DeviceCodeError(
+                "expired_token",
+                "user did not complete authorization in time",
+            ) from None
+        finally:
+            # GC the entry — only one shot per state.
+            self._pending.pop(state, None)
+
+    async def exchange_code(self, state: str, code: str) -> OAuthTokens:
+        """Exchange the auth code + PKCE verifier for tokens.
+
+        The state was looked up to find the verifier; the
+        `wait_for_callback` future has already been resolved (and
+        the entry removed) — so we capture the verifier BEFORE
+        calling resolve_callback or use the explicit verifier the
+        caller passes.  In practice this method is called from inside
+        ``GoogleCalendarIntegration._handle_callback`` which has both.
+        """
+        assert self._session is not None, "Use 'async with OAuthAuthCodeClient(...)'"
+        # Caller is expected to pass the verifier directly (we no
+        # longer have the state entry once wait_for_callback returned)
+        # — so this method actually doesn't need state.  But we keep
+        # the parameter for API symmetry; callers can pass any value.
+        del state
+        return await self._exchange(code)
+
+    async def _exchange(self, code: str, code_verifier: str | None = None) -> OAuthTokens:
+        """Used internally by exchange_code_with_verifier."""
+        assert self._session is not None
+        payload = {
+            "client_id": self._client_id,
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": self._redirect_uri,
+        }
+        if code_verifier:
+            payload["code_verifier"] = code_verifier
+        if self._client_secret:
+            payload["client_secret"] = self._client_secret
+        async with self._session.post(self._token_url, data=payload) as resp:
+            data = await resp.json()
+            if resp.status != 200:
+                raise DeviceCodeError(
+                    code=data.get("error", "exchange_failed"),
+                    description=data.get(
+                        "error_description", "Code exchange rejected by provider",
+                    ),
+                )
+        return _tokens_from_response(data)
+
+    async def exchange_code_with_verifier(
+        self, code: str, code_verifier: str,
+    ) -> OAuthTokens:
+        """The canonical exchange call — pass verifier explicitly."""
+        assert self._session is not None
+        return await self._exchange(code, code_verifier=code_verifier)
+
+    async def refresh(self, refresh_token: str) -> OAuthTokens:
+        """Exchange a refresh token for a new access token."""
+        assert self._session is not None
+        payload = {
+            "client_id": self._client_id,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        }
+        if self._client_secret:
+            payload["client_secret"] = self._client_secret
+        async with self._session.post(self._token_url, data=payload) as resp:
+            data = await resp.json()
+            if resp.status != 200:
+                raise DeviceCodeError(
+                    code=data.get("error", "refresh_failed"),
+                    description=data.get(
+                        "error_description", "Refresh token rejected"
+                    ),
+                )
+        tokens = _tokens_from_response(data)
+        if not tokens.refresh_token:
+            tokens.refresh_token = refresh_token
+        return tokens
+
+
+# ─── Device Authorization Grant (kept for non-Google providers) ───
+
+
+@dataclass
+class DeviceCodeChallenge:
+    """Returned by the device-code endpoint (RFC 8628 §3.2)."""
+
+    device_code: str
+    user_code: str
+    verification_url: str
+    expires_in: int
+    interval: int = 5
+    verification_url_complete: Optional[str] = None
+
+
 class OAuthDeviceCodeClient:
     """Provider-agnostic device-code OAuth client.
 
-    One instance per provider (Google, Spotify, etc.) — the
-    `client_id`, `scope`, `device_code_url`, and `token_url` are
-    provider-specific.  `client_secret` is optional (Google's device
-    flow uses a client secret, Spotify's doesn't).
+    Kept for providers that allow Calendar/Gmail-equivalent scopes
+    through device-code (some Spotify scopes, etc.).  See
+    `OAuthAuthCodeClient` for Google.
     """
 
     def __init__(
@@ -150,13 +402,7 @@ class OAuthDeviceCodeClient:
             await self._session.close()
 
     async def start(self) -> DeviceCodeChallenge:
-        """POST to the device-code endpoint, return the challenge.
-
-        Raises DeviceCodeError when the provider returns a non-2xx
-        response with a structured error body (rare at this stage —
-        usually only happens if the `client_id` is invalid).
-        """
-        assert self._session is not None, "Use 'async with OAuthDeviceCodeClient(...)'"
+        assert self._session is not None
         payload = {"client_id": self._client_id, "scope": self._scope}
         async with self._session.post(self._device_code_url, data=payload) as resp:
             data = await resp.json()
@@ -177,18 +423,7 @@ class OAuthDeviceCodeClient:
         )
 
     async def poll_once(self, device_code: str) -> Optional[OAuthTokens]:
-        """One poll of the token endpoint.
-
-        Returns:
-            * `OAuthTokens` — flow completed, user authorized.
-            * `None` — still pending (RFC 8628 `authorization_pending`
-              or `slow_down`).  Caller should sleep and try again.
-
-        Raises:
-            DeviceCodeError — terminal failure (`expired_token`,
-            `access_denied`, etc.).  Caller stops polling.
-        """
-        assert self._session is not None, "Use 'async with OAuthDeviceCodeClient(...)'"
+        assert self._session is not None
         payload = {
             "client_id": self._client_id,
             "device_code": device_code,
@@ -196,14 +431,12 @@ class OAuthDeviceCodeClient:
         }
         if self._client_secret:
             payload["client_secret"] = self._client_secret
-
         async with self._session.post(self._token_url, data=payload) as resp:
             data = await resp.json()
             if resp.status == 200:
-                return self._tokens_from_response(data)
+                return _tokens_from_response(data)
             err = data.get("error", "")
             if err in ("authorization_pending", "slow_down"):
-                # Not done yet.
                 return None
             raise DeviceCodeError(
                 code=err or "unknown_error",
@@ -217,12 +450,6 @@ class OAuthDeviceCodeClient:
         challenge: DeviceCodeChallenge,
         cancel_event: Optional[asyncio.Event] = None,
     ) -> OAuthTokens:
-        """Convenience: poll on `challenge.interval` until terminal.
-
-        Honors `expires_in` from the challenge — raises
-        ``DeviceCodeError("expired_token", ...)`` when the device-code
-        TTL is up.  Cancel via `cancel_event` (Tab5 closing the modal).
-        """
         deadline = time.time() + challenge.expires_in
         interval = challenge.interval
         while True:
@@ -236,23 +463,16 @@ class OAuthDeviceCodeClient:
                 tokens = await self.poll_once(challenge.device_code)
             except DeviceCodeError as e:
                 if e.code == "slow_down":
-                    # Provider asked us to back off; bump interval.
                     interval += 5
                     await asyncio.sleep(interval)
                     continue
-                # Anything else is terminal.
                 raise
             if tokens is not None:
                 return tokens
             await asyncio.sleep(interval)
 
     async def refresh(self, refresh_token: str) -> OAuthTokens:
-        """Exchange a refresh token for a new access token.
-
-        Raises DeviceCodeError on terminal failure (refresh token
-        revoked / expired — user has to reconnect).
-        """
-        assert self._session is not None, "Use 'async with OAuthDeviceCodeClient(...)'"
+        assert self._session is not None
         payload = {
             "client_id": self._client_id,
             "refresh_token": refresh_token,
@@ -260,7 +480,6 @@ class OAuthDeviceCodeClient:
         }
         if self._client_secret:
             payload["client_secret"] = self._client_secret
-
         async with self._session.post(self._token_url, data=payload) as resp:
             data = await resp.json()
             if resp.status != 200:
@@ -270,29 +489,7 @@ class OAuthDeviceCodeClient:
                         "error_description", "Refresh token rejected"
                     ),
                 )
-        # Refresh responses may omit `refresh_token` — providers expect
-        # the client to reuse the old one.
-        tokens = self._tokens_from_response(data)
+        tokens = _tokens_from_response(data)
         if not tokens.refresh_token:
             tokens.refresh_token = refresh_token
         return tokens
-
-    @staticmethod
-    def _tokens_from_response(data: dict) -> OAuthTokens:
-        expires_in = int(data.get("expires_in", 3600))
-        scope_str = data.get("scope", "")
-        scopes = scope_str.split() if scope_str else []
-        return OAuthTokens(
-            access_token=data["access_token"],
-            refresh_token=data.get("refresh_token"),
-            token_type=data.get("token_type", "Bearer"),
-            expires_at=int(time.time()) + expires_in,
-            scopes=scopes,
-            extra={
-                k: v for k, v in data.items()
-                if k not in {
-                    "access_token", "refresh_token", "token_type",
-                    "expires_in", "scope",
-                }
-            },
-        )

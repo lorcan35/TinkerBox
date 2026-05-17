@@ -16,7 +16,7 @@ status — Tab5 turns them into modal text.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Optional
 
 from aiohttp import web
 
@@ -33,6 +33,27 @@ from dragon_voice.tools.integrations.registry import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _callback_html(message: str, success: bool) -> web.Response:
+    """Minimal HTML page rendered after Google's OAuth callback."""
+    color = "#0bf08c" if success else "#ff6b6b"
+    title = "Connected" if success else "Connection failed"
+    html = f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title} — TinkerClaw</title>
+<style>
+  body {{ background:#0a0a0a; color:#e0e0e0; font-family:system-ui;
+         display:flex; align-items:center; justify-content:center;
+         min-height:100vh; margin:0; padding:32px; box-sizing:border-box; }}
+  .card {{ max-width:420px; padding:32px; border-radius:16px;
+          background:#141414; border:1px solid #2a2a2a; text-align:center; }}
+  h1 {{ color:{color}; margin:0 0 16px; font-size:22px; }}
+  p {{ margin:0; line-height:1.5; }}
+</style></head>
+<body><div class="card"><h1>{title}</h1><p>{message}</p></div></body></html>"""
+    return web.Response(text=html, content_type="text/html", charset="utf-8")
 
 
 class IntegrationRoutes:
@@ -72,6 +93,13 @@ class IntegrationRoutes:
             "/api/v1/integrations/{name}/test",
             self.test,
         )
+        # OAuth callback — public route (bearer-auth bypassed by the
+        # middleware's PUBLIC_PREFIXES list; the auth happens via the
+        # PKCE state parameter which only the originating Dragon
+        # process can decrypt).  Google posts the user here after
+        # consent.  Walks every registered integration to find the one
+        # holding this state.
+        app.router.add_get("/api/v1/oauth/callback", self.oauth_callback)
 
     # ── handlers ────────────────────────────────────────────────
 
@@ -169,3 +197,56 @@ class IntegrationRoutes:
             "detail": detail,
             "name": name,
         })
+
+    async def oauth_callback(self, request: web.Request) -> web.Response:
+        """Public OAuth redirect target.
+
+        Google sends the user here after consent:
+        ``?code=...&state=...`` on success or ``?error=...&state=...``
+        on denial.  We walk every instantiated integration looking for
+        one that recognizes the state, then hand the code off.
+
+        Responds with a tiny HTML page so the user's phone shows a
+        success/error message.  Tab5 has its own polling loop and
+        flips the modal independently.
+        """
+        params = request.query
+        state = params.get("state", "")
+        code = params.get("code")
+        error = params.get("error")
+
+        if not state:
+            return _callback_html(
+                "Missing state parameter — link may be malformed.", success=False,
+            )
+
+        # Find the integration holding this state.
+        matched: Optional[IntegrationBackend] = None
+        for integ in self._instances.values():
+            handler = getattr(integ, "handle_callback", None)
+            if handler is None:
+                continue
+            try:
+                flow = integ._find_flow_by_state(state)  # type: ignore[attr-defined]
+            except AttributeError:
+                flow = None
+            if flow is not None:
+                matched = integ
+                break
+        if matched is None:
+            return _callback_html(
+                "This authorization link has already been used or has expired.",
+                success=False,
+            )
+
+        await matched.handle_callback(state=state, code=code, error=error)  # type: ignore[attr-defined]
+        if error:
+            return _callback_html(
+                f"Google reported an error: {error}.  Go back to the Tab5 "
+                f"and try again.",
+                success=False,
+            )
+        return _callback_html(
+            "Connected ✓  You can close this tab and return to your Tab5.",
+            success=True,
+        )

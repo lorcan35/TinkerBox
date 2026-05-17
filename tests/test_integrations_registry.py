@@ -62,7 +62,7 @@ def test_create_integration_returns_instance():
     assert isinstance(integ, IntegrationBackend)
     assert integ.name == "google-calendar"
     assert integ.display_name == "Google Calendar"
-    assert integ.auth_kind == "oauth-device"
+    assert integ.auth_kind == "oauth-authcode"
 
 
 def test_reset_clears_then_restores_from_snapshot():

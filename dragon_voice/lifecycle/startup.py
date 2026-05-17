@@ -153,6 +153,15 @@ async def run_startup(server: Any, app: web.Application) -> None:
     from dragon_voice.lifecycle.notes_init import init_notes_module
     await init_notes_module(server, app)
 
+    # #341: TinkerBox-native integration tools (Google Calendar
+    # today, plus Gmail / Home Assistant / Spotify as they land).
+    # Backend instances are created lazily by each tool so REST
+    # connect routes and tool calls share state.
+    from dragon_voice.lifecycle.integrations_init import (
+        init_integration_tools,
+    )
+    await init_integration_tools(server)
+
     # SOLID-audit follow-up: MCP server bridges extracted to
     # lifecycle/mcp_init.py.
     from dragon_voice.lifecycle.mcp_init import init_mcp_bridges

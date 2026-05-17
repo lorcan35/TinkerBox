@@ -1,14 +1,14 @@
-"""#341 / #342 — Google Calendar integration tests.
+"""#341 / #342 / #346 — Google Calendar integration tests (auth-code shape).
 
 Stubs the Google OAuth + Calendar API via aiohttp session mocks.
 Asserts:
+  * `auth_kind` is `oauth-authcode` (post-pivot)
   * `is_connected` is False initially, True after token persist
-  * `start_connect` returns a verification_url + user_code from the
-    mocked device-code endpoint
-  * `list_events` builds the right URL + params, normalizes payload
-  * `create_event` + `cancel_event` round-trip
-  * `disconnect` calls revoke + deletes creds
-  * Expired access token triggers refresh-on-401
+  * `start_connect` builds a PKCE authorization_url + tracks the flow
+  * `handle_callback` resolves matching state, persists tokens
+  * `poll_status` reports the flow state correctly
+  * `list_events` / `create_event` / `disconnect` round-trip
+  * Expired access token triggers refresh-on-401 via the auth-code client
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from dragon_voice.tools.integrations.credentials import CredentialStore
 from dragon_voice.tools.integrations.google.calendar import (
     GoogleCalendarIntegration,
 )
-from dragon_voice.tools.integrations.oauth import OAuthTokens
+from dragon_voice.tools.integrations.oauth import DeviceCodeError, OAuthTokens
 
 
 @pytest.fixture(autouse=True)
@@ -32,11 +32,16 @@ def _redirect_cred_store(tmp_path, monkeypatch):
     monkeypatch.setenv("TINKERCLAW_INTEGRATIONS_DIR", str(tmp_path))
 
 
+@pytest.fixture(autouse=True)
+def _oauth_env(monkeypatch):
+    """Default Google OAuth client env so start_connect can build a URL."""
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "test-cid")
+    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "test-csec")
+
+
 @pytest.fixture
 def integration(tmp_path):
     integ = GoogleCalendarIntegration()
-    # Replace the store with an explicit tmp_path-backed one to make
-    # the redirect deterministic even if env-var lookup races.
     integ._store = CredentialStore("google-calendar", base_dir=tmp_path)
     return integ
 
@@ -66,6 +71,13 @@ def _make_mock_response(json_data, status=200):
     return cm
 
 
+# ── shape + lifecycle ───────────────────────────────────────────────
+
+
+def test_auth_kind_is_oauth_authcode(integration):
+    assert integration.auth_kind == "oauth-authcode"
+
+
 @pytest.mark.asyncio
 async def test_initial_state_is_disconnected(integration):
     assert await integration.is_connected() is False
@@ -78,9 +90,18 @@ async def test_is_connected_true_after_persist(integration, valid_tokens):
 
 
 @pytest.mark.asyncio
+async def test_health_check_returns_false_when_disconnected(integration):
+    ok, detail = await integration.health_check()
+    assert ok is False
+    assert "not connected" in detail.lower()
+
+
+# ── start_connect / poll_status / handle_callback ───────────────────
+
+
+@pytest.mark.asyncio
 async def test_start_connect_requires_oauth_env(integration, monkeypatch):
-    """No GOOGLE_OAUTH_CLIENT_ID → raises a structured error so the
-    REST layer can surface a 503 + actionable message."""
+    """No GOOGLE_OAUTH_CLIENT_ID → raises so the REST layer returns 503."""
     monkeypatch.delenv("GOOGLE_OAUTH_CLIENT_ID", raising=False)
     from dragon_voice.tools.integrations.google.auth import (
         GoogleOAuthNotConfiguredError,
@@ -90,16 +111,142 @@ async def test_start_connect_requires_oauth_env(integration, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_health_check_returns_false_when_disconnected(integration):
-    ok, detail = await integration.health_check()
-    assert ok is False
-    assert "not connected" in detail.lower()
+async def test_start_connect_returns_pkce_authorization_url(integration):
+    chal = await integration.start_connect()
+    assert chal.request_id
+    assert chal.verification_url.startswith(
+        "https://accounts.google.com/o/oauth2/v2/auth?",
+    )
+    assert "code_challenge=" in chal.verification_url
+    assert "code_challenge_method=S256" in chal.verification_url
+    # Google needs offline + consent to mint a refresh_token.
+    assert "access_type=offline" in chal.verification_url
+    assert "prompt=consent" in chal.verification_url
+    # Auth-code flow has no user_code (only device-code does).
+    assert chal.user_code is None
+
+
+@pytest.mark.asyncio
+async def test_start_connect_tracks_flow_by_request_id_and_state(integration):
+    chal = await integration.start_connect()
+    flow = integration._flows[chal.request_id]
+    assert flow.state  # populated
+    assert flow.code_verifier  # populated
+    # _find_flow_by_state agrees.
+    assert integration._find_flow_by_state(flow.state) is flow
+
+
+@pytest.mark.asyncio
+async def test_find_flow_by_state_returns_none_for_unknown_state(integration):
+    await integration.start_connect()
+    assert integration._find_flow_by_state("never-issued") is None
+
+
+@pytest.mark.asyncio
+async def test_poll_status_reports_connecting_then_connected(
+    integration, valid_tokens,
+):
+    chal = await integration.start_connect()
+    status = await integration.poll_status(chal.request_id)
+    assert status.state == "connecting"
+
+    # Simulate the callback resolving the flow.
+    flow = integration._flows[chal.request_id]
+    flow.tokens = valid_tokens
+
+    status = await integration.poll_status(chal.request_id)
+    assert status.state == "connected"
+
+
+@pytest.mark.asyncio
+async def test_poll_status_unknown_request_id_is_error(integration):
+    status = await integration.poll_status("never-issued")
+    assert status.state == "error"
+    assert "unknown" in (status.error or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_handle_callback_unknown_state_is_noop(integration):
+    # Must not raise; must not persist anything.
+    await integration.handle_callback(state="never-issued", code="x", error=None)
+    assert await integration.is_connected() is False
+
+
+@pytest.mark.asyncio
+async def test_handle_callback_with_error_sets_flow_error(integration):
+    chal = await integration.start_connect()
+    flow = integration._flows[chal.request_id]
+    await integration.handle_callback(
+        state=flow.state, code=None, error="access_denied",
+    )
+    assert flow.error is not None
+    assert flow.error.code == "access_denied"
+
+    status = await integration.poll_status(chal.request_id)
+    assert status.state == "error"
+
+
+@pytest.mark.asyncio
+async def test_handle_callback_success_exchanges_and_persists(
+    integration, valid_tokens,
+):
+    chal = await integration.start_connect()
+    flow = integration._flows[chal.request_id]
+
+    fake_client = MagicMock()
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=None)
+    fake_client.exchange_code_with_verifier = AsyncMock(return_value=valid_tokens)
+
+    with patch(
+        "dragon_voice.tools.integrations.google.calendar.make_google_client",
+        return_value=fake_client,
+    ):
+        await integration.handle_callback(
+            state=flow.state, code="AUTH-CODE-1", error=None,
+        )
+
+    fake_client.exchange_code_with_verifier.assert_awaited_once_with(
+        code="AUTH-CODE-1", code_verifier=flow.code_verifier,
+    )
+    assert flow.tokens is valid_tokens
+    assert await integration.is_connected() is True
+
+    status = await integration.poll_status(chal.request_id)
+    assert status.state == "connected"
+
+
+@pytest.mark.asyncio
+async def test_handle_callback_exchange_failure_sets_flow_error(integration):
+    chal = await integration.start_connect()
+    flow = integration._flows[chal.request_id]
+
+    fake_client = MagicMock()
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=None)
+    fake_client.exchange_code_with_verifier = AsyncMock(
+        side_effect=DeviceCodeError("invalid_grant", "code reused"),
+    )
+
+    with patch(
+        "dragon_voice.tools.integrations.google.calendar.make_google_client",
+        return_value=fake_client,
+    ):
+        await integration.handle_callback(
+            state=flow.state, code="AUTH-CODE-1", error=None,
+        )
+
+    assert flow.tokens is None
+    assert flow.error is not None
+    assert flow.error.code == "invalid_grant"
+
+
+# ── Calendar API (unchanged by the auth-code pivot) ────────────────
 
 
 @pytest.mark.asyncio
 async def test_list_events_returns_normalized_shape(integration, valid_tokens):
-    """The Calendar API returns verbose payloads — we normalize down
-    to {id, summary, location, start_iso, end_iso, all_day, ...}."""
+    """The Calendar API returns verbose payloads — we normalize down."""
     await integration._persist_tokens(valid_tokens)
 
     fake_session = MagicMock()
@@ -166,7 +313,6 @@ async def test_create_event_posts_with_auth_header(integration, valid_tokens):
 
     assert ev["id"] == "evt-new"
     assert ev["summary"] == "Lunch"
-    # Verify the POST was authed.
     call_kwargs = fake_session.post.call_args.kwargs
     assert call_kwargs["headers"]["Authorization"] == "Bearer AT-fresh"
 
@@ -176,7 +322,6 @@ async def test_disconnect_clears_creds(integration, valid_tokens):
     await integration._persist_tokens(valid_tokens)
     assert await integration.is_connected()
 
-    # Mock the revoke endpoint as a no-op success.
     fake_session = MagicMock()
     fake_session.closed = False
     fake_session.__aenter__ = AsyncMock(return_value=fake_session)
@@ -194,21 +339,17 @@ async def test_disconnect_clears_creds(integration, valid_tokens):
 
 
 @pytest.mark.asyncio
-async def test_expired_token_triggers_refresh(integration, monkeypatch):
-    """When the cached `expires_at` is past, `_get_access_token` must
-    refresh via the OAuth client before returning the new access token."""
+async def test_expired_token_triggers_refresh_via_authcode_client(integration):
+    """When `expires_at` is past, `_get_access_token` refreshes via the
+    auth-code client and persists the new tokens."""
     expired = OAuthTokens(
         access_token="AT-OLD",
         refresh_token="RT-1",
         token_type="Bearer",
-        expires_at=int(time.time()) - 10,  # already expired
+        expires_at=int(time.time()) - 10,
         scopes=["https://www.googleapis.com/auth/calendar.readonly"],
     )
     await integration._persist_tokens(expired)
-
-    # Mock GoogleOAuthConfig.from_env to skip env-var check.
-    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_ID", "cid")
-    monkeypatch.setenv("GOOGLE_OAUTH_CLIENT_SECRET", "csec")
 
     new_tokens = OAuthTokens(
         access_token="AT-NEW",
@@ -218,11 +359,10 @@ async def test_expired_token_triggers_refresh(integration, monkeypatch):
         scopes=["https://www.googleapis.com/auth/calendar.readonly"],
     )
 
-    refresh_mock = AsyncMock(return_value=new_tokens)
     fake_client = MagicMock()
     fake_client.__aenter__ = AsyncMock(return_value=fake_client)
     fake_client.__aexit__ = AsyncMock(return_value=None)
-    fake_client.refresh = refresh_mock
+    fake_client.refresh = AsyncMock(return_value=new_tokens)
 
     with patch(
         "dragon_voice.tools.integrations.google.calendar.make_google_client",
@@ -231,4 +371,4 @@ async def test_expired_token_triggers_refresh(integration, monkeypatch):
         token = await integration._get_access_token()
 
     assert token == "AT-NEW"
-    refresh_mock.assert_awaited_once_with("RT-1")
+    fake_client.refresh.assert_awaited_once_with("RT-1")

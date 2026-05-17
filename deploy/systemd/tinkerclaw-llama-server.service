@@ -1,0 +1,47 @@
+# TinkerClaw — llama-server systemd unit (Dragon ARM64)
+#
+# Serves MiniCPM-V (or any GGUF) on localhost:1234 with the same
+# OpenAI-compatible API LM Studio uses.  Dragon's `lmstudio_llm`
+# backend (dragon_voice/llm/lmstudio_llm.py) talks to this on the
+# Local + Hybrid voice-mode paths.
+#
+# Why: Ollama on Q6A delivers ~0.06 tok/s; llama-server with the
+# same model is 45× faster on the same hardware and supports
+# tool-call markers reliably for ministral, MiniCPM-V, qwen3 etc.
+#
+# Pre-reqs (one-time install on Dragon):
+#   - llama.cpp built at /home/radxa/llama.cpp/build/bin/llama-server
+#   - GGUF model + (optional) mmproj at /home/radxa/llama.cpp/models/minicpm/
+#   - This unit copied to /etc/systemd/system/, daemon-reload, enable + start
+#
+# To swap the model: edit ExecStart's --model arg, run
+#   sudo systemctl restart tinkerclaw-llama-server
+#
+# Pair-with: edit /home/radxa/dragon_voice/config.yaml so
+#   llm.backend = "lmstudio"
+#   llm.local_backend = "lmstudio"
+#   llm.lmstudio_url = "http://localhost:1234/v1"
+# then restart tinkerclaw-voice.
+
+[Unit]
+Description=TinkerClaw llama-server (LM Studio compatible, MiniCPM-V on ARM64)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=radxa
+WorkingDirectory=/home/radxa/llama.cpp
+ExecStart=/home/radxa/llama.cpp/build/bin/llama-server \
+  --model /home/radxa/llama.cpp/models/minicpm/model-q4_k_m.gguf \
+  --port 1234 \
+  --host 127.0.0.1 \
+  --ctx-size 16384 \
+  --threads 8 \
+  --jinja \
+  --log-disable
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -159,6 +159,22 @@ tries the LAN address first then falls back to
 [`telegram-bot.md`](telegram-bot.md) for the Telegram channel
 deployment as a fourth ngrok target.
 
+## Channel Messaging Architecture
+
+W7-F connects external messaging platforms (Telegram, WhatsApp,
+Discord, Slack, Signal, iMessage, Email…) into the Tab5 voice surface.
+Dragon receives a `channel_message` from the platform via the
+TinkerClaw gateway on `localhost:18789` (one signed-connect handshake
+per Dragon boot using an ed25519 device identity persisted at
+`~/.dragon/identity/device.json`).  Dragon routes the message to the
+addressed Tab5 over the existing voice WebSocket as a `channel_message`
+frame; the user replies by voice on Tab5, which emits a `channel_reply`
+frame back; Dragon forwards the reply to the originating platform via
+the same gateway (`GatewayConnector.send_reply`), and emits a
+`channel_reply_ack` to Tab5 once the platform acknowledges.  Wire
+formats: see [`protocol.md`](protocol.md) §20.1 (`channel_message`),
+§20.2 (`channel_reply`), §20.3 (`channel_reply_ack`).
+
 ## Voice WebSocket protocol — at a glance
 
 The single most important contract on the system.  Full reference:

@@ -158,6 +158,53 @@ All run live 2026-05-17.  See `DEMOS.md` on Dragon for the exact JS.
    at 780×441; the PNG round-tripped back to the workstation cleanly.
 5. **Navigate Google + count links** — 20 anchor tags on the home page.
 
+## UI-TARS-1.5-7B attempt (2026-05-17) — too big for Q6A
+
+Tried ByteDance's purpose-built browser/GUI agent.  Pulled
+`mradermacher/UI-TARS-1.5-7B-GGUF` Q4_K_M (4.68 GB) + mmproj-Q8
+(856 MB).  Wrote a dedicated agent (`experiments/agent_uitars_browser.py`)
+matching UI-TARS's specific action space:
+
+```
+click(point='<point>X Y</point>')      # X,Y in 0..1000 normalized
+type(content='xxx')
+scroll(point='<point>X Y</point>', direction='down|up|left|right')
+hotkey(key='ctrl c')
+wait()
+finished(content='answer')
+```
+
+Critical insight: **UI-TARS has no `navigate(url)` action**.  It was
+trained to operate on already-loaded pages; the orchestrator handles
+the URL bar.  Added `--url` flag to pre-navigate before the agent
+loop starts.
+
+**Result: hardware-limited, not model-limited.**  llama-server with
+UI-TARS resident:
+- RES 6.5 GB / 11.5 GB total RAM
+- **Swap 1.7 GB in use** — weights paging in/out
+- Free RAM 265 MB
+- Per-turn latency **>10 minutes** (600 s curl timeout hit during
+  first vision-prompt prefill)
+- 179 min of accumulated CPU time grinding before being killed
+
+The arithmetic: Q4_K_M 4.7 GB + mmproj 856 MB + KV cache for 16 k
+ctx at 7 B + chromium daemon (~1 GB) + Bun harness + base OS =
+over budget on Q6A's 11.5 GB.  UI-TARS is designed for desktops/
+servers with NPU/GPU.
+
+**Verdict:** Right model for browser agents (purpose-trained,
+screenshot-conditioned, correct action space), wrong hardware for
+Dragon Q6A.  Mitigations to try if revisiting:
+- Q3_K_S (~3.5 GB) might avoid swap, at quality cost
+- Lower ctx to 4 k to halve KV cache
+- Move orchestrator to workstation (Dragon serves harness + chromium
+  via CDP over LAN)
+- Wait for smaller UI-TARS variants — 1.5 series ships only 7B today
+
+Agent script + verb-translation preserved in
+`experiments/agent_uitars_browser.py` for the eventual revisit.
+
 ## First agent-loop attempt (2026-05-17, LFM2.5-VL Q4_0)
 
 A minimal 5-verb agent (`experiments/agent_lfm_browser.py`) was

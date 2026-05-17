@@ -51,6 +51,57 @@ Both live in `experiments/`:
 Both use Dialect 5 sentinel-token parsing with a bare-verb fallback
 because Gemma 3 sometimes drops the sentinels on follow-up turns.
 
+## Skill recipes (2026-05-17 — 3 of 95 wired in)
+
+`experiments/agent_skill_recipes.py` exposes three of the Python
+harness's pre-baked domain skills (`agent-workspace/domain-skills/`)
+as agent verbs:
+
+| Verb | Skill | Strategy |
+|---|---|---|
+| `hn_top()` | hackernews/scraping.md | `http_get` + regex on news.ycombinator.com |
+| `arxiv_search(query)` | arxiv/scraping.md | `http_get` Atom API |
+| `ddg_lookup(entity)` | duckduckgo/scraping.md | `http_get` Instant Answer JSON |
+
+All three skills explicitly say **"never use a browser"** — they're
+fast `http_get` + regex/XML/JSON pipelines (170-400 ms latency per
+call). Encoding them as agent verbs means we keep the structured
+output and the skill's hardening (rate-limit handling, sentinel
+trimming, etc.) without having Gemma 3 parse and write the recipe
+code itself (which the hard-gauntlet tells us it can't reliably do).
+
+**Results (Gemma 3 4B Q4):**
+
+| Story | Result |
+|---|---|
+| "What are the top 3 stories on Hacker News right now?" | ✅ Clean. Picked hn_top, summarized top 3 from live data, called browser_done with concrete titles. ~141 s. |
+| "Find recent arxiv papers about retrieval augmented generation" | ⚠️ Picked arxiv_search correctly; arxiv.org returned HTTP 429 (rate-limited from our earlier WebFetches in the session). Gemma reported the error honestly via browser_done ("I am unable to retrieve the requested information"). No hallucination. |
+| "Who is Elon Musk?" | ⚠️ Picked arxiv_search first (wrong tool — academic papers, not biographies). Saw the error, self-corrected to ddg_lookup on step 2, got a perfect Wikipedia abstract about Musk... then called browser_done({}) with EMPTY answer. The state-tracking gap from earlier — model knew to stop, didn't pass the result through. |
+| "Look up OpenAI on DuckDuckGo" | ⚠️ Picked ddg_lookup; DDG returned an empty payload (intermittent — works for "Elon Musk", fails for "OpenAI"); JSON parse failed; Gemma issued browser_done with a perfectly accurate answer **hallucinated from training data**, not from the observation. Same failure mode as the "Learn more" click test. |
+
+**Synthesis:**
+- 1/4 fully clean
+- 1/4 graceful failure (honest "can't do it")
+- 1/4 self-corrected verb choice but lost the answer at hand-off
+- 1/4 produced a correct answer hallucinated from training data when
+  the verb failed silently
+
+The pattern is consistent with the hard-gauntlet 7/20 result: Gemma
+3 4B can route to verbs and close loops, but arg extraction (passing
+observed text through to `browser_done(answer=...)`) and "did I
+actually see this?" verification are weak.
+
+**Implication for production:** the skill recipes are great
+deterministic helpers — the failures above are all in the agent
+orchestration layer, not in the recipes themselves.  We could write
+a stricter post-processor that:
+- Requires `browser_done(answer)` to have a non-empty `answer` arg
+- Substitutes the latest non-error observation when the arg is missing
+- Refuses to accept `browser_done` after a chain of error observations
+
+That hand-coded reliability scaffold around an LLM-flaky orchestrator
+is the realistic shape of a Q6A-resident agent for now.
+
 ## Why install with no agent
 
 The natural pairing is LFM2.5-VL (current Local default), but LFM-VL

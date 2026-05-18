@@ -1604,6 +1604,19 @@ class VoicePipeline:
                 if pool is not None:
                     for t in init_tasks:
                         pool[t.key] = t.instance
+                # Flip `_pooled_*` once registered — otherwise the
+                # NEXT swap (which sees `old_is_pooled=False`) would
+                # shut down a backend the pool still references, and
+                # the third swap back to it would return a
+                # shut-down instance with `_tts is None`.  Mirrors
+                # the initial-init logic at lines 312-321.
+                for t in init_tasks:
+                    if t.kind == "stt":
+                        self._pooled_stt = True
+                    elif t.kind == "tts":
+                        self._pooled_tts = True
+                    elif t.kind == "llm":
+                        self._pooled_llm = True
                 logger.info("Backend swap complete")
 
             # Audit B6 (#154): when swapping INTO a cloud STT mode,

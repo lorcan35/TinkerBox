@@ -105,7 +105,15 @@ def _reset_conn_config_to_local_defaults(conn_config: Any) -> None:
     tearing it down.
     """
     conn_config.stt.backend = "moonshine"
-    conn_config.tts.backend = "piper"
+    # Honor the user's YAML `tts.backend` if it's a local-eligible
+    # backend; only force-reset to piper when conn_config arrived with
+    # a cloud / unsupported value (preserves the NeuTTS Air premium
+    # voice + Kokoro override paths).  See config_swap.py for the
+    # parallel local_tts_override gate.
+    if (conn_config.tts.backend or "").strip().lower() not in (
+        "piper", "kokoro", "neutts_air",
+    ):
+        conn_config.tts.backend = "piper"
     if conn_config.llm.backend in _CLOUD_LLM_BACKENDS:
         # Use the user's `local_backend` preference when set,
         # else fall back to "ollama" — matches pre-extract.

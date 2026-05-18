@@ -39,6 +39,7 @@ from dragon_voice.tts.text_cleaner import clean_for_tts
 from dragon_voice.tts import (  # noqa: F401
     edge_tts_backend,
     kokoro_tts,
+    neutts_air_tts,
     openrouter_tts,
     piper_tts,
 )

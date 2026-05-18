@@ -91,6 +91,15 @@ class TTSConfig:
     # NeuTTS Air voice-cloning backend (neuphonic/neutts-air-q4-gguf + neucodec)
     neutts_ref_audio: str = ""
     neutts_ref_text: str = ""
+    # Supertonic-3 (Supertone, MIT) — 10 voices (F1-F5/M1-M5) + inline
+    # expression tags (<laugh>/<sigh>/<breath>).  44.1 kHz output.
+    supertonic_voice: str = "F1"
+    supertonic_lang: str = "en"
+    supertonic_speed: float = 1.0
+    supertonic_steps: int = 8
+    # KittenTTS (Apache-2.0) — 8 expression voices, 24 kHz English-only.
+    kitten_voice: str = "expr-voice-2-f"
+    kitten_speed: float = 1.0
     # OpenRouter cloud TTS (key auto-populated from llm.openrouter_api_key)
     openrouter_api_key: str = ""
     openrouter_url: str = "https://openrouter.ai/api/v1"
@@ -332,7 +341,10 @@ class VoiceConfig:
                 f"llm.backend must be one of {valid_llm}, got '{self.llm.backend}'"
             )
 
-        valid_tts = ("piper", "kokoro", "edge_tts", "openrouter", "neutts_air")
+        valid_tts = (
+            "piper", "kokoro", "edge_tts", "openrouter", "neutts_air",
+            "supertonic", "kitten",
+        )
         if self.tts.backend not in valid_tts:
             errors.append(
                 f"tts.backend must be one of {valid_tts}, got '{self.tts.backend}'"

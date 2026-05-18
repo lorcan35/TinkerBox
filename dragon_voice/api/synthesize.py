@@ -1,6 +1,7 @@
 """TTS synthesis and STT transcription API routes."""
 
 import base64
+import copy
 import json
 import logging
 import time
@@ -29,11 +30,29 @@ class SynthesizeRoutes:
         app.router.add_get("/api/ota/firmware.bin", self.ota_firmware)
 
     async def _ensure_stt(self) -> STTBackend | None:
+        """Build the STT backend used for /api/v1/transcribe.
+
+        When `stt.transcribe_backend` is set in config, we build a
+        DEDICATED backend (typically whisper.cpp) for batched WAV
+        uploads — independent of the voice-pipeline's `stt.backend`
+        (typically Moonshine, tuned for short streaming turns).
+        This is what makes long-form dictation work without stalling
+        the streaming model.
+        """
         if self._stt:
             return self._stt
-        self._stt = create_stt(self._config.stt)
+        cfg = self._config.stt
+        if cfg.transcribe_backend:
+            override = copy.deepcopy(cfg)
+            override.backend = cfg.transcribe_backend
+            if cfg.transcribe_model:
+                override.model = cfg.transcribe_model
+            stt_cfg = override
+        else:
+            stt_cfg = cfg
+        self._stt = create_stt(stt_cfg)
         await self._stt.initialize()
-        logger.info("STT initialized for API: %s", self._stt.name)
+        logger.info("Transcribe STT initialized: %s", self._stt.name)
         return self._stt
 
     async def _ensure_tts(self) -> TTSBackend | None:

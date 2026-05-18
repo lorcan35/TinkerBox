@@ -71,6 +71,13 @@ class STTConfig:
     # OpenRouter cloud STT (key auto-populated from llm.openrouter_api_key)
     openrouter_api_key: str = ""
     openrouter_url: str = "https://openrouter.ai/api/v1"
+    # Dedicated backend for the REST `/api/v1/transcribe` endpoint
+    # (long-form dictation).  When set, the transcribe endpoint uses
+    # this instead of `backend` — keeps Moonshine's low-latency
+    # streaming model on the voice WS pipeline while routing
+    # batched WAV uploads to a long-form-friendly Whisper model.
+    transcribe_backend: str = ""
+    transcribe_model: str = ""
 
 
 @dataclass
@@ -321,6 +328,11 @@ class VoiceConfig:
         if self.stt.backend not in valid_stt:
             errors.append(
                 f"stt.backend must be one of {valid_stt}, got '{self.stt.backend}'"
+            )
+        if self.stt.transcribe_backend and self.stt.transcribe_backend not in valid_stt:
+            errors.append(
+                f"stt.transcribe_backend must be one of {valid_stt} (or empty), "
+                f"got '{self.stt.transcribe_backend}'"
             )
 
         valid_llm = ("ollama", "openrouter", "lmstudio", "npu_genie", "tinkerclaw", "dual", "router")

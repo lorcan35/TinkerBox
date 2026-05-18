@@ -31,6 +31,29 @@ class KokoroBackend(TTSBackend):
 
     async def initialize(self) -> None:
         """Load the Kokoro model."""
+        # Compat shim for kokoro-onnx 0.5.0 + phonemizer-fork ≥ 3.3:
+        # (a) restore the static `EspeakWrapper.set_data_path` method
+        #     (became a `data_path` property in 3.3).
+        # (b) IGNORE whatever path kokoro hands us — it comes from
+        #     `espeakng_loader.get_data_path()` which is baked in at
+        #     wheel-build time and points at the CI runner's tmpdir
+        #     (`/home/runner/work/espeakng-loader/…`).  Force the
+        #     system espeak-ng-data dir, which DOES exist.
+        try:
+            from phonemizer.backend.espeak.wrapper import EspeakWrapper
+            _SYS_ESPEAK_DATA = "/usr/lib/aarch64-linux-gnu/espeak-ng-data"
+            if Path(_SYS_ESPEAK_DATA).is_dir():
+                def _set_data_path(_ignored):
+                    EspeakWrapper.data_path = _SYS_ESPEAK_DATA
+                EspeakWrapper.set_data_path = staticmethod(_set_data_path)
+                EspeakWrapper.data_path = _SYS_ESPEAK_DATA
+            elif not hasattr(EspeakWrapper, "set_data_path"):
+                def _set_data_path(path):
+                    EspeakWrapper.data_path = path
+                EspeakWrapper.set_data_path = staticmethod(_set_data_path)
+        except Exception as patch_err:
+            logger.warning("phonemizer compat shim skipped: %s", patch_err)
+
         try:
             import kokoro_onnx
         except ImportError as err:

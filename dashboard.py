@@ -715,16 +715,27 @@ tr.clickable { cursor: pointer; }
       </div>
       <div class="form-group">
         <label>TTS Backend</label>
-        <select id="cfg-tts">
-          <option value="piper">piper</option>
-          <option value="kokoro">kokoro</option>
-          <option value="edge_tts">edge_tts</option>
-          <option value="openrouter">openrouter</option>
+        <select id="cfg-tts" onchange="onTtsBackendChange()">
+          <option value="piper">piper — fast, robotic</option>
+          <option value="kokoro">kokoro — small, expressive (default)</option>
+          <option value="supertonic">supertonic — 10 voices, &lt;laugh&gt; tags</option>
+          <option value="kitten">kitten — 8 expression voices, tiny</option>
+          <option value="neutts_air">neutts_air — voice cloning, slow</option>
+          <option value="edge_tts">edge_tts — cloud, natural</option>
+          <option value="openrouter">openrouter — cloud, gpt-audio-mini</option>
         </select>
       </div>
       <div class="form-group">
-        <label>TTS Voice / Model</label>
-        <input id="cfg-tts-model" type="text" placeholder="e.g. en_US-lessac-medium">
+        <label>TTS Voice / Model <span id="cfg-tts-model-hint" style="color:var(--muted); font-weight:normal;"></span></label>
+        <input id="cfg-tts-model" type="text" placeholder="">
+      </div>
+      <div class="form-group full">
+        <label>Preview Voice</label>
+        <div style="display:flex; gap:8px; align-items:center;">
+          <input id="cfg-tts-preview-text" type="text" placeholder="Hello, this is Tinker speaking." style="flex:1;" value="Hello, this is Tinker speaking.">
+          <button class="btn" id="btn-tts-preview" onclick="previewVoice()">▶ Preview</button>
+          <span class="feedback" id="tts-preview-feedback"></span>
+        </div>
       </div>
       <div class="form-group">
         <label>LLM Backend</label>
@@ -1366,6 +1377,75 @@ async function loadConfig() {
   } catch(e) { console.warn('Config load failed:', e); }
 }
 
+// Voice/Model field is BACKEND-specific.  Carrying a Piper voice name
+// across to Kitten errors out at synth time; clear + hint on change.
+const TTS_HINTS = {
+  piper:      { ph: 'e.g. en_US-lessac-medium', hint: '(piper voice id)' },
+  kokoro:     { ph: 'e.g. af_heart, af_bella, am_michael', hint: '(kokoro voice)' },
+  supertonic: { ph: 'F1 F2 F3 F4 F5 M1 M2 M3 M4 M5', hint: '(supertonic voice — leave blank for F1)' },
+  kitten:     { ph: 'expr-voice-2-m / expr-voice-3-f / etc.', hint: '(kitten voice — leave blank for expr-voice-2-f)' },
+  neutts_air: { ph: '/path/to/reference.wav', hint: '(NeuTTS reference audio path)' },
+  edge_tts:   { ph: 'e.g. en-US-AriaNeural', hint: '(edge voice id)' },
+  openrouter: { ph: 'e.g. alloy, nova, echo', hint: '(openrouter voice)' },
+};
+
+function onTtsBackendChange() {
+  const tts = $('cfg-tts').value;
+  const cfg = TTS_HINTS[tts] || {ph: '', hint: ''};
+  const inp = $('cfg-tts-model');
+  // Clear stale carry-over so a Piper voice name doesn't get
+  // shipped to Kitten (synth would KeyError).
+  inp.value = '';
+  inp.placeholder = cfg.ph;
+  $('cfg-tts-model-hint').textContent = cfg.hint;
+}
+
+async function previewVoice() {
+  const btn = $('btn-tts-preview'), fb = $('tts-preview-feedback');
+  const text = ($('cfg-tts-preview-text').value || '').trim();
+  if (!text) { fb.textContent = 'Type something to preview'; return; }
+  btn.disabled = true;
+  fb.textContent = 'Synthesizing…';
+  try {
+    // Hits Dragon directly so the dashboard doesn't need to proxy
+    // raw audio bytes.  Bearer token comes from the same auth header
+    // chain used for /api/voice-config (server side).
+    const r = await fetch(P + '/api/v1/synthesize', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+      body: JSON.stringify({ text, sample_rate: 16000 }),
+    });
+    if (!r.ok) {
+      const e = await r.json().catch(()=>({error: r.statusText}));
+      fb.textContent = 'Error: ' + (e.error || r.statusText);
+      return;
+    }
+    const data = await r.json();
+    fb.textContent = `${data.tts_ms}ms · ${data.duration_s}s`;
+    // Decode base64 PCM and play via WebAudio
+    const raw = atob(data.audio_base64);
+    const buf = new Int16Array(raw.length / 2);
+    for (let i = 0; i < buf.length; i++) {
+      buf[i] = (raw.charCodeAt(i*2) | (raw.charCodeAt(i*2+1) << 8));
+      if (buf[i] >= 0x8000) buf[i] -= 0x10000;
+    }
+    const sr = data.sample_rate || 16000;
+    const ac = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: sr });
+    const ab = ac.createBuffer(1, buf.length, sr);
+    const ch = ab.getChannelData(0);
+    for (let i = 0; i < buf.length; i++) ch[i] = buf[i] / 32768;
+    const src = ac.createBufferSource();
+    src.buffer = ab;
+    src.connect(ac.destination);
+    src.start();
+    src.onended = () => ac.close();
+  } catch (e) {
+    fb.textContent = 'Failed: ' + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 async function applyConfig() {
   const btn = $('btn-apply'), fb = $('cfg-feedback');
   btn.disabled = true;
@@ -1380,6 +1460,9 @@ async function applyConfig() {
   const ttsModel = $('cfg-tts-model').value;
   if (tts === 'piper') payload.tts.piper_model = ttsModel;
   else if (tts === 'kokoro') payload.tts.kokoro_voice = ttsModel;
+  else if (tts === 'supertonic') { if (ttsModel) payload.tts.supertonic_voice = ttsModel; }
+  else if (tts === 'kitten') { if (ttsModel) payload.tts.kitten_voice = ttsModel; }
+  else if (tts === 'neutts_air') { if (ttsModel) payload.tts.neutts_ref_audio = ttsModel; }
   else if (tts === 'edge_tts') payload.tts.edge_voice = ttsModel;
   else if (tts === 'openrouter') payload.tts.openrouter_voice = ttsModel;
 

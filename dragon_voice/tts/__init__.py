@@ -38,10 +38,12 @@ from dragon_voice.tts.text_cleaner import clean_for_tts
 # registry doesn't care.
 from dragon_voice.tts import (  # noqa: F401
     edge_tts_backend,
+    kitten_tts,
     kokoro_tts,
     neutts_air_tts,
     openrouter_tts,
     piper_tts,
+    supertonic_tts,
 )
 
 

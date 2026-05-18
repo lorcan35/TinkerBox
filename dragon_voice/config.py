@@ -78,6 +78,10 @@ class STTConfig:
     # batched WAV uploads to a long-form-friendly Whisper model.
     transcribe_backend: str = ""
     transcribe_model: str = ""
+    # Where /api/v1/transcribe preserves raw WAV uploads so they can
+    # be retranscribed with a stronger model later.  Empty = use the
+    # default `/home/radxa/tinkerclaw/dictation_audio`.
+    transcribe_audio_dir: str = ""
 
 
 @dataclass

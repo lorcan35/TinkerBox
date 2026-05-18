@@ -10,20 +10,49 @@ from aiohttp import web
 
 from dragon_voice.api.utils import json_error, parse_json_body
 from dragon_voice.config import VoiceConfig
+from dragon_voice.dictation_audio import DictationAudioStore
 from dragon_voice.stt import create_stt, STTBackend
 from dragon_voice.tts import create_tts, TTSBackend
 
 logger = logging.getLogger(__name__)
 
 
+def _strip_wav_header(audio_bytes: bytes) -> bytes:
+    """Return PCM payload, dropping the 44-byte WAV header if present."""
+    if len(audio_bytes) > 4 and audio_bytes[:4] == b"RIFF":
+        data_pos = audio_bytes.find(b"data")
+        if data_pos >= 0 and data_pos + 8 <= len(audio_bytes):
+            return audio_bytes[data_pos + 8:]
+        return audio_bytes[44:]
+    return audio_bytes
+
+
 class SynthesizeRoutes:
     def __init__(self, voice_config: VoiceConfig) -> None:
         self._config = voice_config
         self._stt: STTBackend | None = None
+        # Per-model cache for retranscribe overrides — first call with
+        # "small.en" lazily builds + reuses that whisper.cpp instance.
+        self._stt_by_model: dict[str, STTBackend] = {}
         self._tts: TTSBackend | None = None
+        # Default under tinkerclaw/ so the systemd hardening's
+        # ReadWritePaths whitelist already covers it.
+        audio_dir = getattr(
+            voice_config.stt, "transcribe_audio_dir", ""
+        ) or "/home/radxa/tinkerclaw/dictation_audio"
+        self._audio_store = DictationAudioStore(audio_dir)
 
     def register(self, app: web.Application) -> None:
         app.router.add_post("/api/v1/transcribe", self.transcribe_audio)
+        app.router.add_get(
+            "/api/v1/transcribe/audio/{audio_id}", self.get_audio
+        )
+        app.router.add_delete(
+            "/api/v1/transcribe/audio/{audio_id}", self.delete_audio
+        )
+        app.router.add_post(
+            "/api/v1/transcribe/{audio_id}/retranscribe", self.retranscribe
+        )
         app.router.add_post("/api/v1/synthesize", self.synthesize)
         # OTA firmware
         app.router.add_get("/api/ota/check", self.ota_check)
@@ -64,24 +93,32 @@ class SynthesizeRoutes:
         return self._tts
 
     async def transcribe_audio(self, request: web.Request) -> web.Response:
-        """POST /api/v1/transcribe — raw PCM or WAV → text"""
+        """POST /api/v1/transcribe — raw PCM or WAV → text + audio_id.
+
+        Content-paramount mode: the raw upload is persisted to disk
+        (content-addressed by sha256) BEFORE transcription runs, so
+        even if Whisper hangs or Dragon crashes mid-decode the source
+        audio is safe.  The response carries an ``audio_id`` the
+        client can pass to ``/api/v1/transcribe/{id}/retranscribe``
+        for a do-over with a different model.
+        """
         stt = await self._ensure_stt()
         if not stt:
             return json_error("STT backend not available", 503)
 
         sample_rate = int(request.headers.get("X-Sample-Rate", "16000"))
-        audio_bytes = await request.read()
-        if not audio_bytes or len(audio_bytes) < 100:
+        upload = await request.read()
+        if not upload or len(upload) < 100:
             return json_error("No audio data in request body")
 
-        # Strip WAV header if present
-        if len(audio_bytes) > 4 and audio_bytes[:4] == b"RIFF":
-            data_pos = audio_bytes.find(b"data")
-            if data_pos >= 0 and data_pos + 8 <= len(audio_bytes):
-                audio_bytes = audio_bytes[data_pos + 8:]
-            else:
-                audio_bytes = audio_bytes[44:]
+        # Persist FIRST — Whisper failure must not lose the recording.
+        try:
+            audio_id = await self._audio_store.save(upload)
+        except Exception:
+            logger.exception("dictation_audio save failed")
+            audio_id = ""
 
+        audio_bytes = _strip_wav_header(upload)
         duration_s = len(audio_bytes) / (sample_rate * 2)
         try:
             t0 = time.monotonic()
@@ -91,10 +128,111 @@ class SynthesizeRoutes:
                 "text": transcript.strip(),
                 "duration_s": round(duration_s, 1),
                 "stt_ms": round(stt_ms),
+                "audio_id": audio_id,
+                "stt_backend": stt.name,
             })
         except Exception as e:
             logger.exception("Transcription failed")
-            return json_error(f"Transcription failed: {e}", 500)
+            return json_error(
+                f"Transcription failed: {e} (audio preserved as {audio_id})",
+                500,
+            )
+
+    async def _get_stt_for_model(self, model: str) -> STTBackend:
+        """Return a whisper.cpp STT instance for the requested model.
+
+        Lazily builds + caches per model name so /retranscribe can
+        offer a "try the bigger model" path without reloading on
+        every request.
+        """
+        key = model.strip() or "__default__"
+        if key in self._stt_by_model:
+            return self._stt_by_model[key]
+        if key == "__default__":
+            stt = await self._ensure_stt()
+            self._stt_by_model[key] = stt
+            return stt
+        override = copy.deepcopy(self._config.stt)
+        # Force whisper for retranscribes regardless of the default
+        # transcribe_backend.  Whisper is the only backend with the
+        # quality knob (`tiny.en` → `small.en` → `medium.en`) we
+        # expose here.
+        override.backend = "whisper_cpp"
+        override.model = key
+        stt = create_stt(override)
+        await stt.initialize()
+        logger.info("Retranscribe STT initialized: %s", stt.name)
+        self._stt_by_model[key] = stt
+        return stt
+
+    async def get_audio(self, request: web.Request) -> web.StreamResponse:
+        """GET /api/v1/transcribe/audio/{audio_id} — download the WAV."""
+        audio_id = request.match_info["audio_id"]
+        try:
+            data = await self._audio_store.load(audio_id)
+        except ValueError as e:
+            return json_error(str(e), 400)
+        if data is None:
+            return json_error("audio not found", 404)
+        return web.Response(
+            body=data,
+            content_type="audio/wav",
+            headers={"Content-Disposition": f'attachment; filename="{audio_id}.wav"'},
+        )
+
+    async def delete_audio(self, request: web.Request) -> web.Response:
+        """DELETE /api/v1/transcribe/audio/{audio_id} — purge a stored WAV."""
+        audio_id = request.match_info["audio_id"]
+        try:
+            removed = await self._audio_store.delete(audio_id)
+        except ValueError as e:
+            return json_error(str(e), 400)
+        if not removed:
+            return json_error("audio not found", 404)
+        return web.json_response({"deleted": audio_id})
+
+    async def retranscribe(self, request: web.Request) -> web.Response:
+        """POST /api/v1/transcribe/{audio_id}/retranscribe?model=small.en
+
+        Re-runs whisper.cpp on a previously-stored WAV.  Use when the
+        first pass garbled something or you want a higher-quality
+        transcript than the default model produced.  ``model`` query
+        param picks the whisper.cpp model size (``tiny.en`` /
+        ``base.en`` / ``small.en`` / ``medium.en``); omit to use the
+        configured default.
+        """
+        audio_id = request.match_info["audio_id"]
+        try:
+            data = await self._audio_store.load(audio_id)
+        except ValueError as e:
+            return json_error(str(e), 400)
+        if data is None:
+            return json_error("audio not found", 404)
+
+        model = request.query.get("model", "")
+        try:
+            stt = await self._get_stt_for_model(model)
+        except Exception as e:
+            logger.exception("retranscribe STT init failed")
+            return json_error(f"STT init failed: {e}", 500)
+
+        sample_rate = int(request.headers.get("X-Sample-Rate", "16000"))
+        audio_bytes = _strip_wav_header(data)
+        duration_s = len(audio_bytes) / (sample_rate * 2)
+        try:
+            t0 = time.monotonic()
+            transcript = await stt.transcribe(audio_bytes, sample_rate)
+            stt_ms = (time.monotonic() - t0) * 1000
+            return web.json_response({
+                "text": transcript.strip(),
+                "duration_s": round(duration_s, 1),
+                "stt_ms": round(stt_ms),
+                "audio_id": audio_id,
+                "stt_backend": stt.name,
+            })
+        except Exception as e:
+            logger.exception("Retranscription failed")
+            return json_error(f"Retranscription failed: {e}", 500)
 
     async def synthesize(self, request: web.Request) -> web.Response:
         """POST /api/v1/synthesize — text → audio

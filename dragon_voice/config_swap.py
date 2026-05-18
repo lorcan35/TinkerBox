@@ -114,20 +114,26 @@ def select_backends_for_mode(
     # backends are never invoked — but if the user flips back to mode
     # 0 after a SOLO session we want LOCAL-shaped backends already
     # selected rather than CLOUD-shaped ones from a stale prior swap.
+    # Read the configured TTS backend from config.yaml; honor it as an
+    # explicit override on local-shaped modes.  Kokoro remains the
+    # fall-through default if config.yaml says "kokoro" / "piper" /
+    # nothing meaningful.  This is the override mechanism #338 promised
+    # in its comment but didn't actually wire — needed for the
+    # neutts_air premium-voice backend.
+    configured_tts = (conn_config.tts.backend or "").strip().lower()
+    local_tts_override = (
+        configured_tts if configured_tts in ("piper", "kokoro", "neutts_air") else "kokoro"
+    )
+
     if vmode.is_local() or vmode.is_solo():
-        # #338: Kokoro is the new local default — much higher MOS than
-        # Piper at modest CPU cost on Q6A.  Piper stays available as
-        # an explicit override via `tts.backend` in config.yaml for
-        # very low-end deploys or where the 350 MB Kokoro model isn't
-        # acceptable.
-        stt_be, tts_be = "moonshine", "kokoro"
+        stt_be, tts_be = "moonshine", local_tts_override
     elif vmode.is_tinkerclaw():
-        # TinkerClaw mode: default local STT/TTS (Kokoro since #338).
+        # TinkerClaw mode: default local STT/TTS (per local_tts_override).
         # "cloud" suffix in llm_model → use OpenRouter STT/TTS.
         if llm_model and "cloud" in llm_model.lower():
             stt_be, tts_be = "openrouter", "openrouter"
         else:
-            stt_be, tts_be = "moonshine", "kokoro"
+            stt_be, tts_be = "moonshine", local_tts_override
     else:
         stt_be, tts_be = "openrouter", "openrouter"
 

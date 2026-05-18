@@ -88,6 +88,9 @@ class TTSConfig:
     text_cleaner_enabled: bool = True
     edge_voice: str = "en-US-AriaNeural"
     sample_rate: int = 22050
+    # NeuTTS Air voice-cloning backend (neuphonic/neutts-air-q4-gguf + neucodec)
+    neutts_ref_audio: str = ""
+    neutts_ref_text: str = ""
     # OpenRouter cloud TTS (key auto-populated from llm.openrouter_api_key)
     openrouter_api_key: str = ""
     openrouter_url: str = "https://openrouter.ai/api/v1"
@@ -329,7 +332,7 @@ class VoiceConfig:
                 f"llm.backend must be one of {valid_llm}, got '{self.llm.backend}'"
             )
 
-        valid_tts = ("piper", "kokoro", "edge_tts", "openrouter")
+        valid_tts = ("piper", "kokoro", "edge_tts", "openrouter", "neutts_air")
         if self.tts.backend not in valid_tts:
             errors.append(
                 f"tts.backend must be one of {valid_tts}, got '{self.tts.backend}'"

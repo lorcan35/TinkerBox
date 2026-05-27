@@ -217,6 +217,75 @@ class LMStudioBackend(LLMBackend):
                 logger.error("LM Studio request failed: %s", e)
                 yield f"[Connection error: {e}]"
 
+    async def generate_with_tools(
+        self, messages: list[dict], tools: list[dict]
+    ) -> dict:
+        """Native OpenAI tool-calling pass (SupportsNativeTools).
+
+        Non-streaming. Sends `tools=[...]` + `tool_choice="auto"` at
+        temperature 0 (deterministic tool routing) and returns the
+        structured result. Requires llama-server started with `--jinja`
+        so the loaded GGUF's chat template renders + parses tool calls.
+
+        Returns {"content": str, "tool_calls": [{"name", "args"}, ...]}.
+        On transport error returns content with an error marker and no
+        tool calls so the caller degrades to a plain reply.
+        """
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=600, sock_read=300),
+                headers={"Content-Type": "application/json"},
+            )
+
+        payload = {
+            "model": self._model,
+            "messages": messages,
+            "stream": False,
+            "max_tokens": self._config.max_tokens,
+            "temperature": 0.0,
+            "tools": tools,
+            "tool_choice": "auto",
+        }
+
+        async with self._lock:
+            try:
+                async with self._session.post(
+                    f"{self._base_url}/chat/completions",
+                    json=payload,
+                ) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        logger.error(
+                            "LM Studio tools error %d: %s",
+                            resp.status,
+                            error_text[:300],
+                        )
+                        return {"content": "", "tool_calls": []}
+                    data = await resp.json()
+            except aiohttp.ClientError as e:
+                logger.error("LM Studio tools request failed: %s", e)
+                return {"content": "", "tool_calls": []}
+
+        choices = data.get("choices") or [{}]
+        msg = choices[0].get("message", {}) or {}
+        calls: list[dict] = []
+        for tc in msg.get("tool_calls") or []:
+            fn = tc.get("function") or {}
+            name = fn.get("name")
+            if not name:
+                continue
+            raw_args = fn.get("arguments")
+            if isinstance(raw_args, dict):
+                args = raw_args
+            else:
+                try:
+                    args = json.loads(raw_args) if raw_args else {}
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+            calls.append({"name": name, "args": args})
+
+        return {"content": msg.get("content") or "", "tool_calls": calls}
+
     def clear_history(self) -> None:
         """Clear conversation history."""
         self._conversation.clear()

@@ -20,6 +20,7 @@ from dragon_voice.messages import (
     trim_context_to_budget,
 )
 from dragon_voice.llm import create_llm, LLMBackend
+from dragon_voice.llm.base import SupportsNativeTools
 from dragon_voice.config import LLMConfig
 
 logger = logging.getLogger(__name__)
@@ -412,11 +413,17 @@ class ConversationEngine:
         )
         return response_text
 
-    async def _build_context(self, session_id: str, user_text: str) -> list[dict]:
+    async def _build_context(
+        self, session_id: str, user_text: str, inject_tool_prose: bool = True
+    ) -> list[dict]:
         """Build LLM context with optional memory augmentation and tool descriptions.
 
         After assembling the full context (system prompt + memory + tools + history),
         trims oldest messages to fit within the model's token budget (US-P16).
+
+        `inject_tool_prose=False` skips the prose [TOOLS] block — used by the
+        native tool-calling path, which sends tool schemas via the API
+        `tools=[...]` parameter instead of describing them in the prompt.
         """
         # Mode-aware context depth: local models have tiny context windows,
         # cloud models (128K+) can use much more conversation history.
@@ -439,7 +446,7 @@ class ConversationEngine:
 
         # Inject tool descriptions into system prompt
         # Use compact format for local models to save tokens
-        if self._tool_registry:
+        if self._tool_registry and inject_tool_prose:
             is_local = self._llm_config.backend in ("ollama", "npu_genie", "lmstudio")
             tool_desc = self._tool_registry.format_for_llm(compact=is_local)
             if tool_desc and context and context[0]["role"] == "system":
@@ -485,6 +492,22 @@ class ConversationEngine:
         """
         if not self._llm:
             raise RuntimeError("ConversationEngine not initialized")
+
+        # Native tool-calling path (llm.native_tools + a backend that
+        # supports the OpenAI tools=[...] API). Isolated method so the
+        # audit-hardened prose/marker loop below is untouched and stays
+        # the fallback for every other backend/model.
+        if (
+            getattr(self._llm_config, "native_tools", False)
+            and self._tool_registry
+            and isinstance(self._llm, SupportsNativeTools)
+        ):
+            async for token in self._process_text_stream_native(
+                session_id, text, input_mode, audio_duration_s,
+                on_tool_call, on_tool_result, on_tool_error, media_id,
+            ):
+                yield token
+            return
 
         # Store user message — multimodal turns pass media_id to encode
         # the content with the multimodal marker (#183 PR 3). Uses
@@ -683,5 +706,141 @@ class ConversationEngine:
 
         logger.info(
             "Conversation streamed (session=%s, latency=%.0fms, tools=%d): '%s' → '%s'",
+            session_id, latency_ms, tool_calls_made, text[:50], response_text[:50],
+        )
+
+    async def _process_text_stream_native(
+        self,
+        session_id: str,
+        text: str,
+        input_mode: str = "text",
+        audio_duration_s: Optional[float] = None,
+        on_tool_call=None,
+        on_tool_result=None,
+        on_tool_error=None,
+        media_id: Optional[str] = None,
+    ) -> AsyncIterator[str]:
+        """Native tool-calling turn via the OpenAI tools=[...] API.
+
+        Mirrors process_text_stream's contract but uses
+        `SupportsNativeTools.generate_with_tools` instead of prose-listed
+        tools + the marker parser. Each loop iteration asks the model for
+        a structured decision: a tool call (execute → feed result back →
+        loop) or final content (yield + stop). `tool_choice="auto"` means
+        the model returns no tool call for chit-chat / out-of-scope, so
+        the synthetic none() escape hatch isn't needed.
+
+        Non-streaming: the final answer is yielded in one chunk. The
+        WS keepalive (server.py) covers the silent inference window.
+        """
+        import json as _json
+
+        await self._messages.add_message(
+            session_id=session_id,
+            role="user",
+            content=text,
+            input_mode="text" if media_id else input_mode,
+            audio_duration_s=audio_duration_s,
+            media_id=media_id,
+        )
+        await self._db.touch_session(session_id)
+
+        tools = self._tool_registry.openai_tools()
+        t0 = time.monotonic()
+        tool_calls_made = 0
+        response_text = ""
+
+        while True:
+            context = await self._build_context(
+                session_id, text, inject_tool_prose=False
+            )
+            result = await self._llm.generate_with_tools(context, tools)
+            calls = result.get("tool_calls") or []
+            response_text = result.get("content") or ""
+
+            if calls and tool_calls_made < MAX_TOOL_CALLS:
+                call = calls[0]  # one at a time, same as the prose path
+                tool_calls_made += 1
+                tool_call = {"tool": call["name"], "args": call.get("args") or {}}
+                logger.info(
+                    "Native tool call: %s(%s)", tool_call["tool"], tool_call["args"]
+                )
+
+                if on_tool_call:
+                    try:
+                        await on_tool_call(tool_call)
+                    except Exception as e:
+                        logger.debug("on_tool_call callback error: %s", e)
+
+                if not self._tool_registry.get(tool_call["tool"]):
+                    # Model invented a tool name — surface it, don't loop.
+                    if on_tool_error:
+                        try:
+                            await on_tool_error({
+                                "name": tool_call["tool"],
+                                "code": "unknown_tool",
+                                "message": f"No such tool: {tool_call['tool']}",
+                            })
+                        except Exception as e:
+                            logger.debug("on_tool_error callback error: %s", e)
+                    break
+
+                _args = dict(tool_call["args"])
+                _args.setdefault("session_id", session_id)
+                tool_result = await self._tool_registry.execute(
+                    tool_call["tool"], _args
+                )
+
+                if on_tool_result:
+                    try:
+                        await on_tool_result(tool_result)
+                    except Exception as e:
+                        logger.debug("on_tool_result callback error: %s", e)
+
+                await self._messages.add_message(
+                    session_id=session_id, role="assistant",
+                    content=f"<tool>{tool_call['tool']}</tool>"
+                            f"<args>{_json.dumps(tool_call['args'])}</args>",
+                    input_mode="system", model=self._llm.name,
+                )
+                await self._messages.add_message(
+                    session_id=session_id, role="tool",
+                    content=f"<tool_result>"
+                            f"{_json.dumps(tool_result.get('result', tool_result))}"
+                            f"</tool_result>",
+                    input_mode="system",
+                )
+                continue  # re-query with the tool result in context
+
+            # No tool call (or limit hit) — final answer.
+            if calls and tool_calls_made >= MAX_TOOL_CALLS and on_tool_error:
+                try:
+                    await on_tool_error({
+                        "name": "(chain)",
+                        "code": "tool_call_limit_reached",
+                        "message": (
+                            f"Reached the {MAX_TOOL_CALLS}-tool limit for "
+                            "this turn — please ask again to continue."
+                        ),
+                        "limit": MAX_TOOL_CALLS,
+                    })
+                except Exception as e:
+                    logger.debug("on_tool_error (limit) callback error: %s", e)
+
+            if response_text:
+                yield response_text
+            break
+
+        latency_ms = (time.monotonic() - t0) * 1000
+        await self._messages.add_message(
+            session_id=session_id,
+            role="assistant",
+            content=response_text,
+            input_mode="system",
+            model=self._llm.name,
+            latency_ms=latency_ms,
+        )
+        logger.info(
+            "Native turn (session=%s, latency=%.0fms, tools=%d): '%s' → '%s'",
             session_id, latency_ms, tool_calls_made, text[:50], response_text[:50],
         )

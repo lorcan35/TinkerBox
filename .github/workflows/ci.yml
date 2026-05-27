@@ -143,4 +143,5 @@ jobs:
             tests/test_oauth_auth_code.py \
             tests/test_integrations_init.py \
             tests/test_google_calendar_integration.py \
-            tests/test_gmail_integration.py
+            tests/test_gmail_integration.py \
+            tests/test_tool_openai_schema.py

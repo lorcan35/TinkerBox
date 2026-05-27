@@ -134,6 +134,13 @@ class LLMConfig:
     openrouter_url: str = "https://openrouter.ai/api/v1"
     lmstudio_url: str = "http://localhost:1234/v1"
     lmstudio_model: str = "default"
+    # Native tool-calling: pass tools=[...] + tool_choice="auto" to the
+    # llama-server OpenAI API (requires --jinja) and consume structured
+    # tool_calls, instead of prose-listing tools in the system prompt and
+    # parsing markers out of the text. Off by default — the prose path
+    # stays the fallback for backends/models without native tool support.
+    # Live A/B on LFM2.5-VL-1.6B lifted the hard gauntlet 7/10 → 9/10.
+    native_tools: bool = False
     genie_model_dir: str = "/home/radxa/qairt/models/llama32-1b"
     genie_config: str = "htp-model-config-llama32-1b-gqa.json"
     system_prompt: str = (

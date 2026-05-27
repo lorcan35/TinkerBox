@@ -386,6 +386,41 @@ production-grade:** (1) local-mode system prompt that nudges tool use + the
 read-vs-action and remember-vs-recall distinctions; (2) sharper action-tool
 descriptions; (3) consider curating/grouping the tool set for the 1 B model.
 
+## Quant + hardware-speed research (2026-05-27)
+
+Dragon CPU verified: **8-core aarch64, `asimddp` (dotprod), NO `i8mm`, NO `sve`**
+(QCS6490, Hexagon v66/v68-class NPU).
+
+**Optimal quant for this core:**
+- Ship plain **Q4_0** → llama.cpp **runtime-repacks** to `q4_0_4x4` (dotprod) at
+  load (PR #9921; the static `Q4_0_4_4` type was removed in b4282). Gives
+  ~1.2–1.5× tok/s over Q4_K_M on this class of core. Verify `DOTPROD=1` +
+  `AARCH64_REPACK=1` + `q4_0_4x4` repack lines in the startup log.
+- **Q4_K_M** = best quality-per-bit (~5× less perplexity damage than Q4_0).
+- **Q8_0** = near-lossless but ~2× the memory bandwidth → ~half the tok/s.
+- **i-quants (IQ4_NL)** net neutral-to-slower on a slow dotprod core.
+
+**Q8 quant test (live, optimized recipe):** Granite-1B Q8 = **17/20**,
+Qwen3-1.7B Q8 = **15/20** — i.e. **Q8 gave NO tool-accuracy gain** over Q4
+(Granite Q4_K_M was 19/20; the gap is run-variance + the turn-1 cold-start
+artifact) while running ~2× slower. **Conclusion: Q4_K_M is the right production
+quant; Q4_0 is the speed option (~1.3×) if a quick A/B shows the 1B keeps its
+tool accuracy. Q8 is not worth the latency.**
+
+**Making 3-4B usable — verdict: not on this CPU.**
+- **Speculative decoding**: ~no gain on a compute-bound CPU (llama.cpp CPU
+  spec-decode is still a proposal, #21453; voice = open-ended chat = ~50% draft
+  acceptance). MTP is GPU-only numbers + Qwen3.6-only.
+- **Hexagon NPU**: QCS6490 is below the v73 floor that LLM-on-Genie/HTP
+  requires — no LLM-on-NPU path in 2026.
+- Best case for a 4B (Q4_0 + tuned threads) ≈ 70–90 s/turn, still above the
+  ~30-40 s usability bar. **Sub-2B is the only viable real-time path.**
+
+**Recommended llama-server flags for the live 1-2B tool model:**
+`-t 6 -fa on -ctk q8_0 -ctv q8_0 --mlock -c 4096 --cache-reuse 256`
+(pin with `taskset -c 0-5`; benchmark -t 6 vs 7 vs 8 — bandwidth-bound, 6 often
+wins). KV-quant must be symmetric (ctk==ctv) or it falls back to the slow path.
+
 ## Risks & open questions
 
 - **llama-server native tool-calling fidelity per model.** `--jinja` tool

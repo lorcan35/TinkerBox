@@ -350,6 +350,42 @@ emitted no correct tool call; only the 4 no-tool scenarios pass.)
   slower than Granite; the rest sit at the 4/10 floor (no reliable tool
   emission). Reasoning models (R1-Distill, EXAONE) are both weak and slow.
 
+## Live deployment + real-tools test (2026-05-27)
+
+**Shipped:** `tinkerclaw-llama-server` unit swapped to Granite 4.0 Nano-1B
+(text-only, `--mmproj` dropped; LFM-VL unit backed up at `.lfmvl.bak`).
+`llm.native_tools: true` added to live `config.yaml`; voice server restarted.
+Granite serves on :1234, native tool probe confirmed (`weather → {location:Paris}`).
+**Local mode vision is temporarily unavailable** (Granite is text-only) — wiring
+a dual-server / router fallback for camera turns is the follow-up.
+
+**Real-tools test** — varied phrasings against Granite with the *actual* 27-tool
+Dragon registry (calendar/email/tasks/weather/web/datetime/memory) + native API:
+
+Correct + clean args: "any new emails"→`gmail_unread`, "search inbox for
+invoices"→`gmail_search(subject:invoice)`, "email mom happy birthday…"→
+`gmail_send(to,subject,body)` (clean), "to-do list"→`tasks_list`, "add buy
+groceries"→`tasks_add(title)`, "what time"→`datetime`, "weather in London"→
+`weather(London)`, "18% tip on 64"→`calculator(64*0.18)`, "thanks!"→no tool. (~12/19)
+
+**Misroutes exposed by the 27-tool granularity (not seen on the 9-tool bench):**
+- Defaults to the READ/LIST variant over the ACTION variant: "schedule a
+  dentist…"→`calendar_today` (want `calendar_create`); "cancel my 2pm"→
+  `calendar_today` (want `calendar_cancel`); "mark laundry done"→`tasks_list`
+  (want `tasks_complete`).
+- "did Sarah email me…"→`gmail_unread` (want `gmail_search`).
+- "remember I prefer window seats"→`recall` (want `remember`).
+- "tell me a joke"→`web_search` (should answer directly — chitchat over-fire).
+- First 3 turns timed out = cold-start (first inference ~117 s after load); warm
+  turns 9-18 s.
+
+**Conclusion:** Granite native-tools is solid for the common single-shot cases
+but the large, granular real registry + the terse production system prompt drop
+it below the controlled-bench 10/10. **Tuning needed before this is
+production-grade:** (1) local-mode system prompt that nudges tool use + the
+read-vs-action and remember-vs-recall distinctions; (2) sharper action-tool
+descriptions; (3) consider curating/grouping the tool set for the 1 B model.
+
 ## Risks & open questions
 
 - **llama-server native tool-calling fidelity per model.** `--jinja` tool

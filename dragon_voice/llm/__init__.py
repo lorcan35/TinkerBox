@@ -72,9 +72,22 @@ def create_llm(config: LLMConfig) -> LLMBackend:
     # swap to Ollama so Dragon comes up serving SOMETHING instead of
     # blowing up at the first request.
     if backend_name == "lmstudio":
-        if not _quick_tcp_probe(config.lmstudio_url):
+        # Retry the probe with backoff before giving up. At boot, llama-server
+        # is often still loading the model when tinkerclaw-voice starts; a
+        # single failed 1.5 s probe used to strand the whole session on (often
+        # dead) Ollama. ~5×2 s grace catches a loading server without delaying
+        # boot meaningfully when it's truly down.
+        import time as _time
+
+        reachable = False
+        for _attempt in range(5):
+            if _quick_tcp_probe(config.lmstudio_url):
+                reachable = True
+                break
+            _time.sleep(2.0)
+        if not reachable:
             logger.warning(
-                "LM Studio backend selected but %s unreachable — "
+                "LM Studio backend selected but %s unreachable after retries — "
                 "falling back to Ollama for this session.  Run "
                 "`systemctl status tinkerclaw-llama-server` on Dragon "
                 "and `systemctl restart tinkerclaw-voice` to switch back.",

@@ -421,6 +421,66 @@ tool accuracy. Q8 is not worth the latency.**
 (pin with `taskset -c 0-5`; benchmark -t 6 vs 7 vs 8 — bandwidth-bound, 6 often
 wins). KV-quant must be symmetric (ctk==ctv) or it falls back to the slow path.
 
+## 10x local-capability architecture (2026-05-27 research + plan)
+
+Goal: a Local setup that can "actually do" multi-step/agentic tasks, not just
+route one tool call — accepting "smart" can be slower than real-time. The infra
+mostly already exists (ReAct loop in `conversation.py`, native-tools path,
+`CapabilityAwareRouter` #183 unused, `DualModelBackend` parked, `SchedulerManager`).
+
+**RAM math (the enabler):** STT+TTS+Python ≈ 2.5–3.5 GB; 1B Q4 (~1.4 GB) + 4B Q4
+(Qwen3.5-4B, ~4 GB incl KV) both fit resident in 12 GB with ~2 GB headroom. Only
+one model infers at a time (turns are sequential) → no 8-core oversubscription.
+"Two warm, one inferring."
+
+**The 3 highest-value changes (capability-per-latency):**
+1. **Two warm tiers + grounded escalation.** Fast Granite-1B (real-time, 19/20
+   routing) + warm smart Qwen3.5-4B (18–20/20, drafts/chains). Prefer
+   llama-server router/`--models-preset` (one endpoint, `model:"fast"|"smart"`,
+   both `load-on-startup`, smart `stop-timeout=0`); else two `--port` instances
+   via the existing `DualModelBackend`/fleet plumbing. Escalation: the fast 1B
+   self-escalates via a `<escalate/>` sentinel; an explicit "think hard" voice
+   intent / Tab5 smartness knob forces smart; and the `MAX_TOOL_CALLS` branch
+   re-issues on smart instead of erroring. Raise `MAX_TOOL_CALLS` to 6–8 on the
+   smart tier only (keep 3 on fast).
+2. **`--cache-reuse 256` + prefix-stable context.** Biggest *latency* cut on a
+   prefill-bound CPU: reuse the static system+tools prefix across every
+   tool-loop iteration. Keep the tool block fixed in `context[0]`; move volatile
+   memory/RAG to a later message so the long prefix stays cacheable. VERIFY
+   reuse engages (logs) on Qwen3.5-4B — it's broken for some archs (Gemma-4,
+   Qwen3-Next).
+3. **Async background smart-agent tier.** For "research X and get back to me" /
+   "draft replies to my unread": ack instantly on fast tier, enqueue a
+   `SchedulerManager` job that runs the smart tier (high tool cap + reflection,
+   latency is free), deliver via the existing notification/channel-push. Turns
+   Qwen3.5-4B's ~2 min/turn from a liability into a feature. (Local browsing
+   lives on the parked `feat/browser-agent` branch — natural home here.)
+
+**Agentic-loop guidance:** keep grounded ReAct + parallel tool execution
+(`asyncio.gather` independent calls instead of `tool_calls[0]` one-at-a-time);
+add **CodeAct** for the smart tier later (smolagents: ~30% fewer steps). Do NOT
+add plan-and-execute or reflection to the live voice loop (extra full LLM calls
+you can't afford at ~2 min/turn) — reserve reflection for the async tier.
+NOT worth it: spec-decode/MTP, `--parallel>1` concurrent inference, a separate
+learned classifier, 3+ resident models.
+
+## Production findings during recipe rollout (2026-05-27)
+
+- **Recipe is LIVE + verified:** native path fires; "schedule a dentist
+  appointment" → `calendar_create` w/ clean args (was `calendar_today`).
+- **Concurrency oversubscription:** the WS inference executor (`max_workers=4`)
+  let 4 simultaneous local-LLM turns run on the 8-core CPU → thrash → every turn
+  crawled to the 300 s `sock_read` timeout. **Fix: serialize the local CPU model
+  (effective max_workers=1 for the lmstudio/local backend)** so bursts queue
+  instead of thrashing.
+- **Startup Ollama fallback:** `create_llm()`'s one-shot lmstudio TCP probe fell
+  back to (dead) Ollama at boot when :1234 was momentarily busy. Per-connection
+  re-init used lmstudio correctly, but the global instance shouldn't silently
+  land on a dead backend — harden the probe (retry/backoff) or fail loud.
+- **Tool-execution latency:** a verified `calendar_create` turn took ~120 s —
+  much of it the Google Calendar API call + the post-tool LLM wrap, not routing.
+  Tighten tool-exec timeouts; the tiering + cache-reuse address the LLM side.
+
 ## Risks & open questions
 
 - **llama-server native tool-calling fidelity per model.** `--jinja` tool

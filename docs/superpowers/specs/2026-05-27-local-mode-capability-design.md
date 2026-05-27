@@ -311,6 +311,45 @@ templates are historically fragile for the OpenAI round-trip. **Plan: Granite
 Nano-1B stays the tool/voice brain; keep a VLM as the camera fallback (trial
 Qwen3-VL-2B vs LFM2.5-VL-1.6B only for vision quality, route tools to Granite).**
 
+## Round-3 bake-off (2026-05-27) — all challengers + ruled-out, BOTH modes
+
+Tested every candidate in **native** (OpenAI `tools=[...]`) AND **prose**
+(tools in system prompt, parsed by Dragon's deployed 5-dialect parser — the
+production fallback path). Best mode per model bolded. (A 4/10 floor = the model
+emitted no correct tool call; only the 4 no-tool scenarios pass.)
+
+| Model | Params | Native | Prose |
+|-------|--------|--------|-------|
+| **IBM Granite 4.0 Nano-1B** | 1B | **10/10 @ 14s** | 4/10 @ 10s |
+| Qwen3-1.7B | 1.7B | 8/10 @ 13s | **9/10 @ 7.6s** |
+| Qwen3.5-2B | 2B | 8/10 @ 41s | 8/10 @ 24s |
+| LFM2-1.2B-Tool | 1.2B | **8/10 @ 29s** | 6/10 @ 19s |
+| LFM2.5-1.2B-Instruct | 1.2B | **8/10 @ 30s** | 4/10 @ 15s |
+| Qwen3.5-0.8B | 0.8B | 7/10 @ 22s | 5/10 @ 11s |
+| SmolLM2-1.7B | 1.7B | 4/10 @ 10s | **7/10 @ 7.6s** |
+| EXAONE-4.0-1.2B | 1.2B | 4/10 @ 24s | 4/10 @ 26s |
+| DeepSeek-R1-Distill-Qwen-1.5B | 1.5B | 4/10 @ 87s | 4/10 @ 81s |
+| Kanana-nano-2.1B | 2.1B | 4/10 @ 24s | 4/10 @ 15s |
+| Falcon3-1B-Instruct | 1B | 2/10 @ 20s | 4/10 @ 6.5s |
+| StableLM-2-1.6B | 1.6B | 4/10 @ 12s | 4/10 @ 14s |
+| H2O-Danube3-1.8B | 1.8B | — (GGUF gated, not obtainable) | — |
+
+### Findings
+
+- **Granite 4.0 Nano-1B is confirmed the winner — 10/10 @ 14s, reproduced.**
+  Nothing beat it across two rounds and both modes.
+- **Granite's accuracy lives in the native path** (10/10 native vs 4/10 prose).
+  Confirms Component 2 (`native_tools`) is *essential* for the winner, not
+  optional.
+- **Qwen models are the inverse — better via prose.** Qwen3-1.7B: 9/10 prose vs
+  8/10 native; SmolLM2: 7/10 prose vs 4/10 native. The prose-path test earned
+  its keep here.
+- **Qwen3-1.7B (9/10 @ 7.6s prose) is the one real alternative** — one point
+  below Granite but ~2× faster. The speed pick if 14s feels long.
+- **The ruled-out set stayed ruled out.** LFM2-Tool/LFM2.5 reach 8/10 native but
+  slower than Granite; the rest sit at the 4/10 floor (no reliable tool
+  emission). Reasoning models (R1-Distill, EXAONE) are both weak and slow.
+
 ## Risks & open questions
 
 - **llama-server native tool-calling fidelity per model.** `--jinja` tool

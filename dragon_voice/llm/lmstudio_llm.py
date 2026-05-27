@@ -237,11 +237,17 @@ class LMStudioBackend(LLMBackend):
                 headers={"Content-Type": "application/json"},
             )
 
+        # Cap the tool-decision generation hard. A tool call (or a 1-2
+        # sentence reply) is short; without this the model can run toward
+        # the 1024 MAX_TOOL_LOCAL ceiling and, non-streaming on a 1B CPU,
+        # blow past the 300 s sock_read timeout (~0.2-0.3 s/token) — which
+        # presented as "native turn fires no tool". 256 is plenty for a
+        # tool call + clean args.
         payload = {
             "model": self._model,
             "messages": messages,
             "stream": False,
-            "max_tokens": self._config.max_tokens,
+            "max_tokens": min(self._config.max_tokens, 256),
             "temperature": 0.0,
             "tools": tools,
             "tool_choice": "auto",

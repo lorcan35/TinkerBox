@@ -561,8 +561,16 @@ class ConversationEngine:
         # supports the OpenAI tools=[...] API). Isolated method so the
         # audit-hardened prose/marker loop below is untouched and stays
         # the fallback for every other backend/model.
+        _nt = getattr(self._llm_config, "native_tools", False)
+        logger.info(
+            "TT-ROUTE native_tools=%s backend=%s llm=%s supports_native=%s reg=%s",
+            _nt, getattr(self._llm_config, "backend", None),
+            type(self._llm).__name__,
+            isinstance(self._llm, SupportsNativeTools),
+            bool(self._tool_registry),
+        )
         if (
-            getattr(self._llm_config, "native_tools", False)
+            _nt
             and self._tool_registry
             and isinstance(self._llm, SupportsNativeTools)
         ):

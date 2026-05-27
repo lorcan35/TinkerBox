@@ -181,6 +181,33 @@ with the documented production reality (finding #2).
   2026-05-16) and latency-relevant, but latency is secondary here; track as a
   follow-up, not part of this capability-first project.
 
+## Validation (2026-05-27) — Component 2 proven on live hardware
+
+Before writing the production code, an A/B probe ran against the live
+llama-server (LFM2.5-VL-1.6B Q8, the current Local default, `--jinja` already
+enabled) over a 10-scenario hard-gauntlet subset spanning all four capability
+axes:
+
+| Path | Score | Avg latency |
+|------|-------|-------------|
+| Prose-listed tools (current) | **7/10** | 13.7 s |
+| Native `tools=[...]` API (proposed) | **9/10** | 27.7 s |
+
+The native path fixed exactly the documented prose-path failures: happy-path
+tool selection ("what's on my plate today?" → `calendar_today` not
+`tasks_list`) and complex-arg extraction ("email mom…" → clean
+`gmail_send(to, subject, body)` instead of positional placeholders). The one
+native miss is a 1.6B red-herring over-fire ("these tasks are killing me" →
+`tasks_list`), unmoved by a tool-discipline system-prompt line — a model
+ceiling that the Component 3 bake-off (Qwen3.5-4B scored 3/3 on red-herrings)
+addresses.
+
+The implementation then landed behind `llm.native_tools` (default off) and was
+re-validated **through the real deployed code path** (`LMStudioBackend
+.generate_with_tools` + `ToolRegistry.openai_tools` + `_process_text_stream_
+native`): **9/10**, matching the raw probe. Latency ~2× (acceptable —
+capability is the gate). Committed: `feat(llm): native tool-calling path`.
+
 ## Risks & open questions
 
 - **llama-server native tool-calling fidelity per model.** `--jinja` tool

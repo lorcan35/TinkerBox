@@ -147,16 +147,40 @@ contamination (exemplars removed).
 ### Component 3 — Model bake-off behind the harness
 
 With the harness (1) and the hardened path (2) in place, run the candidates and
-pick the **capability knee** (latency recorded but not gating):
+pick the **capability knee** (latency recorded but not gating).
 
-- **LFM2.5-VL-1.6B** — incumbent; does the native tools API lift it past 7/20?
-- **Qwen3-4B-Instruct-2507 @ Q4_K_M** (thinking off) — research-recommended
-  accuracy anchor, lighter quant than the Q8 we benched.
-- **Qwen3.5-4B @ Q4_K_M** — the parked 18/20 leader, now viable since latency
-  is not the gate.
-- **ministral-3:3b** — old default, baseline.
-- *(optional)* **LFM2.5-1.2B-Instruct** — fastest candidate, for the latency
-  data point.
+**Selection constraint (from the 2026-05-27 deep model survey):** because
+Component 2 uses the native OpenAI `tools=[...]` API, the candidate must emit
+tool calls that **round-trip cleanly through llama-server's OpenAI-compatible
+parser**. This is a hard gate equal to GGUF availability. Function-calling
+*specialists* with custom formats (Hammer 2.1, xLAM-2) fail it badly on this
+runtime class (independent eval: Hammer 0/8 on actual calls, xLAM ~15%) even
+though their weights are strong — they would require their bespoke parsers (the
+existing 5-dialect text parser path), not the native API. So the native-path
+bake-off favors **native-OpenAI-schema generalists**:
+
+- **NVIDIA Nemotron-3-Nano-4B @ Q4_K_M** — *new top challenger.* Mar 2026,
+  official NVIDIA GGUF, Mamba-2/Transformer hybrid (linear attention → fast on
+  the CPU-bound Dragon), tool-use as a primary RL target, native OpenAI tools +
+  `finish_reason:"tool_calls"`, reasoning toggleable off for latency. Scored
+  95% on an independent OpenAI-compatible tool-calling eval. `<think>` tokens
+  (12/13) must be stripped.
+- **Qwen3.5-4B @ Q4_K_M** — the parked 18/20 accuracy leader, BFCL-v4 0.503,
+  now viable since latency is not the gate. Use a GGUF post-dating the universal
+  chat-template tool-calling fix.
+- **Qwen3-4B-Instruct-2507 @ Q4_K_M** (thinking off) — accuracy anchor,
+  lighter quant than the Q8 we benched.
+- **IBM Granite 4.0 Micro 3B / Nano-1B (plain transformer)** — cleanest native
+  OpenAI-schema tool-calling, BFCLv3 + IFEval-proven; the safe well-behaved
+  baseline and the tiny option.
+- **MiniCPM5-1B** — *speed wildcard.* Brand new (~late May 2026), official clean
+  GGUF, claims 1B-class agentic-tool SOTA. Emits XML tool calls → needs a
+  `--jinja` template mapping to OpenAI JSON; validate that round-trip before
+  trusting it on the native path.
+- **LFM2.5-VL-1.6B** — incumbent baseline (already measured: prose 7/10 →
+  native 9/10).
+- *(optional)* **LFM2.5-1.2B-Instruct** / **ministral-3:3b** — additional
+  latency/baseline data points.
 
 Make the winner the **committed `config.yaml` default**, reconciling the repo
 with the documented production reality (finding #2).

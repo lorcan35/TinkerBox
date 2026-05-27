@@ -27,6 +27,70 @@ logger = logging.getLogger(__name__)
 
 MAX_TOOL_CALLS = 3  # Prevent infinite tool-call loops
 
+# ── Native tool-calling recipe (TinkerBox spec 2026-05-27) ─────────────
+# Lifts the 27-tool gauntlet from ~12/19 to 19/20 on Granite-4.0-Nano-1B.
+# Three parts, applied only on the native (tools=[...]) path:
+#   1) _NATIVE_TOOL_GUIDANCE — appended to the system prompt: when to call a
+#      tool + read-vs-action / remember-vs-recall disambiguation + no-fire on
+#      chit-chat.
+#   2) _NATIVE_TOOL_DESC — intent-keyed descriptions for confusable tools
+#      (the native router leans heavily on tool descriptions).
+#   3) _NATIVE_FEWSHOT — message-level few-shot exemplars (the decisive lever;
+#      rules alone didn't fix read-vs-action, real tool_call examples did).
+_NATIVE_TOOL_GUIDANCE = (
+    "\n\nTOOL USE: Always call the matching tool when the user asks about their "
+    "calendar, email, tasks, the weather, the time, a calculation, or to "
+    "remember/recall a fact — never answer those from your own knowledge. Match "
+    "intent precisely: schedule/book/set up a NEW event = calendar_create (NOT "
+    "calendar_today); cancel/delete an event = calendar_cancel; read/list "
+    "existing events = calendar_today or calendar_week; find/search email or "
+    "'did X email me' = gmail_search (NOT gmail_unread); new/unread email = "
+    "gmail_unread; mark a task done/complete = tasks_complete (NOT tasks_list); "
+    "save/'remember that' a fact = remember; 'what do you know'/recall = recall. "
+    "For jokes, opinions, greetings, thanks, or chit-chat, do NOT call any tool "
+    "— just reply briefly."
+)
+_NATIVE_TOOL_DESC = {
+    "calendar_today": "List/read EXISTING calendar events for today. Read-only; does NOT create events.",
+    "calendar_week": "List/read EXISTING calendar events for this week. Read-only.",
+    "calendar_create": "Create/schedule/book a NEW calendar event or appointment.",
+    "calendar_cancel": "Cancel, delete, or remove an existing calendar event.",
+    "gmail_unread": "List the user's UNREAD/new emails ('any new mail', 'unread').",
+    "gmail_search": "Search the inbox by keyword/sender/subject ('did X email me', 'find email about Y').",
+    "gmail_send": "Compose and SEND a new email; extract recipient, subject, body.",
+    "gmail_read": "Read the full body of one specific email.",
+    "tasks_list": "List the user's existing to-do tasks. Read-only.",
+    "tasks_add": "Add a NEW to-do task.",
+    "tasks_complete": "Mark an existing to-do task as done/complete/finished.",
+    "remember": "Store/save a NEW fact about the user for later.",
+    "recall": "Retrieve previously stored facts about the user.",
+}
+
+
+def _native_fewshot() -> list[dict]:
+    """Read-vs-action + no-tool-on-chitchat exemplars in OpenAI tool format."""
+    import json as _j
+
+    def _tc(name, args):
+        return {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "fs", "type": "function",
+             "function": {"name": name, "arguments": _j.dumps(args)}}]}
+
+    def _tr():
+        return {"role": "tool", "tool_call_id": "fs", "content": "{\"ok\":true}"}
+
+    return [
+        {"role": "user", "content": "book a haircut for Friday at 2pm"},
+        _tc("calendar_create", {"summary": "Haircut", "start_iso": "Friday 14:00"}), _tr(),
+        {"role": "user", "content": "cancel my 4pm meeting"},
+        _tc("calendar_cancel", {"query": "4pm meeting"}), _tr(),
+        {"role": "user", "content": "mark the dishes task as done"},
+        _tc("tasks_complete", {"title": "dishes"}), _tr(),
+        {"role": "user", "content": "tell me a joke"},
+        {"role": "assistant",
+         "content": "Why don't scientists trust atoms? Because they make up everything!"},
+    ]
+
 # Audit D5 fix: the ToolRegistry's tolerant parser accepts `<tool>`/`</tool>`
 # + `<args>`/`</args>` with minor whitespace + stray closing chars. When we
 # fall through to "no tool call (or max reached)" and yield the buffered
@@ -746,6 +810,11 @@ class ConversationEngine:
         await self._db.touch_session(session_id)
 
         tools = self._tool_registry.openai_tools()
+        for _t in tools:  # sharpen confusable tool descriptions (recipe part 2)
+            _nm = _t["function"]["name"]
+            if _nm in _NATIVE_TOOL_DESC:
+                _t["function"]["description"] = _NATIVE_TOOL_DESC[_nm]
+        fewshot = _native_fewshot()
         t0 = time.monotonic()
         tool_calls_made = 0
         response_text = ""
@@ -754,6 +823,18 @@ class ConversationEngine:
             context = await self._build_context(
                 session_id, text, inject_tool_prose=False
             )
+            # Recipe parts 1+3: append tool-routing guidance to the system
+            # prompt and splice the read-vs-action / no-chitchat few-shot in
+            # right after it (native path only).
+            if context and context[0].get("role") == "system":
+                context[0] = {**context[0],
+                              "content": context[0]["content"] + _NATIVE_TOOL_GUIDANCE}
+                context = [context[0]] + fewshot + context[1:]
+            else:
+                context = (
+                    [{"role": "system", "content": _NATIVE_TOOL_GUIDANCE.strip()}]
+                    + fewshot + context
+                )
             result = await self._llm.generate_with_tools(context, tools)
             calls = result.get("tool_calls") or []
             response_text = result.get("content") or ""

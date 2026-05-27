@@ -283,6 +283,34 @@ text-only). Next step: swap the `tinkerclaw-llama-server` unit's `--model` to
 the Granite Nano GGUF, set `llm.native_tools: true` in the live config, restart,
 and confirm a real WS voice turn end-to-end.
 
+## Further model survey (2026-05-27, round 2) — challengers + vision question
+
+A second deep survey (≤2B native-tool challengers + sub-4B vision+tools VLMs):
+
+**Tool challengers to Granite Nano-1B (only native-OpenAI/Hermes round-trip models qualify):**
+- **Qwen3.5-2B** (NEW ~Mar 2026) — Hermes `<tool_call>` JSON, thinking off by
+  default, **201 languages**, 256K ctx. The "equal tools + far better
+  multilingual" play. GGUF `unsloth/Qwen3.5-2B-GGUF` Q4_K_M (1.28 GB). Caveat:
+  use a post-template-fix GGUF (a universal Qwen3.5 tool-template bug is fixed).
+- **Qwen3-1.7B** — Hermes JSON, BFCL-v3 56.6 (non-thinking), the "faster than
+  13 s" play. Pin non-thinking + temp 0. Official GGUF.
+- **Qwen3.5-0.8B** — sub-1B speed gamble; accuracy may crack at arg extraction.
+- *Not ready (custom/non-OpenAI tool format → won't round-trip):* LFM2-1.2B-Tool
+  / LFM2.5-1.2B (Pythonic `<|tool_call_start|>`), SmolLM2-1.7B (plain-text tags,
+  BFCL ~27), EXAONE-4.0-1.2B (works only via `--chat-template-file`), Kanana,
+  Falcon3-1B (unverified), StableLM2, Zamba2, Danube3, R1-Distill-1.5B.
+
+**Vision + tools sub-4B (can one model replace text-tool + vision-fallback?):**
+**Conclusion — keep them separate.** No sub-4B VLM is good enough at tool-calling
+to replace a dedicated text tool model. LFM2.5-VL tools are weak (450M variant
+BFCL-v4 ~21, text-only). Most VLMs can't even run vision on mainline llama.cpp
+(MiniCPM-V, Granite-vision, Ovis2, DeepSeek-VL2, PaliGemma2, Phi-3.5-vision all
+unsupported/crash). The only sub-4B VLM with both halves live on stock llama.cpp
+is **Qwen3-VL-2B**, but its 2B tool-calling won't beat Granite Nano and VL chat
+templates are historically fragile for the OpenAI round-trip. **Plan: Granite
+Nano-1B stays the tool/voice brain; keep a VLM as the camera fallback (trial
+Qwen3-VL-2B vs LFM2.5-VL-1.6B only for vision quality, route tools to Granite).**
+
 ## Risks & open questions
 
 - **llama-server native tool-calling fidelity per model.** `--jinja` tool

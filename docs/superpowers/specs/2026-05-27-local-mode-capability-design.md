@@ -232,6 +232,57 @@ re-validated **through the real deployed code path** (`LMStudioBackend
 native`): **9/10**, matching the raw probe. Latency ~2× (acceptable —
 capability is the gate). Committed: `feat(llm): native tool-calling path`.
 
+## Bake-off results (2026-05-27) — Component 3 run on live hardware
+
+All candidates pulled as Q4_K_M GGUF and run through the native OpenAI
+`tools=[...]` path on Dragon (llama-server, `--jinja`, reasoning disabled,
+`temperature=0`) over the same 10-scenario hard-gauntlet subset. Production
+llama-server was stopped during the run so each candidate had the full CPU.
+
+| Model | Params | Score | Avg latency/turn |
+|-------|--------|-------|------------------|
+| **IBM Granite 4.0 Nano-1B** | **1B** | **10/10** | **13.0 s** |
+| Qwen3.5-4B | 4B | 10/10 | 118.3 s |
+| IBM Granite 4.0 Micro-3B | 3B | 9/10 | 31.4 s |
+| NVIDIA Nemotron-3-Nano-4B | 4B | 9/10 | 117.1 s |
+| LFM2.5-VL-1.6B (incumbent) | 1.6B | 9/10 | ~28 s* |
+| MiniCPM5-1B | 1B | 4/10 | 15.0 s |
+
+\* LFM-VL measured earlier through the deployed `generate_with_tools` path.
+
+### Findings
+
+- **Winner: IBM Granite 4.0 Nano-1B — perfect 10/10 at 13 s/turn.** A 1 B / ~1 GB
+  model matched the 4 B Qwen's perfect score (both red-herrings, OOS, chit-chat,
+  and the complex-arg `gmail_send` with apostrophe handling) at **~9× lower
+  latency than Qwen and ~2× faster than the current LFM-VL incumbent — while
+  also beating LFM-VL on accuracy (10 vs 9).** This breaks the project's
+  founding assumption that sub-4B capability requires high latency; the
+  native-tools path plus a tool-tuned 1 B model gets both.
+- **The 4 B models are ~2 min/turn on the Dragon CPU** regardless of
+  architecture — Nemotron's Mamba-2 hybrid did not help (llama.cpp's ARM Mamba
+  kernels aren't optimized, and reasoning isn't fully suppressible via the
+  template kwargs). 4 B is impractical for voice even under a capability-first
+  priority.
+- **MiniCPM5-1B scored 4/10 — emitted zero native `tool_calls`.** Its XML tool
+  format does not round-trip through llama-server's OpenAI-compatible parser,
+  exactly as the survey warned. It would need a custom parser, not the native
+  path; not worth it given Granite Nano wins outright.
+- The native-tools selection constraint held: every model that emits native
+  OpenAI tool calls (Granite, Qwen, Nemotron, LFM) worked on the path; the one
+  that uses a custom format (MiniCPM5) failed.
+
+### Recommendation
+
+Make **IBM Granite 4.0 Nano-1B (Q4_K_M) the new Local default** with
+`llm.native_tools: true`. It is the capability *and* latency winner, ~1 GB
+resident (leaving ample headroom on the 12 GB Dragon), and uses native
+OpenAI-schema tool calling that the deployed Component 2 path already handles.
+Keep LFM2.5-VL-1.6B available as the vision-capable fallback (Granite is
+text-only). Next step: swap the `tinkerclaw-llama-server` unit's `--model` to
+the Granite Nano GGUF, set `llm.native_tools: true` in the live config, restart,
+and confirm a real WS voice turn end-to-end.
+
 ## Risks & open questions
 
 - **llama-server native tool-calling fidelity per model.** `--jinja` tool

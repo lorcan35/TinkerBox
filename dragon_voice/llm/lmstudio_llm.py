@@ -218,7 +218,10 @@ class LMStudioBackend(LLMBackend):
                 yield f"[Connection error: {e}]"
 
     async def generate_with_tools(
-        self, messages: list[dict], tools: list[dict]
+        self, messages: list[dict], tools: list[dict],
+        max_tokens: int | None = None,
+        disable_thinking: bool = False,
+        timeout_s: int | None = None,
     ) -> dict:
         """Native OpenAI tool-calling pass (SupportsNativeTools).
 
@@ -247,27 +250,42 @@ class LMStudioBackend(LLMBackend):
             "model": self._model,
             "messages": messages,
             "stream": False,
-            "max_tokens": min(self._config.max_tokens, 256),
+            "max_tokens": max_tokens or min(self._config.max_tokens, 256),
             "temperature": 0.0,
             "tools": tools,
             "tool_choice": "auto",
         }
+        # Reasoning models (Qwen3.x) default to thinking, which burns the
+        # token budget before emitting a tool call. The smart tier passes
+        # disable_thinking=True; templates that don't accept the kwarg 400,
+        # so we retry once without it.
+        if disable_thinking:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+
+        _post_kw: dict = {}
+        if timeout_s:
+            _post_kw["timeout"] = aiohttp.ClientTimeout(
+                total=timeout_s, sock_read=timeout_s
+            )
+
+        async def _do_post(pl):
+            async with self._session.post(
+                f"{self._base_url}/chat/completions", json=pl, **_post_kw,
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    return None, resp.status, body
+                return await resp.json(), 200, ""
 
         async with self._lock:
             try:
-                async with self._session.post(
-                    f"{self._base_url}/chat/completions",
-                    json=payload,
-                ) as resp:
-                    if resp.status != 200:
-                        error_text = await resp.text()
-                        logger.error(
-                            "LM Studio tools error %d: %s",
-                            resp.status,
-                            error_text[:300],
-                        )
-                        return {"content": "", "tool_calls": []}
-                    data = await resp.json()
+                data, status, body = await _do_post(payload)
+                if data is None and status in (400, 500) and disable_thinking:
+                    payload.pop("chat_template_kwargs", None)
+                    data, status, body = await _do_post(payload)
+                if data is None:
+                    logger.error("LM Studio tools error %d: %s", status, body[:300])
+                    return {"content": "", "tool_calls": []}
             except aiohttp.ClientError as e:
                 logger.error("LM Studio tools request failed: %s", e)
                 return {"content": "", "tool_calls": []}

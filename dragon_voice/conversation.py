@@ -573,7 +573,7 @@ class ConversationEngine:
         # audit-hardened prose/marker loop below is untouched and stays
         # the fallback for every other backend/model.
         _nt = getattr(self._llm_config, "native_tools", False)
-        logger.info(
+        logger.debug(
             "TT-ROUTE native_tools=%s backend=%s llm=%s supports_native=%s reg=%s",
             _nt, getattr(self._llm_config, "backend", None),
             type(self._llm).__name__,
@@ -846,6 +846,7 @@ class ConversationEngine:
         t0 = time.monotonic()
         tool_calls_made = 0
         response_text = ""
+        turn_calls: list[dict] = []  # for the empty-response wrap
 
         while True:
             context = await self._build_context(
@@ -906,6 +907,11 @@ class ConversationEngine:
                     except Exception as e:
                         logger.debug("on_tool_result callback error: %s", e)
 
+                turn_calls.append({
+                    "tool": tool_call["tool"], "args": tool_call["args"],
+                    "result": tool_result.get("result", tool_result),
+                })
+
                 await self._messages.add_message(
                     session_id=session_id, role="assistant",
                     content=f"<tool>{tool_call['tool']}</tool>"
@@ -935,6 +941,17 @@ class ConversationEngine:
                     })
                 except Exception as e:
                     logger.debug("on_tool_error (limit) callback error: %s", e)
+
+            # Empty-response wrap (parity with the prose path): if a tool
+            # fired but the model produced no user-visible text, synthesize a
+            # one-line natural-language ack from the tool result instead of
+            # leaving the user with a blank turn.
+            if not response_text and turn_calls:
+                try:
+                    from dragon_voice.tools.response_wrap import synthesize_wrap
+                    response_text = synthesize_wrap(turn_calls)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("native empty-wrap failed: %s", e)
 
             if response_text:
                 yield response_text

@@ -1146,7 +1146,7 @@ class VoiceServer:
         text: str, session_id: str, content: str,
     ) -> None:
         """Body of _handle_text, wrapped by the B1 turn-gate bracket above."""
-        logger.info("TT-HTB reached: content=%r", (content or "")[:80])
+        logger.debug("TT-HTB reached: content=%r", (content or "")[:80])
 
         # SOLID-audit follow-up: TinkerClaw bypass branch
         # extracted to tinkerclaw_text_path.handle_tinkerclaw_text_path.

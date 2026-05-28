@@ -481,6 +481,34 @@ learned classifier, 3+ resident models.
   much of it the Google Calendar API call + the post-tool LLM wrap, not routing.
   Tighten tool-exec timeouts; the tiering + cache-reuse address the LLM side.
 
+## Dragon-side performance infra (2026-05-28) — LIVES ON DRAGON, NOT IN REPO
+
+Root cause of slow local inference was a **misbuilt llama.cpp**: the b8696 binary
+had NO dotprod kernels (`system_info`: `NEON=1 ... REPACK=1`, no `DOTPROD=1`)
+because `GGML_NATIVE=ON` doesn't set `__ARM_FEATURE_DOTPROD` on GCC 13 (llama.cpp
+#16237) — despite the QCS6490 having `asimddp`. It ran the generic-NEON matmul
+(2-4× slower). Fixes applied live on Dragon (re-apply if reflashed):
+
+- **Rebuilt** to `/home/radxa/llama.cpp/build_dp/`:
+  `cmake -B build_dp -S . -DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16 -DGGML_CPU_KLEIDIAI=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build_dp -j6 --target llama-server`.
+  New banner: `DOTPROD = 1 | KLEIDIAI = 1 | FP16_VA = 1`. Do NOT add +i8mm/+sve
+  (A78 lacks them → SIGILL).
+- **Both llama-server units repointed** to `build_dp/bin/llama-server`:
+  `tinkerclaw-llama-server` (fast, Granite-1B, :1234) + `tinkerclaw-llama-smart`
+  (Qwen3.5-4B, :1235).
+- Fast unit: `CPUAffinity=4 5 6 7` (the 4 big A78 cores; 0-3 are weak A55),
+  `--threads 4 --threads-batch 4 --ubatch-size 512 --parallel 1 --cache-reuse 256
+  --mlock --jinja`.
+- **`cpu-performance.service`** (new, enabled): pins all cores to the
+  `performance` governor at boot (was `schedutil` idling at 1.65 GHz).
+
+**Measured result:** prefill ~12.8 → ~25 tok/s (~2×), generation ~3 → ~27 tok/s,
+**calendar tool turn ~110 s → 69 s** (clean, returns a real event summary). Both
+tiers benefit. Next levers (not limits): trim the ~2400-token agentic prompt
+(fewer tools / lighter few-shot), `--slot-save-path` to persist the system-prompt
+prefill across restarts, larger ubatch. **DEBUG GOTCHA:** kill stray `llama-bench`
+before trusting any latency number (it saturates the box).
+
 ## Risks & open questions
 
 - **llama-server native tool-calling fidelity per model.** `--jinja` tool

@@ -50,6 +50,17 @@ _NATIVE_TOOL_GUIDANCE = (
     "For jokes, opinions, greetings, thanks, or chit-chat, do NOT call any tool "
     "— just reply briefly."
 )
+# Curated fast-tier tool allowlist (~13). Keeps the common calendar/email/
+# tasks/weather/time/calc/memory verbs the user actually hits; the rarer tools
+# (gmail_read/archive, calendar_week, tasks_delete, convert, stock_ticker,
+# system_info, web_search, timesense_timer, quick_poll, schedule_reminder, note,
+# forget_fact, recall) are handled by the smart/async tier. Cuts prefill tokens.
+_FAST_NATIVE_TOOLS = {
+    "calendar_today", "calendar_create", "calendar_cancel",
+    "gmail_unread", "gmail_search", "gmail_send",
+    "tasks_list", "tasks_add", "tasks_complete",
+    "weather", "datetime", "calculator", "remember",
+}
 _NATIVE_TOOL_DESC = {
     "calendar_today": "List/read EXISTING calendar events for today. Read-only; does NOT create events.",
     "calendar_week": "List/read EXISTING calendar events for this week. Read-only.",
@@ -817,7 +828,16 @@ class ConversationEngine:
         )
         await self._db.touch_session(session_id)
 
-        tools = self._tool_registry.openai_tools()
+        # Curate the fast-tier tool set: send only the ~13 highest-value tools,
+        # not all 27. The dominant local-turn latency is PREFILLING the tool
+        # schemas on a 1B CPU (~16 tok/s), so halving the schema count roughly
+        # halves prefill. The long tail of rarer tools is reached via the smart
+        # / async tier. If the registry has none of these (test harness), fall
+        # back to the full set so the prompt isn't empty.
+        tools = [
+            t for t in self._tool_registry.openai_tools()
+            if t["function"]["name"] in _FAST_NATIVE_TOOLS
+        ] or self._tool_registry.openai_tools()
         for _t in tools:  # sharpen confusable tool descriptions (recipe part 2)
             _nm = _t["function"]["name"]
             if _nm in _NATIVE_TOOL_DESC:

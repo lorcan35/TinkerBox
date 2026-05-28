@@ -489,7 +489,8 @@ class ConversationEngine:
         return response_text
 
     async def _build_context(
-        self, session_id: str, user_text: str, inject_tool_prose: bool = True
+        self, session_id: str, user_text: str, inject_tool_prose: bool = True,
+        light_memory: bool = False,
     ) -> list[dict]:
         """Build LLM context with optional memory augmentation and tool descriptions.
 
@@ -499,6 +500,13 @@ class ConversationEngine:
         `inject_tool_prose=False` skips the prose [TOOLS] block — used by the
         native tool-calling path, which sends tool schemas via the API
         `tools=[...]` parameter instead of describing them in the prompt.
+
+        `light_memory=True` injects only a couple facts and NO document chunks.
+        Document chunks (up to 3×512 tokens) are the dominant uncached cold-
+        prefill cost on the 1B CPU (~80s at ~13 tok/s) and are pointless for
+        quick voice tool commands ("what's on my calendar", "unread email").
+        The fast native path passes this; long-form knowledge QA keeps the full
+        RAG.
         """
         # Mode-aware context depth: local models have tiny context windows,
         # cloud models (128K+) can use much more conversation history.
@@ -511,7 +519,14 @@ class ConversationEngine:
         # Inject memory context before the user's message
         if self._memory_service:
             try:
-                memory_ctx = await self._memory_service.get_relevant_context(user_text)
+                if light_memory:
+                    memory_ctx = await self._memory_service.get_relevant_context(
+                        user_text, max_facts=2, max_chunks=0,
+                    )
+                else:
+                    memory_ctx = await self._memory_service.get_relevant_context(
+                        user_text
+                    )
                 if memory_ctx:
                     # Augment system prompt with memory context
                     if context and context[0]["role"] == "system":
@@ -850,7 +865,7 @@ class ConversationEngine:
 
         while True:
             context = await self._build_context(
-                session_id, text, inject_tool_prose=False
+                session_id, text, inject_tool_prose=False, light_memory=True,
             )
             # Recipe parts 1+3: append tool-routing guidance to the system
             # prompt and splice the read-vs-action / no-chitchat few-shot in

@@ -44,8 +44,15 @@ class _StubLlmCfg:
 
 
 @dataclass
+class _StubTtsCfg:
+    """Minimal subset of TTSConfig used by select_backends_for_mode."""
+    backend: str = "kokoro"
+
+
+@dataclass
 class _StubVoiceCfg:
     llm: _StubLlmCfg = field(default_factory=_StubLlmCfg)
+    tts: _StubTtsCfg = field(default_factory=_StubTtsCfg)
 
 
 class SelectBackendsTests(unittest.TestCase):

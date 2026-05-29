@@ -15,8 +15,22 @@ import secrets
 import sys
 
 import aiohttp
+import pytest
 
 DRAGON_URL = os.environ.get("DRAGON_URL", "ws://192.168.1.91:3502/ws/voice")
+
+# These two functions are live-Dragon integration probes (see the module
+# docstring), not self-contained unit tests — they open a real /ws/voice
+# socket and exercise the live LLM + media pipeline.  Skip them in the normal
+# suite; opt in with RUN_LIVE_AUDIT=1 against a reachable Dragon.  When opted
+# in, run them as asyncio tests (the repo uses strict pytest-asyncio mode).
+pytestmark = [
+    pytest.mark.asyncio,
+    pytest.mark.skipif(
+        not os.environ.get("RUN_LIVE_AUDIT"),
+        reason="live-Dragon audit probe; set RUN_LIVE_AUDIT=1 to run (see module docstring)",
+    ),
+]
 
 
 async def _register_and_config(ws, model: str):

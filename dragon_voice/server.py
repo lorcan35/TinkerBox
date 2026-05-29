@@ -1146,6 +1146,7 @@ class VoiceServer:
         text: str, session_id: str, content: str,
     ) -> None:
         """Body of _handle_text, wrapped by the B1 turn-gate bracket above."""
+        logger.debug("TT-HTB reached: content=%r", (content or "")[:80])
 
         # SOLID-audit follow-up: TinkerClaw bypass branch
         # extracted to tinkerclaw_text_path.handle_tinkerclaw_text_path.
@@ -1170,6 +1171,55 @@ class VoiceServer:
             safe_send_json=self._safe_send_json,
             message_store=self._message_store,
         ):
+            return
+
+        # Wave 3: async background smart-agent tier. A heavy/deferred agentic
+        # ask ("research X and get back to me", "go through my unread and draft
+        # replies") is acked instantly here on the fast tier and run on the
+        # smart model (Qwen3.5-4B, :1235) in the background; the result is
+        # delivered as a channel_message the Tab5 notification surface renders.
+        from dragon_voice.async_agent import (
+            is_background_request, spawn_background_agent,
+        )
+        if self._tool_registry is not None and is_background_request(content):
+            ack = "On it — I'll work on that in the background and let you know."
+            if not ws.closed:
+                await self._safe_send_json(ws, {"type": "llm", "text": ack})
+                await self._safe_send_json(ws, {"type": "llm_done", "llm_ms": 0})
+
+            target_device = conn_state.get("device_id", "")
+
+            async def _deliver(summary: str) -> None:
+                import time as _t
+                frame = {
+                    "type": "channel_message",
+                    "channel": "tinker",
+                    "message_id": f"bg-{int(_t.time())}",
+                    "sender": {"display_name": "Tinker", "starred": True},
+                    "text": summary,
+                    "preview": summary[:80],
+                    "priority": "normal",
+                    "needs_reply": False,
+                }
+                # Deliver to the device's CURRENT connection — the bg task runs
+                # for minutes and the original ws will likely have reconnected,
+                # so the captured socket is stale. Scan active connections by
+                # device_id (same approach as debug_channel).
+                for conn in self._active_connections.values():
+                    if conn.get("device_id") == target_device:
+                        cur = conn.get("ws")
+                        if cur is not None and not cur.closed:
+                            try:
+                                await cur.send_json(frame)
+                            except Exception as e:  # noqa: BLE001
+                                logger.warning("bg deliver send failed: %s", e)
+                        return
+                logger.warning(
+                    "bg deliver: device %s not connected — result dropped: %s",
+                    target_device, summary[:60],
+                )
+
+            spawn_background_agent(content, self._tool_registry, _deliver)
             return
 
         try:

@@ -217,6 +217,99 @@ class LMStudioBackend(LLMBackend):
                 logger.error("LM Studio request failed: %s", e)
                 yield f"[Connection error: {e}]"
 
+    async def generate_with_tools(
+        self, messages: list[dict], tools: list[dict],
+        max_tokens: int | None = None,
+        disable_thinking: bool = False,
+        timeout_s: int | None = None,
+    ) -> dict:
+        """Native OpenAI tool-calling pass (SupportsNativeTools).
+
+        Non-streaming. Sends `tools=[...]` + `tool_choice="auto"` at
+        temperature 0 (deterministic tool routing) and returns the
+        structured result. Requires llama-server started with `--jinja`
+        so the loaded GGUF's chat template renders + parses tool calls.
+
+        Returns {"content": str, "tool_calls": [{"name", "args"}, ...]}.
+        On transport error returns content with an error marker and no
+        tool calls so the caller degrades to a plain reply.
+        """
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=600, sock_read=300),
+                headers={"Content-Type": "application/json"},
+            )
+
+        # Cap the tool-decision generation hard. A tool call (or a 1-2
+        # sentence reply) is short; without this the model can run toward
+        # the 1024 MAX_TOOL_LOCAL ceiling and, non-streaming on a 1B CPU,
+        # blow past the 300 s sock_read timeout (~0.2-0.3 s/token) — which
+        # presented as "native turn fires no tool". 256 is plenty for a
+        # tool call + clean args.
+        payload = {
+            "model": self._model,
+            "messages": messages,
+            "stream": False,
+            "max_tokens": max_tokens or min(self._config.max_tokens, 256),
+            "temperature": 0.0,
+            "tools": tools,
+            "tool_choice": "auto",
+        }
+        # Reasoning models (Qwen3.x) default to thinking, which burns the
+        # token budget before emitting a tool call. The smart tier passes
+        # disable_thinking=True; templates that don't accept the kwarg 400,
+        # so we retry once without it.
+        if disable_thinking:
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+
+        _post_kw: dict = {}
+        if timeout_s:
+            _post_kw["timeout"] = aiohttp.ClientTimeout(
+                total=timeout_s, sock_read=timeout_s
+            )
+
+        async def _do_post(pl):
+            async with self._session.post(
+                f"{self._base_url}/chat/completions", json=pl, **_post_kw,
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    return None, resp.status, body
+                return await resp.json(), 200, ""
+
+        async with self._lock:
+            try:
+                data, status, body = await _do_post(payload)
+                if data is None and status in (400, 500) and disable_thinking:
+                    payload.pop("chat_template_kwargs", None)
+                    data, status, body = await _do_post(payload)
+                if data is None:
+                    logger.error("LM Studio tools error %d: %s", status, body[:300])
+                    return {"content": "", "tool_calls": []}
+            except aiohttp.ClientError as e:
+                logger.error("LM Studio tools request failed: %s", e)
+                return {"content": "", "tool_calls": []}
+
+        choices = data.get("choices") or [{}]
+        msg = choices[0].get("message", {}) or {}
+        calls: list[dict] = []
+        for tc in msg.get("tool_calls") or []:
+            fn = tc.get("function") or {}
+            name = fn.get("name")
+            if not name:
+                continue
+            raw_args = fn.get("arguments")
+            if isinstance(raw_args, dict):
+                args = raw_args
+            else:
+                try:
+                    args = json.loads(raw_args) if raw_args else {}
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+            calls.append({"name": name, "args": args})
+
+        return {"content": msg.get("content") or "", "tool_calls": calls}
+
     def clear_history(self) -> None:
         """Clear conversation history."""
         self._conversation.clear()

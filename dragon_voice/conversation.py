@@ -20,11 +20,145 @@ from dragon_voice.messages import (
     trim_context_to_budget,
 )
 from dragon_voice.llm import create_llm, LLMBackend
+from dragon_voice.llm.base import SupportsNativeTools
 from dragon_voice.config import LLMConfig
 
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_CALLS = 3  # Prevent infinite tool-call loops
+# Fast native path: prior-turn history depth. A voice tool command needs the
+# current turn plus a turn or two of context — not the full 10-message window
+# whose stale fat tool-result blobs dominate CPU prefill. The current turn's
+# tool round-trip is accumulated in-memory (not re-fetched), so this cap never
+# truncates the active chain.
+NATIVE_HISTORY_MSGS = 6
+
+# ── Native tool-calling recipe (TinkerBox spec 2026-05-27) ─────────────
+# Lifts the 27-tool gauntlet from ~12/19 to 19/20 on Granite-4.0-Nano-1B.
+# Three parts, applied only on the native (tools=[...]) path:
+#   1) _NATIVE_TOOL_GUIDANCE — appended to the system prompt: when to call a
+#      tool + read-vs-action / remember-vs-recall disambiguation + no-fire on
+#      chit-chat.
+#   2) _NATIVE_TOOL_DESC — intent-keyed descriptions for confusable tools
+#      (the native router leans heavily on tool descriptions).
+#   3) _NATIVE_FEWSHOT — message-level few-shot exemplars (the decisive lever;
+#      rules alone didn't fix read-vs-action, real tool_call examples did).
+_NATIVE_TOOL_GUIDANCE = (
+    "\n\nTOOL USE: Always call the matching tool when the user asks about their "
+    "calendar, email, tasks, the weather, the time, a calculation, or to "
+    "remember/recall a fact — never answer those from your own knowledge. Match "
+    "intent precisely: schedule/book/set up a NEW event = calendar_create (NOT "
+    "calendar_today); cancel/delete an event = calendar_cancel; read/list "
+    "existing events = calendar_today or calendar_week; find/search email or "
+    "'did X email me' = gmail_search (NOT gmail_unread); new/unread email = "
+    "gmail_unread; mark a task done/complete = tasks_complete (NOT tasks_list); "
+    "save/'remember that' a fact = remember; 'what do you know'/recall = recall. "
+    "For jokes, opinions, greetings, thanks, or chit-chat, do NOT call any tool "
+    "— just reply briefly. "
+    "ANSWER STYLE: this is a spoken voice assistant. When you summarize a tool "
+    "result, reply in ONE short, natural spoken sentence. Never use markdown, "
+    "bullet lists, headers, or URLs/links — say the essentials only (e.g. 'You "
+    "have 3 events today: standup at 7:30, the DE standup at 1, and day-end at 3')."
+)
+# Curated fast-tier tool allowlist (~13). Keeps the common calendar/email/
+# tasks/weather/time/calc/memory verbs the user actually hits; the rarer tools
+# (gmail_read/archive, calendar_week, tasks_delete, convert, stock_ticker,
+# system_info, web_search, timesense_timer, quick_poll, schedule_reminder, note,
+# forget_fact, recall) are handled by the smart/async tier. Cuts prefill tokens.
+_FAST_NATIVE_TOOLS = {
+    "calendar_today", "calendar_create", "calendar_cancel",
+    "gmail_unread", "gmail_search", "gmail_send",
+    "tasks_list", "tasks_add", "tasks_complete",
+    "weather", "datetime", "calculator", "remember",
+}
+_NATIVE_TOOL_DESC = {
+    "calendar_today": "List/read EXISTING calendar events for today. Read-only; does NOT create events.",
+    "calendar_week": "List/read EXISTING calendar events for this week. Read-only.",
+    "calendar_create": "Create/schedule/book a NEW calendar event or appointment.",
+    "calendar_cancel": "Cancel, delete, or remove an existing calendar event.",
+    "gmail_unread": "List the user's UNREAD/new emails ('any new mail', 'unread').",
+    "gmail_search": "Search the inbox by keyword/sender/subject ('did X email me', 'find email about Y').",
+    "gmail_send": "Compose and SEND a new email; extract recipient, subject, body.",
+    "gmail_read": "Read the full body of one specific email.",
+    "tasks_list": "List the user's existing to-do tasks. Read-only.",
+    "tasks_add": "Add a NEW to-do task.",
+    "tasks_complete": "Mark an existing to-do task as done/complete/finished.",
+    "remember": "Store/save a NEW fact about the user for later.",
+    "recall": "Retrieve previously stored facts about the user.",
+}
+
+
+# Result-wrap prefill guard. A list-returning tool (gmail_unread → 10 emails
+# with snippets, calendar_today → many events, *_search) can emit a multi-
+# thousand-token result blob. The model must prefill that whole blob on the
+# result-wrap call just to summarize it — on the 1B CPU that single fat result
+# dominates the turn (measured: a 10-email result pushed the wrap prompt to
+# 6438 tokens / ~400s under thermal throttle). The fast tier only needs enough
+# to give a spoken summary, so cap list length and per-string length before the
+# result re-enters context. The full result already reached the user (the
+# answer) and the agent_log; this only trims what the model re-reads.
+_TOOL_RESULT_LIST_CAP = 4
+_TOOL_RESULT_STR_CAP = 120
+_TOOL_RESULT_CHAR_BUDGET = 1400
+# Fields a spoken summary never needs — they're large and the model would
+# otherwise echo them as markdown links. Dropped before the result re-enters
+# context. Matched case-insensitively as a substring of the key.
+_TOOL_RESULT_DROP_KEYS = ("link", "url", "html", "eid", "snippet", "ical")
+
+
+def _compact_tool_result(result: object) -> str:
+    """Serialize a tool result for feeding back to the model, capping fat
+    list/string fields and dropping voice-useless link/url fields so the
+    result-wrap prefill stays small."""
+    import json as _j
+
+    def _shorten(o: object) -> object:
+        if isinstance(o, str):
+            return o if len(o) <= _TOOL_RESULT_STR_CAP else o[:_TOOL_RESULT_STR_CAP] + "…"
+        if isinstance(o, list):
+            head = [_shorten(x) for x in o[:_TOOL_RESULT_LIST_CAP]]
+            if len(o) > _TOOL_RESULT_LIST_CAP:
+                head.append(f"…(+{len(o) - _TOOL_RESULT_LIST_CAP} more)")
+            return head
+        if isinstance(o, dict):
+            return {
+                k: _shorten(v) for k, v in o.items()
+                if not any(d in k.lower() for d in _TOOL_RESULT_DROP_KEYS)
+            }
+        return o
+
+    try:
+        s = _j.dumps(_shorten(result), ensure_ascii=False)
+    except Exception:  # noqa: BLE001
+        s = str(result)
+    if len(s) > _TOOL_RESULT_CHAR_BUDGET:
+        s = s[:_TOOL_RESULT_CHAR_BUDGET] + "…"
+    return s
+
+
+def _native_fewshot() -> list[dict]:
+    """Read-vs-action + no-tool-on-chitchat exemplars in OpenAI tool format."""
+    import json as _j
+
+    def _tc(name, args):
+        return {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "fs", "type": "function",
+             "function": {"name": name, "arguments": _j.dumps(args)}}]}
+
+    def _tr():
+        return {"role": "tool", "tool_call_id": "fs", "content": "{\"ok\":true}"}
+
+    return [
+        {"role": "user", "content": "book a haircut for Friday at 2pm"},
+        _tc("calendar_create", {"summary": "Haircut", "start_iso": "Friday 14:00"}), _tr(),
+        {"role": "user", "content": "cancel my 4pm meeting"},
+        _tc("calendar_cancel", {"query": "4pm meeting"}), _tr(),
+        {"role": "user", "content": "mark the dishes task as done"},
+        _tc("tasks_complete", {"title": "dishes"}), _tr(),
+        {"role": "user", "content": "tell me a joke"},
+        {"role": "assistant",
+         "content": "Why don't scientists trust atoms? Because they make up everything!"},
+    ]
 
 # Audit D5 fix: the ToolRegistry's tolerant parser accepts `<tool>`/`</tool>`
 # + `<args>`/`</args>` with minor whitespace + stray closing chars. When we
@@ -412,24 +546,71 @@ class ConversationEngine:
         )
         return response_text
 
-    async def _build_context(self, session_id: str, user_text: str) -> list[dict]:
+    async def _build_context(
+        self, session_id: str, user_text: str, inject_tool_prose: bool = True,
+        light_memory: bool = False, max_msgs: Optional[int] = None,
+        inject_memory: bool = True, drop_tool_history: bool = False,
+    ) -> list[dict]:
         """Build LLM context with optional memory augmentation and tool descriptions.
 
         After assembling the full context (system prompt + memory + tools + history),
         trims oldest messages to fit within the model's token budget (US-P16).
+
+        `inject_tool_prose=False` skips the prose [TOOLS] block — used by the
+        native tool-calling path, which sends tool schemas via the API
+        `tools=[...]` parameter instead of describing them in the prompt.
+
+        `light_memory=True` injects only a couple facts and NO document chunks.
+        Document chunks (up to 3×512 tokens) are the dominant uncached cold-
+        prefill cost on the 1B CPU (~80s at ~13 tok/s) and are pointless for
+        quick voice tool commands ("what's on my calendar", "unread email").
+        The fast native path passes this; long-form knowledge QA keeps the full
+        RAG.
         """
         # Mode-aware context depth: local models have tiny context windows,
         # cloud models (128K+) can use much more conversation history.
         is_local = self._llm_config.backend in ("ollama", "npu_genie", "lmstudio")
-        max_msgs = 10 if is_local else 30
+        if max_msgs is None:
+            max_msgs = 10 if is_local else 30
         context = await self._messages.get_context(
             session_id, max_messages=max_msgs, media_store=self._media_store
         )
 
-        # Inject memory context before the user's message
-        if self._memory_service:
+        # Drop PRIOR turns' tool-call / tool-result messages from the prefill
+        # history. The native path supplies the current turn's tool round-trip
+        # in-memory (proper OpenAI format), so re-fetching old turns' legacy
+        # <tool>…</tool> markers from the DB only adds fat, format-mismatched
+        # tokens that bust prompt-cache reuse on every decision call. The DB
+        # record is untouched (dashboard/audit still see the full exchange);
+        # this trims only what gets prefilled. A brief assistant answer already
+        # captures what each prior turn did.
+        if drop_tool_history and len(context) > 1:
+            context = [context[0]] + [
+                m for m in context[1:]
+                if m.get("role") != "tool"
+                and not (
+                    m.get("role") == "assistant"
+                    and isinstance(m.get("content"), str)
+                    and m["content"].lstrip().startswith("<tool>")
+                )
+            ]
+
+        # Inject memory context before the user's message.
+        # `inject_memory=False` keeps the system prompt byte-stable across turns
+        # so llama-server's prompt cache can reuse the whole static prefix. The
+        # fast native path uses this: query-keyed memory facts would otherwise
+        # change the system message every turn and bust the cache (tool commands
+        # fetch live data and don't need injected facts — recall is a tool).
+        if self._memory_service and inject_memory:
             try:
-                memory_ctx = await self._memory_service.get_relevant_context(user_text)
+                if light_memory:
+                    memory_ctx = await self._memory_service.get_relevant_context(
+                        user_text, max_facts=2, max_chunks=0,
+                    )
+                else:
+                    memory_ctx = await self._memory_service.get_relevant_context(
+                        user_text
+                    )
                 if memory_ctx:
                     # Augment system prompt with memory context
                     if context and context[0]["role"] == "system":
@@ -439,7 +620,7 @@ class ConversationEngine:
 
         # Inject tool descriptions into system prompt
         # Use compact format for local models to save tokens
-        if self._tool_registry:
+        if self._tool_registry and inject_tool_prose:
             is_local = self._llm_config.backend in ("ollama", "npu_genie", "lmstudio")
             tool_desc = self._tool_registry.format_for_llm(compact=is_local)
             if tool_desc and context and context[0]["role"] == "system":
@@ -485,6 +666,30 @@ class ConversationEngine:
         """
         if not self._llm:
             raise RuntimeError("ConversationEngine not initialized")
+
+        # Native tool-calling path (llm.native_tools + a backend that
+        # supports the OpenAI tools=[...] API). Isolated method so the
+        # audit-hardened prose/marker loop below is untouched and stays
+        # the fallback for every other backend/model.
+        _nt = getattr(self._llm_config, "native_tools", False)
+        logger.debug(
+            "TT-ROUTE native_tools=%s backend=%s llm=%s supports_native=%s reg=%s",
+            _nt, getattr(self._llm_config, "backend", None),
+            type(self._llm).__name__,
+            isinstance(self._llm, SupportsNativeTools),
+            bool(self._tool_registry),
+        )
+        if (
+            _nt
+            and self._tool_registry
+            and isinstance(self._llm, SupportsNativeTools)
+        ):
+            async for token in self._process_text_stream_native(
+                session_id, text, input_mode, audio_duration_s,
+                on_tool_call, on_tool_result, on_tool_error, media_id,
+            ):
+                yield token
+            return
 
         # Store user message — multimodal turns pass media_id to encode
         # the content with the multimodal marker (#183 PR 3). Uses
@@ -683,5 +888,212 @@ class ConversationEngine:
 
         logger.info(
             "Conversation streamed (session=%s, latency=%.0fms, tools=%d): '%s' → '%s'",
+            session_id, latency_ms, tool_calls_made, text[:50], response_text[:50],
+        )
+
+    async def _process_text_stream_native(
+        self,
+        session_id: str,
+        text: str,
+        input_mode: str = "text",
+        audio_duration_s: Optional[float] = None,
+        on_tool_call=None,
+        on_tool_result=None,
+        on_tool_error=None,
+        media_id: Optional[str] = None,
+    ) -> AsyncIterator[str]:
+        """Native tool-calling turn via the OpenAI tools=[...] API.
+
+        Mirrors process_text_stream's contract but uses
+        `SupportsNativeTools.generate_with_tools` instead of prose-listed
+        tools + the marker parser. Each loop iteration asks the model for
+        a structured decision: a tool call (execute → feed result back →
+        loop) or final content (yield + stop). `tool_choice="auto"` means
+        the model returns no tool call for chit-chat / out-of-scope, so
+        the synthetic none() escape hatch isn't needed.
+
+        Non-streaming: the final answer is yielded in one chunk. The
+        WS keepalive (server.py) covers the silent inference window.
+        """
+        import json as _json
+
+        await self._messages.add_message(
+            session_id=session_id,
+            role="user",
+            content=text,
+            input_mode="text" if media_id else input_mode,
+            audio_duration_s=audio_duration_s,
+            media_id=media_id,
+        )
+        await self._db.touch_session(session_id)
+
+        # Curate the fast-tier tool set: send only the ~13 highest-value tools,
+        # not all 27. The dominant local-turn latency is PREFILLING the tool
+        # schemas on a 1B CPU (~16 tok/s), so halving the schema count roughly
+        # halves prefill. The long tail of rarer tools is reached via the smart
+        # / async tier. If the registry has none of these (test harness), fall
+        # back to the full set so the prompt isn't empty.
+        tools = [
+            t for t in self._tool_registry.openai_tools()
+            if t["function"]["name"] in _FAST_NATIVE_TOOLS
+        ] or self._tool_registry.openai_tools()
+        for _t in tools:  # sharpen confusable tool descriptions (recipe part 2)
+            _nm = _t["function"]["name"]
+            if _nm in _NATIVE_TOOL_DESC:
+                _t["function"]["description"] = _NATIVE_TOOL_DESC[_nm]
+        fewshot = _native_fewshot()
+        t0 = time.monotonic()
+        tool_calls_made = 0
+        response_text = ""
+        turn_calls: list[dict] = []  # for the empty-response wrap
+
+        # Build the prompt prefix ONCE (small history — see NATIVE_HISTORY_MSGS).
+        # The current turn's tool round-trip is accumulated in-memory below as
+        # proper OpenAI tool_calls/tool messages, so the static prefix (system +
+        # guidance + few-shot + tool schemas) stays byte-identical across loop
+        # iterations for prompt-cache reuse, and multi-tool chains keep their
+        # own results regardless of the history cap.
+        context = await self._build_context(
+            session_id, text, inject_tool_prose=False, light_memory=True,
+            max_msgs=NATIVE_HISTORY_MSGS, inject_memory=False,
+            drop_tool_history=True,
+        )
+        # Recipe parts 1+3: append tool-routing guidance to the system prompt
+        # and splice the read-vs-action / no-chitchat few-shot right after it.
+        if context and context[0].get("role") == "system":
+            context[0] = {**context[0],
+                          "content": context[0]["content"] + _NATIVE_TOOL_GUIDANCE}
+            context = [context[0]] + fewshot + context[1:]
+        else:
+            context = (
+                [{"role": "system", "content": _NATIVE_TOOL_GUIDANCE.strip()}]
+                + fewshot + context
+            )
+
+        while True:
+            result = await self._llm.generate_with_tools(context, tools)
+            calls = result.get("tool_calls") or []
+            response_text = result.get("content") or ""
+
+            if calls and tool_calls_made < MAX_TOOL_CALLS:
+                call = calls[0]  # one at a time, same as the prose path
+                tool_calls_made += 1
+                tool_call = {"tool": call["name"], "args": call.get("args") or {}}
+                logger.info(
+                    "Native tool call: %s(%s)", tool_call["tool"], tool_call["args"]
+                )
+
+                if on_tool_call:
+                    try:
+                        await on_tool_call(tool_call)
+                    except Exception as e:
+                        logger.debug("on_tool_call callback error: %s", e)
+
+                if not self._tool_registry.get(tool_call["tool"]):
+                    # Model invented a tool name — surface it, don't loop.
+                    if on_tool_error:
+                        try:
+                            await on_tool_error({
+                                "name": tool_call["tool"],
+                                "code": "unknown_tool",
+                                "message": f"No such tool: {tool_call['tool']}",
+                            })
+                        except Exception as e:
+                            logger.debug("on_tool_error callback error: %s", e)
+                    break
+
+                _args = dict(tool_call["args"])
+                _args.setdefault("session_id", session_id)
+                tool_result = await self._tool_registry.execute(
+                    tool_call["tool"], _args
+                )
+
+                if on_tool_result:
+                    try:
+                        await on_tool_result(tool_result)
+                    except Exception as e:
+                        logger.debug("on_tool_result callback error: %s", e)
+
+                turn_calls.append({
+                    "tool": tool_call["tool"], "args": tool_call["args"],
+                    "result": tool_result.get("result", tool_result),
+                })
+
+                # Compact the result ONCE — used for both the DB record (so it
+                # doesn't bloat future-turn history) and the in-memory wrap.
+                _compact = _compact_tool_result(
+                    tool_result.get("result", tool_result)
+                )
+                await self._messages.add_message(
+                    session_id=session_id, role="assistant",
+                    content=f"<tool>{tool_call['tool']}</tool>"
+                            f"<args>{_json.dumps(tool_call['args'])}</args>",
+                    input_mode="system", model=self._llm.name,
+                )
+                await self._messages.add_message(
+                    session_id=session_id, role="tool",
+                    content=f"<tool_result>{_compact}</tool_result>",
+                    input_mode="system",
+                )
+                # Feed the result back IN-MEMORY as proper OpenAI tool messages
+                # (stronger signal than the legacy <tool_result> text, and keeps
+                # the current turn's chain intact independent of the history cap).
+                _cid = f"c{tool_calls_made}"
+                context.append({
+                    "role": "assistant", "content": None,
+                    "tool_calls": [{
+                        "id": _cid, "type": "function",
+                        "function": {
+                            "name": tool_call["tool"],
+                            "arguments": _json.dumps(tool_call["args"]),
+                        },
+                    }],
+                })
+                context.append({
+                    "role": "tool", "tool_call_id": _cid, "content": _compact,
+                })
+                continue  # re-query with the tool result in context
+
+            # No tool call (or limit hit) — final answer.
+            if calls and tool_calls_made >= MAX_TOOL_CALLS and on_tool_error:
+                try:
+                    await on_tool_error({
+                        "name": "(chain)",
+                        "code": "tool_call_limit_reached",
+                        "message": (
+                            f"Reached the {MAX_TOOL_CALLS}-tool limit for "
+                            "this turn — please ask again to continue."
+                        ),
+                        "limit": MAX_TOOL_CALLS,
+                    })
+                except Exception as e:
+                    logger.debug("on_tool_error (limit) callback error: %s", e)
+
+            # Empty-response wrap (parity with the prose path): if a tool
+            # fired but the model produced no user-visible text, synthesize a
+            # one-line natural-language ack from the tool result instead of
+            # leaving the user with a blank turn.
+            if not response_text and turn_calls:
+                try:
+                    from dragon_voice.tools.response_wrap import synthesize_wrap
+                    response_text = synthesize_wrap(turn_calls)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("native empty-wrap failed: %s", e)
+
+            if response_text:
+                yield response_text
+            break
+
+        latency_ms = (time.monotonic() - t0) * 1000
+        await self._messages.add_message(
+            session_id=session_id,
+            role="assistant",
+            content=response_text,
+            input_mode="system",
+            model=self._llm.name,
+            latency_ms=latency_ms,
+        )
+        logger.info(
+            "Native turn (session=%s, latency=%.0fms, tools=%d): '%s' → '%s'",
             session_id, latency_ms, tool_calls_made, text[:50], response_text[:50],
         )

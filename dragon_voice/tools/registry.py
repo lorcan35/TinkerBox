@@ -136,6 +136,32 @@ class ToolRegistry:
         """
         return _has_tool_call(text, registered_names=self._tools.keys())
 
+    def openai_tools(self) -> list[dict]:
+        """Render registered tools as OpenAI-format function schemas.
+
+        For the native tool-calling path (SupportsNativeTools): passed as
+        `tools=[...]` to the llama-server OpenAI API. Each tool's
+        `parameters_schema` is already a JSON-schema object, so this is a
+        thin wrap. The whole registry is sent (not just the compact
+        priority subset) — the native API gives the model a structured
+        signal that doesn't bloat the prose context the way the prompt
+        block does.
+        """
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": t.name,
+                    "description": t.description,
+                    "parameters": t.parameters_schema or {
+                        "type": "object",
+                        "properties": {},
+                    },
+                },
+            }
+            for t in self._tools.values()
+        ]
+
     def format_for_llm(self, compact: bool = False) -> str:
         """Format tool descriptions for injection into LLM system prompt.
 

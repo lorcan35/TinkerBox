@@ -227,10 +227,17 @@ class OAuthAuthCodeClient:
         if extra_params:
             params.update(extra_params)
         url = f"{self._auth_url}?{urllib.parse.urlencode(params)}"
+        # The waiter's future is created lazily in wait_for_callback() on the
+        # running loop that actually awaits it.  start() is a synchronous
+        # URL-builder that may be called with no event loop at all (py3.12
+        # made asyncio.get_event_loop() raise in that case), and a future
+        # must live on the loop that awaits it — so we defer creation.  If
+        # the provider callback beats the waiter, resolve_callback() buffers
+        # the outcome for wait_for_callback() to honor immediately.
         self._pending[state] = {
             "code_verifier": verifier,
             "expires_at": time.time() + 600,
-            "future": asyncio.get_event_loop().create_future(),
+            "future": None,
         }
         return AuthCodeChallenge(
             authorization_url=url,
@@ -245,7 +252,13 @@ class OAuthAuthCodeClient:
         if entry is None:
             logger.warning("OAuth callback for unknown state %r — ignoring", state[:12])
             return
-        future = entry["future"]
+        future = entry.get("future")
+        if future is None:
+            # Callback arrived before wait_for_callback() parked — buffer the
+            # outcome so the waiter can honor it as soon as it starts waiting.
+            entry["pending_code"] = code
+            entry["pending_error"] = error
+            return
         if future.done():
             return
         if error:
@@ -262,8 +275,17 @@ class OAuthAuthCodeClient:
         entry = self._pending.get(state)
         if entry is None:
             raise DeviceCodeError("unknown_state", "no pending flow for state")
+        # If the callback already resolved before we parked, honor it now.
+        if "pending_code" in entry or "pending_error" in entry:
+            self._pending.pop(state, None)
+            err = entry.get("pending_error")
+            if err:
+                raise DeviceCodeError(code=err, description=err)
+            return entry.get("pending_code")
+        future = asyncio.get_running_loop().create_future()
+        entry["future"] = future
         try:
-            code = await asyncio.wait_for(entry["future"], timeout=timeout_s)
+            code = await asyncio.wait_for(future, timeout=timeout_s)
             return code
         except asyncio.TimeoutError:
             raise DeviceCodeError(

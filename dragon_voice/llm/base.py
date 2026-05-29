@@ -171,6 +171,32 @@ class LLMBackend(ABC):
 
 
 @runtime_checkable
+class SupportsNativeTools(Protocol):
+    """Backends that support the OpenAI-native `tools=[...]` API.
+
+    Instead of prose-listing tools in the system prompt and parsing
+    `<tool>NAME</tool><args>{}</args>` markers out of the streamed text,
+    these backends accept structured tool schemas + `tool_choice="auto"`
+    and return structured tool calls. This gives the model a schema to
+    fill (clean arg extraction) and a native "don't call a tool" path
+    (no spurious fires on chit-chat).
+
+    `generate_with_tools` is non-streaming: the tool-decision turn emits
+    a tool call, not user-facing prose, so streaming buys nothing. The
+    final natural-language turn (after the tool result) is returned as
+    `content` in one block.
+
+    Returns a dict:
+        {"content": str, "tool_calls": [{"name": str, "args": dict}, ...]}
+    `tool_calls` is empty when the model chose to answer directly.
+    """
+
+    async def generate_with_tools(
+        self, messages: list[dict], tools: list[dict]
+    ) -> dict: ...
+
+
+@runtime_checkable
 class SupportsSessionKey(Protocol):
     """Backends that own their own conversation context per-session.
 

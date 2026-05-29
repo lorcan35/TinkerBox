@@ -9,7 +9,7 @@ dictation finished), the server has to:
 
   1. **Dictate mode** — call `pipeline.finish_dictation()` which
      runs STT + post-processing.  When the transcript is
-     non-trivial (>10 chars), auto-save it as a Dragon note via
+     non-trivial (> MIN_DICTATION_CHARS), auto-save it as a Dragon note via
      `notes_svc.create_from_text()` and emit a `note_created`
      frame so Tab5 can show the freshly-saved note.
   2. **Ask / other modes** — call `pipeline.start_processing()`
@@ -38,16 +38,17 @@ await handle_stop_command(
 
 `conn_lock` is the per-connection `asyncio.Lock` (US-P10).
 `notes_svc` is the NotesService singleton — when missing or
-when the dictation transcript is too short to be useful (≤10
-chars), the note auto-create silently skips.
+when the dictation transcript is too short to be useful
+(≤ MIN_DICTATION_CHARS), the note auto-create silently skips.
 
-## Why >10 char transcript gate
+## Why the MIN_DICTATION_CHARS transcript gate
 
 Dictation post-processing on a near-empty buffer can produce
 filler like " " or "Uh." or " uhh." after Whisper's silence
 trim.  Persisting these as notes would clutter the notes view
-without value.  The 10-char floor is a proxy for "the user
-actually said something dictatable".
+without value.  The MIN_DICTATION_CHARS floor is a proxy for
+"the user actually said something dictatable" and is shared
+with the pipeline summary gate so the two never disagree.
 
 ## Why try/except around create_from_text
 
@@ -65,12 +66,16 @@ from typing import Any, Optional
 
 from aiohttp import web
 
+from dragon_voice.dictation_post import MIN_DICTATION_CHARS
+
 logger = logging.getLogger(__name__)
 
 
-# Dictation transcripts shorter than this are filler (silence
-# trim residue); skip the note auto-save.
-_MIN_DICTATION_CHARS_FOR_NOTE = 10
+# The note-auto-save gate shares MIN_DICTATION_CHARS with the
+# pipeline's summary gate (dictation audit S3-3) — a transcript that is
+# too short to summarize is also too short to save as a note, so the two
+# can't disagree (pre-fix an 11-20 char transcript saved a note while
+# the pipeline reported it EMPTY).
 
 
 async def handle_stop_command(
@@ -87,7 +92,7 @@ async def handle_stop_command(
 
     Mode dispatch:
       * ``dictate`` → `pipeline.finish_dictation()` + auto-note
-        when transcript is >10 chars and notes_svc is available.
+        when transcript is > MIN_DICTATION_CHARS and notes_svc is available.
       * ``ask`` (or anything else) → `pipeline.start_processing()`
         — runs the STT → LLM → TTS chain on the buffered audio.
 
@@ -143,7 +148,7 @@ async def _maybe_auto_create_note(
     if not transcript:
         return
     stripped = transcript.strip()
-    if len(stripped) <= _MIN_DICTATION_CHARS_FOR_NOTE:
+    if len(stripped) <= MIN_DICTATION_CHARS:
         return
     if notes_svc is None:
         return

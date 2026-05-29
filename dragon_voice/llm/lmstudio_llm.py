@@ -20,6 +20,12 @@ logger = logging.getLogger(__name__)
 class LMStudioBackend(LLMBackend):
     """LLM backend using LM Studio's local OpenAI-compatible API."""
 
+    # Slow CPU-local path (llama-server on Dragon, 60-90 s per summary):
+    # synthesize the dictation title+summary from the transcript instead
+    # of round-tripping the LLM, so the pipeline reaches SAVED before
+    # Tab5's 45 s grace timer / the ngrok idle-close window.
+    synthesize_summary_locally = True
+
     def __init__(self, config: LLMConfig) -> None:
         self._config = config
         self._base_url = config.lmstudio_url.rstrip("/")

@@ -102,6 +102,14 @@ def _classify_safe(transcript: str) -> dict:
 OnEvent = Callable[[dict], Awaitable[None]]
 
 
+# Single source for "is this transcript substantial enough to keep?"
+# Shared by pipeline.finish_dictation (summary gate) and
+# stop_handler (note-auto-save gate) so the two can't disagree —
+# pre-fix a 11-20 char transcript saved a note while the pipeline
+# reported it EMPTY (dictation audit 2026-05-29, S3-3).
+MIN_DICTATION_CHARS = 20
+
+
 # Title + summary prompt template.  Module-level so the contract
 # is greppable; tweaks to the wording propagate to a single
 # place.  Transcript truncated to 2000 chars to keep the LLM
@@ -205,12 +213,15 @@ async def run_dictation_post_process(
         return
 
 
-    # PR 2 polish: short-circuit for Local mode (OllamaBackend).
-    # Synthesize title/summary from the transcript instead of calling
-    # the slow CPU LLM — fires dictation_summary immediately so the
-    # pipeline reaches SAVED before the ngrok WS idle-close window.
-    backend_name = type(llm).__name__
-    if backend_name == 'OllamaBackend':
+    # Short-circuit for slow CPU-local backends (Ollama / llama-server /
+    # NPU Genie): synthesize title/summary from the transcript instead of
+    # calling the slow LLM — fires dictation_summary immediately so the
+    # pipeline reaches SAVED before Tab5's 45 s grace timer / the ngrok WS
+    # idle-close window.  Gated on the backend *capability*, not its class
+    # name — the old `type(llm).__name__ == 'OllamaBackend'` check silently
+    # broke when Local moved Ollama → llama-server (LMStudioBackend),
+    # reintroducing the very hang it was meant to kill.
+    if getattr(llm, "synthesize_summary_locally", False):
         title, summary = _synthesize_local_title_summary(transcript)
         # PR 4: heuristic classifier → optional proposed_action chip.
         proposed = _classify_safe(transcript)

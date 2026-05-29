@@ -24,6 +24,11 @@ def _make_llm(*, response_tokens: list[str] | None = None) -> MagicMock:
             yield tok
 
     llm.generate_stream = _stream
+    # Default mock = a fast remote backend (OpenRouter/TinkerClaw): it
+    # goes through the LLM.  Without pinning this False the MagicMock
+    # auto-vivifies a truthy child attr and every happy-path test would
+    # wrongly take the local-synthesize short-circuit.
+    llm.synthesize_summary_locally = False
     return llm
 
 
@@ -132,6 +137,7 @@ class TestFailure:
     async def test_llm_exception_emits_error_event(self):
         on_event = _make_on_event()
         llm = MagicMock()
+        llm.synthesize_summary_locally = False  # exercise the LLM path
 
         async def _broken(prompt, system_prompt):
             raise RuntimeError("LLM crashed mid-summary")
@@ -162,6 +168,7 @@ class TestFailure:
         spawning this task — no double-emit)."""
         on_event = _make_on_event()
         llm = MagicMock()
+        llm.synthesize_summary_locally = False  # exercise the LLM path
 
         async def _cancel(prompt, system_prompt):
             raise asyncio.CancelledError()
@@ -320,20 +327,21 @@ def test_synthesize_local_word_boundary_in_title():
 
 
 @pytest.mark.asyncio
-async def test_ollama_backend_bypasses_llm_for_synthesis():
-    """When the LLM backend is OllamaBackend, dictation_post should
-    skip the LLM call entirely and emit a dictation_summary built from
-    the transcript directly (no slow CPU LLM round-trip)."""
+async def test_local_backend_bypasses_llm_for_synthesis():
+    """A backend that declares `synthesize_summary_locally` (slow
+    CPU-local: Ollama / llama-server / NPU Genie) must skip the LLM
+    call and emit a dictation_summary built from the transcript
+    directly (no slow CPU LLM round-trip)."""
     events: list[dict] = []
 
     async def on_event(e: dict) -> None:
         events.append(e)
 
-    # Mock that *looks* like OllamaBackend by name — that's the gate
-    # we use to distinguish Local mode from Solo/Cloud (which use
-    # OpenRouter and are fast enough to call directly).
+    # Capability gate — NOT a class-name check.  The old gate
+    # (`type(llm).__name__ == 'OllamaBackend'`) silently broke when
+    # Local moved Ollama → llama-server.
     llm = MagicMock()
-    llm.__class__.__name__ = "OllamaBackend"
+    llm.synthesize_summary_locally = True
 
     await run_dictation_post_process(
         "hello world testing cross-network dictation",
@@ -352,3 +360,38 @@ async def test_ollama_backend_bypasses_llm_for_synthesis():
     final = summaries[-1]
     assert final["title"].startswith("Hello world")
     assert "cross-network dictation" in final["summary"]
+
+
+@pytest.mark.parametrize(
+    "module_path,class_name",
+    [
+        ("dragon_voice.llm.lmstudio_llm", "LMStudioBackend"),
+        ("dragon_voice.llm.ollama_llm", "OllamaBackend"),
+        ("dragon_voice.llm.npu_genie", "NPUGenieBackend"),
+    ],
+)
+def test_slow_local_backends_declare_synthesize_capability(module_path, class_name):
+    """Regression guard for S1-1 (dictation audit 2026-05-29): the live
+    Local backend MUST take the synthesize path.  This is the test that
+    would have caught the silent Ollama → llama-server regression — if a
+    future rename/swap drops the capability, this fails here instead of
+    reintroducing the 60-90 s summary hang in production."""
+    import importlib
+
+    cls = getattr(importlib.import_module(module_path), class_name)
+    assert cls.synthesize_summary_locally is True
+
+
+def test_fast_remote_backends_do_not_synthesize_locally():
+    """Fast remote backends (OpenRouter / TinkerClaw) keep the LLM path
+    (nicer title+summary, no timeout risk) — they must NOT shadow the
+    capability and so inherit the ABC default of False."""
+    from dragon_voice.llm.base import LLMBackend
+    from dragon_voice.llm.openrouter_llm import OpenRouterBackend
+    from dragon_voice.llm.tinkerclaw_llm import TinkerClawBackend
+
+    # ABC default is False.
+    assert LLMBackend.synthesize_summary_locally.fget(object()) is False
+    # Neither fast backend overrides it with a class-level True.
+    assert "synthesize_summary_locally" not in OpenRouterBackend.__dict__
+    assert "synthesize_summary_locally" not in TinkerClawBackend.__dict__

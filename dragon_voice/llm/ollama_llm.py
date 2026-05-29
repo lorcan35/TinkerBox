@@ -81,6 +81,11 @@ def _is_reasoning_model(model_id: str) -> bool:
 class OllamaBackend(LLMBackend):
     """LLM backend using Ollama's REST API."""
 
+    # Slow CPU-local path: synthesize the dictation title+summary from
+    # the transcript instead of paying a 60-90 s LLM round-trip (see
+    # LLMBackend.synthesize_summary_locally).
+    synthesize_summary_locally = True
+
     # How long Ollama keeps a model loaded in memory after the last request.
     # Default is 5 minutes which causes OOM on 8GB Dragon when switching
     # between models (e.g. qwen3:1.7b -> qwen3:4b).  30s is enough to

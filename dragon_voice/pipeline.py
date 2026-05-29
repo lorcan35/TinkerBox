@@ -764,65 +764,71 @@ class VoicePipeline:
         # PR 2 polish: when transcript is empty/short, emit a final
         # dictation_summary with empty fields so Tab5's pipeline resolves
         # (DICT_FAILED/EMPTY) instead of stalling at TRANSCRIBING forever.
-        if not (full_text.strip() and len(full_text) > 20):
+        # MIN_DICTATION_CHARS is the single source shared with the
+        # note-auto-save gate in stop_handler (dictation audit S3-3) so a
+        # short utterance can't save a note while reporting EMPTY here.
+        from dragon_voice.dictation_post import MIN_DICTATION_CHARS
+
+        if not (full_text.strip() and len(full_text) > MIN_DICTATION_CHARS):
             await self._on_event({
                 "type": "dictation_summary",
                 "title": "",
                 "summary": "",
             })
             return full_text
-        if full_text.strip() and len(full_text) > 20:
-            # v4·D audit P1 fix: cancel any prior post-process task before
-            # overwriting the handle.  Two rapid finish_dictation calls
-            # previously leaked the first task -- it kept running while
-            # the second task raced it to write title/summary.
-            prev = self._post_process_task
-            if prev and not prev.done():
-                # Audit B5 (#152): await the cancellation so the prior
-                # task can't race-emit a stale dictation_summary
-                # between the LLM call returning and CancelledError
-                # firing at the next await.
-                self._post_process_task = None
-                prev.cancel()
-                try:
-                    await prev
-                except (asyncio.CancelledError, Exception):
-                    pass
-                # Phase 2 H4 (issue #94): tell Tab5 the prior post-process
-                # was abandoned for the new one.  Without this, a user who
-                # rapidly stops + restarts dictation could see a stale
-                # summary land on top of their new transcript a few seconds
-                # later.
-                # β-arch (issue #123): double-write — legacy frame for
-                # unmodified Tab5 firmware + new progress frame for the
-                # unified bus.
-                await emit_progress_pair(
-                    self._on_event,
-                    legacy={"type": "dictation_postprocessing_cancelled"},
-                    phase=Phase.DICTATION_POST,
-                    stage=Stage.CANCELLED,
-                    code="dictation_post_cancelled",
-                    message="Prior summary abandoned for new dictation.",
-                    emit_legacy=self._config.progress_bus_emit_legacy,
-                )
-            # Phase 2 H4 (issue #94): emit a "still working" event so Tab5
-            # can show "Generating summary..." instead of leaving the user
-            # staring at the bare transcript for 10-20 s while the LLM
-            # writes the title + summary.  Pre-fix, the only events between
-            # `stt` (line 490) and `dictation_summary` were silence —
-            # users assumed the device had hung.
+
+        # Transcript is substantial — spawn the async title+summary task.
+        # v4·D audit P1 fix: cancel any prior post-process task before
+        # overwriting the handle.  Two rapid finish_dictation calls
+        # previously leaked the first task -- it kept running while
+        # the second task raced it to write title/summary.
+        prev = self._post_process_task
+        if prev and not prev.done():
+            # Audit B5 (#152): await the cancellation so the prior
+            # task can't race-emit a stale dictation_summary
+            # between the LLM call returning and CancelledError
+            # firing at the next await.
+            self._post_process_task = None
+            prev.cancel()
+            try:
+                await prev
+            except (asyncio.CancelledError, Exception):
+                pass
+            # Phase 2 H4 (issue #94): tell Tab5 the prior post-process
+            # was abandoned for the new one.  Without this, a user who
+            # rapidly stops + restarts dictation could see a stale
+            # summary land on top of their new transcript a few seconds
+            # later.
+            # β-arch (issue #123): double-write — legacy frame for
+            # unmodified Tab5 firmware + new progress frame for the
+            # unified bus.
             await emit_progress_pair(
                 self._on_event,
-                legacy={"type": "dictation_postprocessing"},
+                legacy={"type": "dictation_postprocessing_cancelled"},
                 phase=Phase.DICTATION_POST,
-                stage=Stage.START,
+                stage=Stage.CANCELLED,
+                code="dictation_post_cancelled",
+                message="Prior summary abandoned for new dictation.",
                 emit_legacy=self._config.progress_bus_emit_legacy,
             )
-            self._post_process_task = asyncio.ensure_future(
-                self._post_process_dictation(full_text)
-            )
-            # Prevent "Task exception was never retrieved" warnings
-            self._post_process_task.add_done_callback(self._on_post_process_done)
+        # Phase 2 H4 (issue #94): emit a "still working" event so Tab5
+        # can show "Generating summary..." instead of leaving the user
+        # staring at the bare transcript for 10-20 s while the LLM
+        # writes the title + summary.  Pre-fix, the only events between
+        # `stt` (line 490) and `dictation_summary` were silence —
+        # users assumed the device had hung.
+        await emit_progress_pair(
+            self._on_event,
+            legacy={"type": "dictation_postprocessing"},
+            phase=Phase.DICTATION_POST,
+            stage=Stage.START,
+            emit_legacy=self._config.progress_bus_emit_legacy,
+        )
+        self._post_process_task = asyncio.ensure_future(
+            self._post_process_dictation(full_text)
+        )
+        # Prevent "Task exception was never retrieved" warnings
+        self._post_process_task.add_done_callback(self._on_post_process_done)
 
         return full_text
 

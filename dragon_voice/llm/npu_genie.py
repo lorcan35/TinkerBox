@@ -28,6 +28,11 @@ _MAX_RESPONSE_CHARS = 300  # Hard limit — kill genie process after this many c
 class NPUGenieBackend(LLMBackend):
     """LLM backend using Qualcomm Genie runtime on the NPU (HTP)."""
 
+    # Slow CPU/NPU-local path: synthesize the dictation title+summary
+    # from the transcript instead of paying a slow LLM round-trip (see
+    # LLMBackend.synthesize_summary_locally).
+    synthesize_summary_locally = True
+
     def __init__(self, config: LLMConfig) -> None:
         self._config = config
         self._model_dir = Path(config.genie_model_dir)

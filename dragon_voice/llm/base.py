@@ -130,6 +130,34 @@ class LLMBackend(ABC):
         """
         return frozenset({Modality.TEXT})
 
+    @property
+    def synthesize_summary_locally(self) -> bool:
+        """True for slow CPU-local backends where the dictation
+        title+summary should be synthesized from the transcript
+        directly instead of paying a 60-90 s `generate_stream` round
+        trip.
+
+        This is a *capability*, not an identity check.  It replaces the
+        old `type(llm).__name__ == 'OllamaBackend'` gate in
+        `dictation_post.run_dictation_post_process`, which silently
+        broke when the live Local backend moved from Ollama to
+        llama-server (`LMStudioBackend`) — reintroducing the very hang
+        the gate was written to kill (the slow summary races Tab5's 45 s
+        grace timer / the ngrok idle-close window).
+
+        Slow CPU-local backends (Ollama, llama-server, NPU Genie)
+        override to True.  Fast remote backends (OpenRouter, TinkerClaw)
+        keep the default False so they go through the LLM, which gives a
+        nicer title+summary and is fast enough not to race any timeout.
+
+        Wrapper backends (router/dual) inherit the default False today;
+        forwarding the property to the chosen sub-backend is a tracked
+        follow-up (dictation redesign W3/W4).  The live default
+        deployment is a direct backend, so the property resolves
+        correctly there.
+        """
+        return False
+
     async def health_check(self, timeout_s: float = 2.0) -> tuple[bool, str]:
         """W4-B: cheap reachability probe surfaced by `GET /health`.
 

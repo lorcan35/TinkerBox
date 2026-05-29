@@ -1032,7 +1032,7 @@ dragon_voice/         — Voice pipeline package (port 3502)
                         roll-up over the events table.  Backed by
                         `dragon_voice/billing/spend_tracker.py`.
     scheduler.py      — 5 endpoints for the in-process notification scheduler
-                        (RFC-scheduler.md; ε2 store at sqlite for replay).
+                        (docs/internal/RFC-scheduler.md; ε2 store at sqlite for replay).
     synthesize.py     — TTS synthesis + STT transcription + OTA routes
     completions.py    — Direct LLM completion (stateless)
     system.py         — System metrics + backend listing
@@ -1077,7 +1077,7 @@ dragon_voice/         — Voice pipeline package (port 3502)
     pipeline.py       — MediaPipeline: detects code/tables/image URLs in LLM output, renders JPEG via Pygments/Pillow
     url_signer.py     — MediaUrlSigner: HMAC-signed + time-bounded /api/media/{id} URLs (W14-H04)
   scheduler/          — Phase 5 async push: in-process scheduler + sqlite-backed
-                        notification store.  See docs/RFC-scheduler.md.
+                        notification store.  See docs/internal/RFC-scheduler.md.
     manager.py        — SchedulerManager (RUNAWAY_CAP_PER_DEVICE guards) + REST glue
     models.py         — Notification dataclass
     parser.py         — `parse_when` natural-language time parser
@@ -1125,22 +1125,31 @@ tests/                — Test suite (**1533 tests collected** as of 2026-05-13 
   test_proxy_image_ssrf.py, test_config_redact.py, test_session_cas.py,
   test_mcp_bridge.py, test_notes_db_async.py, test_backend_pool.py,
   test_media_fd_leak.py, test_foundation.py       — all in CI named set
-docs/
+docs/                 — Audience-facing docs (Diátaxis); see docs/README.md for the map
+  README.md           — Docs index / map (tutorials / how-to / reference / explanation)
+  ROADMAP.md          — Documentation program waves
   protocol.md         — WebSocket protocol spec (Tab5 ↔ Dragon)
   router-cookbook.md  — Multi-model router fleet recipes (#188)
   npu-setup.md        — Qualcomm NPU / QAIRT SDK setup guide
-  AUDIT-WAVE-15.md    — Current wave audit (Wave 14 archived; see below)
-  WAVE-15-PROGRESS.md — Per-item checklist for the active Wave 15 sprint
-  PLAN-dual-model-pipeline.md — Dual-model pipeline plan + post-mortem
-  RFC-scheduler.md    — Scheduler/notifications subsystem design
   SKILL_AUTHORING.md  — Skill SDK reference (uses tools/quick_poll_tool.py as example)
-  SOLID-AUDIT.md      — SOLID/structural audit of both repos
   UX-GAPS.md          — Master UX gap tracker (issue #89)
   telegram-bot.md     — Telegram bot deployment guide
+  _templates/         — The four Diátaxis page templates
+  internal/           — Plans / audits / RFCs (moved here 2026-05-29; not audience docs)
+    README.md         — Old→new map for the relocated internal docs
+    AUDIT-WAVE-15.md  — Wave 15 audit
+    WAVE-15-PROGRESS.md — Per-item checklist for the Wave 15 sprint
+    PLAN-dual-model-pipeline.md — Dual-model pipeline plan + post-mortem
+    PLAN-tinkerbox-integrations.md — Integrations layer plan
+    RFC-scheduler.md  — Scheduler/notifications subsystem design
+    SOLID-AUDIT.md    — SOLID/structural audit of both repos
+    AUDIT-solid-2026-05-03.md — SOLID audit (2026-05-03)
   historical/         — Closed waves + superseded audits
     README.md         — Index of archived docs + why each was moved
     AUDIT-WAVE-14.md  — Wave 14 audit (closed 2026-04-21)
     WAVE-14-PROGRESS.md — Wave 14 per-item checklist (all items shipped)
+GLOSSARY.md           — Canonical cross-stack terms + TinkerBox-specific terms
+STYLE.md              — Cross-repo documentation writing standard
 LEARNINGS.md          — Institutional knowledge (MANDATORY reading)
 ```
 

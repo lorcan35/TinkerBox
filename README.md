@@ -13,7 +13,7 @@
 → **use it** ([getting started](docs/getting-started-user.md))
 · **build / modify it** ([dev setup](docs/dev-setup.md))
 · **integrate with it** ([reference](docs/reference/) · [protocol](docs/protocol.md))
-· **run it in production** ([deploy](docs/dev-setup.md#deployment))
+· **run it in production** ([deploy](docs/dev-setup.md#deploy-your-local-working-tree))
 
 > The Diátaxis-organized `docs/` (tutorials / how-to / reference / explanation) is
 > being filled in by [Wave 2](docs/ROADMAP.md); for now the audience links above

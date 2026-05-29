@@ -120,7 +120,8 @@ def test_start_registers_pending_state_with_verifier(fake_session):
     chal = client.start()
     entry = client._pending[chal.state]
     assert entry["code_verifier"] == chal.code_verifier
-    assert entry["future"] is not None
+    # Future is created lazily in wait_for_callback() on the awaiting loop.
+    assert entry["future"] is None
 
 
 # ── resolve_callback + wait_for_callback ────────────────────────────
@@ -179,8 +180,9 @@ def test_resolve_callback_unknown_state_does_not_raise(fake_session):
 def test_wait_for_callback_unknown_state_raises_immediately(fake_session):
     client = _make_client(fake_session)
     with pytest.raises(DeviceCodeError) as excinfo:
-        # No coroutine awaited — the raise is synchronous.
-        asyncio.get_event_loop().run_until_complete(
+        # wait_for_callback raises synchronously for an unknown state; asyncio.run
+        # gives it a fresh loop (no reliance on a deprecated current-loop).
+        asyncio.run(
             client.wait_for_callback("never-issued", timeout_s=1),
         )
     assert excinfo.value.code == "unknown_state"

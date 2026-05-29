@@ -19,6 +19,31 @@ sequentially across the whole file (don't restart per section).
 
 ---
 
+## 2026-05-29 — Test suite: 20 pre-existing failures (config_swap stub, oauth event-loop, live-audit probes)
+
+### OAuth PKCE waiter future bound to a stale/absent event loop
+- **Date:** 2026-05-29
+- **Symptom:** `tests/test_oauth_auth_code.py` start/unknown-state tests PASS in isolation but FAIL in the full suite with `RuntimeError: There is no current event loop in thread 'MainThread'`. 4 failures.
+- **Root Cause:** `oauth.py::OAuthAuthCodeClient.start()` is a *synchronous* URL-builder that eagerly created the waiter future via `asyncio.get_event_loop().create_future()`. Under Python 3.12 `get_event_loop()` with no running loop only warns the first time but RAISES once a prior test has closed/replaced the thread's loop (suite-order pollution). It's also semantically wrong: a future must live on the loop that awaits it, and `wait_for_callback()` can run on a different loop than `start()`.
+- **Fix:** Defer future creation — `start()` stores `"future": None`; `wait_for_callback()` creates it lazily via `asyncio.get_running_loop().create_future()`; `resolve_callback()` buffers the outcome (`pending_code`/`pending_error`) when it fires before the waiter parks, and `wait_for_callback()` honors the buffer immediately. The unknown-state test moved from `get_event_loop().run_until_complete` to `asyncio.run`.
+- **Prevention:** Never call `asyncio.get_event_loop()` in sync code on 3.12+. Create futures on the awaiting loop (`get_running_loop()`), not at registration time.
+
+### config_swap test stub drifted from production
+- **Date:** 2026-05-29
+- **Symptom:** 14 `SelectBackendsTests` fail with `AttributeError: '_StubVoiceCfg' object has no attribute 'tts'` at `config_swap.py:123`.
+- **Root Cause:** `select_backends_for_mode` reads `conn_config.tts.backend` (the #338 neutts_air/kokoro override). Real `VoiceConfig.tts` is a `TTSConfig`, so prod is correct; the hand-rolled `_StubVoiceCfg` only modeled `.llm` and was never updated.
+- **Fix:** Add `_StubTtsCfg(backend="kokoro")` + a `tts` field to the stub.
+- **Prevention:** When a hand-rolled test stub mirrors a production dataclass, construct the real dataclass (or assert the stub covers every attribute the unit reads).
+
+### Live-Dragon audit probes auto-collected as unit tests
+- **Date:** 2026-05-29
+- **Symptom:** 2 `tests/audit/test_d5_d6_ws.py` failures: "async def functions are not natively supported."
+- **Root Cause:** The file is a manual live-Dragon WS probe (its docstring says so) but its `async def test_*` functions got collected by pytest with no `@pytest.mark.asyncio` (repo uses strict pytest-asyncio mode).
+- **Fix:** Module-level `pytestmark = [pytest.mark.asyncio, pytest.mark.skipif(not RUN_LIVE_AUDIT, ...)]` — skip by default, run on opt-in against a live Dragon.
+- **Prevention:** Gate live-service probes behind an opt-in env var; don't let manual scripts masquerade as collectable unit tests.
+
+---
+
 ## 2026-05-15 — Local-mode dictation_summary hangs: Ollama 60-90 s vs ngrok / WS PONG timeout
 
 - **Date:** 2026-05-15

@@ -31,27 +31,31 @@ tts:
   sample_rate: 22050
 
 llm:
-  local_backend: "ollama"  # Stores original local backend for cloud-to-local fallback
-  backend: "ollama"  # ollama, openrouter, lmstudio, npu_genie, tinkerclaw, dual
+  local_backend: "lmstudio"  # original local backend for cloud→local fallback (lmstudio = llama-server)
+  backend: "lmstudio"  # ollama, openrouter, lmstudio, npu_genie, tinkerclaw, dual
+  # ── Local inference ──────────────────────────────────────────────
+  # PRIMARY local path is lmstudio (llama-server) + native tool-calling —
+  # see `native_tools` below.  Ollama is the automatic FALLBACK: create_llm()
+  # TCP-probes lmstudio_url at process start and falls back to ollama for that
+  # session if llama-server isn't reachable.
   # ollama
   ollama_url: "http://localhost:11434"
-  # Default local LLM for voice_mode=0 (Local) and the LLM side of mode 1 (Hybrid).
-  # Selected 2026-04-24 from the 11-model gauntlet audit: ministral-3:3b was the
-  # only tested model that (a) fit inside Tab5's ~30 s WS keepalive ceiling, (b)
-  # fired the calculator tool with the correct answer on a non-memorized number
-  # (456*789=359,784), (c) cleanly stored a fact to the memory DB without leaking
-  # prior-session context, and (d) produced a user-visible reply on 4/5 prompts.
-  # See CLAUDE.md "Local LLM Benchmarks" + LEARNINGS.md 2026-04-24 entry for
-  # the full gauntlet table, the three failure classes (too-small / too-slow /
-  # fluent-hallucinator) we ruled out, and the re-benchmark methodology.
-  ollama_model: "ministral-3:3b"
+  # Ollama fallback model (used only when lmstudio is unreachable).  Matches the
+  # live Dragon as of 2026-05-29.  History: ministral-3:3b was the 2026-04-24
+  # gauntlet winner — see CLAUDE.md "Local LLM Benchmarks" + LEARNINGS.md.
+  ollama_model: "qwen3.5:4b"
   # openrouter
   openrouter_api_key: ""  # reads from OPENROUTER_API_KEY env var if empty
   openrouter_model: "anthropic/claude-3.5-haiku"
   openrouter_url: "https://openrouter.ai/api/v1"
-  # lmstudio
+  # lmstudio (llama-server) — PRIMARY local path.  Serves the loaded GGUF
+  # (Granite 4.0 Nano-1B as of 2026-05-27) on an OpenAI-compatible API.
   lmstudio_url: "http://localhost:1234/v1"
-  lmstudio_model: "default"
+  lmstudio_model: "default"  # llama-server reports its loaded GGUF
+  # Native OpenAI tools=[...] tool-calling on llama-server — the local-mode
+  # capability rework (2026-05-27).  Granite scored 19/20 with this enabled.
+  # Falls back to the prose 5-dialect parser when off / unsupported.
+  native_tools: true
 
   # TinkerClaw agent gateway (optional sidecar)
   tinkerclaw_url: "http://localhost:18789"

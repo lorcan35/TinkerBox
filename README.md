@@ -2,6 +2,23 @@
 
 **The Brain of TinkerClaw** -- Dragon Q6A server stack for the TinkerClaw voice assistant platform.
 
+> **Part of the Tinker stack** — four repos, each documented on its own:
+> [**TinkerTab**](https://github.com/lorcan35/TinkerTab) (Tab5 device firmware) ·
+> [**TinkerBox**](https://github.com/lorcan35/TinkerBox) (Dragon inference server — "the brain") ·
+> [**PingOS**](https://github.com/lorcan35/PingOS) (website-to-API automation gateway) ·
+> [**TinkerClaw**](https://github.com/lorcan35/TinkerClaw) (agent sidecar).
+> New here? Each repo's README is its own front door.
+
+**I want to…**
+→ **use it** ([getting started](docs/getting-started-user.md))
+· **build / modify it** ([dev setup](docs/dev-setup.md))
+· **integrate with it** ([reference](docs/reference/) · [protocol](docs/protocol.md))
+· **run it in production** ([deploy](docs/dev-setup.md#deploy-your-local-working-tree))
+
+> The Diátaxis-organized `docs/` (tutorials / how-to / reference / explanation) is
+> being filled in by [Wave 2](docs/ROADMAP.md); for now the audience links above
+> point at the current docs. See [`docs/README.md`](docs/README.md) for the full map.
+
 📚 **Docs:** [WELCOME](WELCOME.md) · [Get started](docs/getting-started-user.md) · [Architecture](docs/ARCHITECTURE.md) · [Protocol](docs/protocol.md) · [Router cookbook](docs/router-cookbook.md) · [Flows](docs/flows/) · [Glossary](GLOSSARY.md) · [Security](SECURITY.md) · [Contributing](CONTRIBUTING.md) · [Lessons](LEARNINGS.md) · [CLAUDE.md](CLAUDE.md) (runbook)
 
 > **First time here?** [`WELCOME.md`](WELCOME.md) is the multi-audience landing page — pick your track (use it / build it / hack it).  If you're an end user, jump straight to [`docs/getting-started-user.md`](docs/getting-started-user.md).

@@ -536,3 +536,67 @@ before trusting any latency number (it saturates the box).
 - A data-driven Local-mode default committed to `config.yaml`, matching the
   documented production reality, that beats today's 7/20 on the hard gauntlet
   while keeping latency within the "tolerable, capability-first" envelope.
+
+---
+
+## Latency optimization — verified results (2026-05-29)
+
+The capability work (native tool-calling, Granite-1B 19/20) landed first; this
+section records the latency follow-through. Headline: per-turn latency was never
+a hardware floor. Three root causes were found and fixed, with live measurements
+on Dragon (Granite-4.0-Nano-1B Q4_K_M).
+
+### Root cause 1 — the binary lacked DOTPROD kernels
+The deployed `llama-server` was built with `GGML_NATIVE=ON`, which on GCC 13 does
+NOT set `__ARM_FEATURE_DOTPROD` even though the QCS6490 has `asimddp` (llama.cpp
+#16237) — so it ran the generic-NEON matmul, 2-4x slow. Rebuilt to `build_dp`
+with `-DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8.2-a+dotprod+fp16
+-DGGML_CPU_KLEIDIAI=ON` (verify `DOTPROD=1 KLEIDIAI=1` in the banner). Do NOT add
+`+i8mm`/`+sve` (A78 lacks them → SIGILL). Also set the `performance` CPU governor
+(persisted via `cpu-performance.service`).
+
+### Root cause 2 — thermal throttling (no fan)
+Measured: `cpuinfo_max_freq=2.7GHz` but under a big prefill the kernel clamps
+`scaling_max_freq` to 1.32GHz at the 90°C passive trip (zone `power_allocator`,
+trips 90/95/110°C). The Dragon Q6A is passively cooled — no PWM/fan, every hwmon
+is a `*_thermal` sensor. Starting cool (54°C) a short generation ran at full
+2.7GHz and only dipped past ~66°C; the multi-thousand-token prefill pegs all
+cores for minutes → 90°C → half-clock, and heat accumulates across a session
+(why turn 2 was slower than turn 1). Mitigations landed: pin the background smart
+server (:1235) to the cooler A55 little cores (0-3) so it stops stacking heat on
+the big cluster (4-7) the fast path needs; kill stale orphan `dragon_voice`
+processes. **The biggest remaining unlock is a $5 fan** → sustained full clock →
+~2x on the prefill-bound turn. (Raising the 90°C passive trip toward 100°C trades
+silicon longevity for speed — not done without explicit consent.)
+
+### Root cause 3 — the prompt was re-prefilled every turn (cache busted)
+The agentic prompt was ~6431 tokens and llama-server's prompt cache wasn't being
+reused because (a) query-keyed memory facts changed the system message each turn
+and (b) fat re-fetched tool-result history (e.g. 10 emails with snippets ≈ 2900
+tokens) and legacy `<tool>` markers diverged the cached prefix. Fixed in
+`conversation.py` `_process_text_stream_native` (commit `6b0510d`):
+- Build the prompt prefix ONCE; accumulate the current turn's tool round-trip
+  in-memory as proper OpenAI `tool_calls`/`tool` messages (multi-tool chains stay
+  intact under the history cap).
+- `inject_memory=False` on the fast path → byte-stable system message.
+- `drop_tool_history=True` → strip prior turns' tool/`<tool>` messages from the
+  prefill only (DB record untouched for dashboard/audit).
+- `NATIVE_HISTORY_MSGS=6` history cap.
+- `_compact_tool_result` → cap list length + per-string length, drop
+  link/url/snippet fields before a result re-enters context.
+- Spoken-answer guidance (one short sentence, no markdown/links) → ~7x fewer
+  generated tokens, better for TTS.
+
+### Measured before/after (live Dragon, Granite-1B)
+| Turn | Before | After |
+|---|---|---|
+| Calendar (cold) | 62s | 30s |
+| Email (10 results) | 436s | 29s |
+| Warm follow-up (tasks) | — | ~7s |
+
+Decision-call reprocessing dropped from ~550 tokens to ~14-74 (near-total cache
+hit on the static prefix). The remaining per-turn floor is the wrap call
+prefilling the CURRENT tool result (~20-24s for multi-item results — the model
+must read it to summarize); reducible by trimming results harder (trades
+completeness) or by the fan (full clock). Tests:
+`tests/test_native_context_accumulation.py`.

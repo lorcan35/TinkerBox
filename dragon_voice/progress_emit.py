@@ -14,6 +14,19 @@ The swallow pattern matches the existing convention at
 take down the calling task.  Worst case: Tab5 sees only the legacy
 frame (status quo) or only the progress frame (consistent with the
 ``progress_bus_emit_legacy=False`` mode).  Both states are valid.
+
+W5 S3-8 audit (2026-05-30): the ``progress`` half of the dual-write
+has NO consumers fleet-wide at present — Tab5 firmware logs it as
+"Unknown message type: progress" (voice_ws_proto.c) and the dashboard
+(dashboard.py + dragon_voice/static/) never reads it.  It is NOT dead
+code to delete, though: it is the *intentional forward-compat* frame
+the β-arch added so a future progress-bus consumer (dashboard live
+view, a new client) gets a structured event without re-touching every
+emit site.  The legacy half is load-bearing for Tab5 today and is kept
+unconditionally.  Removal of the progress half is deferred until either
+a real consumer ships (then it's load-bearing too) or the progress-bus
+is abandoned (then drop the half + flip emit_legacy semantics).  Do NOT
+collapse the dual-write on the strength of "no consumers" alone.
 """
 from __future__ import annotations
 

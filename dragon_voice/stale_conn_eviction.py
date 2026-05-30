@@ -46,6 +46,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
+from aiohttp import WSCloseCode
+
 from dragon_voice.errors import Scope, Severity, error_event
 
 logger = logging.getLogger(__name__)
@@ -139,6 +141,25 @@ async def evict_stale_connections_for_device(
         old_sid = old_conn.get("session_id")
         if old_sid and session_mgr is not None:
             await session_mgr.pause_session(old_sid)
+
+        # Force-close the old WebSocket so its socket fd is released NOW.
+        # Pre-fix, eviction tore down the pipeline + session + registry entry
+        # but left the old `ws` open, relying on aiohttp's 180 s heartbeat (or
+        # the old handler's receive loop) to eventually reap it.  Under rapid
+        # reconnect churn — or abrupt Tab5 reboots that half-close the TCP
+        # without the blocked handler noticing — evicted sockets pile up in
+        # CLOSE-WAIT and exhaust the WS handler.  Observed live 2026-05-30: 59
+        # CLOSE-WAIT sockets wedged :3502 so no new WS upgrade could complete
+        # ("Error read response for Upgrade header" on the client) and the Tab5
+        # could not reconnect at all until the service was restarted.  Closing
+        # here releases each evicted socket immediately.  Best-effort: a close
+        # failure (already-dead transport) must not block the eviction.
+        old_ws = old_conn.get("ws")
+        if old_ws is not None and not getattr(old_ws, "closed", False):
+            try:
+                await old_ws.close(code=WSCloseCode.GOING_AWAY, message=b"device_evicted")
+            except Exception as e:
+                logger.debug("P13: old ws close failed for %s: %s", old_ws_id, e)
 
         # Mark as unregistered so _handle_disconnect won't mark
         # device offline.

@@ -244,3 +244,82 @@ async def _drive_register(server: VoiceServer, ws, conn_state: dict, cmd: dict) 
         # Post-eviction setup uses real config attributes the stubs
         # don't provide; that's outside the scope of this test.
         pass
+
+
+# ───────────────────────── CLOSE-WAIT leak fix (2026-05-30)
+
+
+def test_eviction_closes_old_websocket() -> None:
+    """The evicted connection's WebSocket MUST be explicitly closed so its
+    socket fd is released immediately.  Pre-fix, eviction tore down the
+    pipeline/session/registry but left the old ws open, relying on aiohttp's
+    180 s heartbeat to reap it — under reconnect churn evicted sockets piled up
+    in CLOSE-WAIT and exhausted the WS handler (observed live: 59 CLOSE-WAIT
+    sockets wedged :3502, "Error read response for Upgrade header", Tab5 could
+    not reconnect until the service was restarted)."""
+    from aiohttp import WSCloseCode
+
+    from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
+
+    old_ws = MagicMock()
+    old_ws.closed = False
+    old_ws.close = AsyncMock()
+    active = {
+        "ws_old": {
+            "ws_id": "ws_old",
+            "device_id": "dev-Z",
+            "registered": True,
+            "session_id": "old-session",
+            "pipeline": MagicMock(shutdown=AsyncMock()),
+            "_on_event": AsyncMock(),
+            "ws": old_ws,
+        }
+    }
+
+    evicted = asyncio.run(
+        evict_stale_connections_for_device(
+            active_connections=active,
+            session_mgr=None,
+            device_id="dev-Z",
+            new_ws_id="ws_new",
+        )
+    )
+
+    assert evicted == 1
+    old_ws.close.assert_awaited_once()
+    assert old_ws.close.await_args.kwargs.get("code") == WSCloseCode.GOING_AWAY
+    assert "ws_old" not in active
+
+
+def test_eviction_skips_close_on_already_closed_ws() -> None:
+    """If the old ws is already closed, eviction skips the close (no
+    double-close) and still completes the teardown."""
+    from dragon_voice.stale_conn_eviction import evict_stale_connections_for_device
+
+    old_ws = MagicMock()
+    old_ws.closed = True
+    old_ws.close = AsyncMock()
+    active = {
+        "ws_old": {
+            "ws_id": "ws_old",
+            "device_id": "dev-Z",
+            "registered": True,
+            "session_id": None,
+            "pipeline": None,
+            "_on_event": None,
+            "ws": old_ws,
+        }
+    }
+
+    evicted = asyncio.run(
+        evict_stale_connections_for_device(
+            active_connections=active,
+            session_mgr=None,
+            device_id="dev-Z",
+            new_ws_id="ws_new",
+        )
+    )
+
+    assert evicted == 1
+    old_ws.close.assert_not_awaited()
+    assert "ws_old" not in active

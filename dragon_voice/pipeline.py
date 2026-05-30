@@ -804,7 +804,15 @@ class VoicePipeline:
             # unified bus.
             await emit_progress_pair(
                 self._on_event,
-                legacy={"type": "dictation_postprocessing_cancelled"},
+                # W2 (review F2): stamp the cancelled frame with the ABANDONED
+                # prior turn's id (the task we just cancelled), NOT conn_state's
+                # live turn_id — which a back-to-back `start` has overwritten
+                # with the SUCCESSOR turn.  Without this, Tab5 would cancel the
+                # live successor + discard its WAV.
+                legacy={
+                    "type": "dictation_postprocessing_cancelled",
+                    "turn_id": getattr(self, "_post_process_turn_id", "-"),
+                },
                 phase=Phase.DICTATION_POST,
                 stage=Stage.CANCELLED,
                 code="dictation_post_cancelled",
@@ -832,6 +840,10 @@ class VoicePipeline:
         self._post_process_task = asyncio.ensure_future(
             self._post_process_dictation(full_text, turn_id=post_turn_id)
         )
+        # W2 (review F2): remember which turn THIS post-process belongs to, so a
+        # later finish_dictation that cancels it stamps the cancelled frame with
+        # this (abandoned) turn's id rather than the successor's.
+        self._post_process_turn_id = post_turn_id
         # Prevent "Task exception was never retrieved" warnings
         self._post_process_task.add_done_callback(self._on_post_process_done)
 

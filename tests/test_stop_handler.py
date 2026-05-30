@@ -279,6 +279,47 @@ class TestDictateMode:
         frame = ws.send_json.await_args.args[0]
         assert len(frame["transcript"]) == 200
 
+    @pytest.mark.asyncio
+    async def test_dictate_note_created_carries_turn_id(self):
+        """W4: Tab5 reconciles the optimistic note row by turn_id, so the
+        note_created frame MUST echo the turn's id (from conn_state, stashed
+        there by start_handler).  Pin it so a refactor can't drop it."""
+        ws = _make_ws()
+        pipeline = _make_pipeline(transcript="A long enough transcript")
+        notes_svc = _make_notes_svc(note_id="note-77")
+
+        await handle_stop_command(
+            ws,
+            ws_id="ws-tid",
+            conn_state={"pipeline": pipeline, "mode": "dictate", "turn_id": "abc123def456"},
+            conn_lock=asyncio.Lock(),
+            notes_svc=notes_svc,
+        )
+
+        frame = ws.send_json.await_args.args[0]
+        assert frame["type"] == "note_created"
+        assert frame["turn_id"] == "abc123def456"
+
+    @pytest.mark.asyncio
+    async def test_dictate_note_created_turn_id_defaults_to_dash(self):
+        """When conn_state has no turn_id (legacy / boot race), the frame still
+        carries a turn_id field ('-') so the Tab5 lookup is well-defined
+        (treated as 'no match' → fresh note)."""
+        ws = _make_ws()
+        pipeline = _make_pipeline(transcript="A long enough transcript")
+        notes_svc = _make_notes_svc()
+
+        await handle_stop_command(
+            ws,
+            ws_id="ws-tid2",
+            conn_state={"pipeline": pipeline, "mode": "dictate"},  # no turn_id
+            conn_lock=asyncio.Lock(),
+            notes_svc=notes_svc,
+        )
+
+        frame = ws.send_json.await_args.args[0]
+        assert frame["turn_id"] == "-"
+
 
 # ─── conn_lock serialisation ──────────────────────────────────
 

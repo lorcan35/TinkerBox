@@ -17,6 +17,12 @@ from dragon_voice.notes.db import Note, NotesDB
 
 logger = logging.getLogger(__name__)
 
+# W4: bounded background retry for note embeddings.  An embedding failure (e.g.
+# "Server disconnected") must never block or fail the note insert — the note is
+# saved + usable the moment the transcript exists; only the semantic index of
+# that note is deferred until a retry succeeds.  Delays in seconds (backoff).
+_EMBED_RETRY_DELAYS = [2, 10, 30]
+
 
 def _placeholder_title(text: str, max_words: int = 8) -> str:
     """First N non-empty words from the transcript as a placeholder title.
@@ -321,11 +327,27 @@ class NotesService:
     # ── Internal: Embeddings ────────────────────────────────────────────
 
     async def _embed_note(self, note_id: str, text: str) -> None:
-        """Generate and store embedding for a note."""
-        embedding = await self._get_embedding(text[:8000])
-        if embedding:
-            await self._db.update(note_id, {"embedding": embedding})
-            logger.info("Embedded note %s (%d dims)", note_id, len(embedding))
+        """Generate + store the note embedding, retrying transient failures.
+
+        Never raises — embedding is best-effort background work (W4).  On every
+        attempt failure we wait a backoff and retry; after the last delay we give
+        up quietly (the note stays usable, just unindexed until a later edit
+        re-embeds it).  This makes a transient "Server disconnected" self-heal
+        instead of leaving the note permanently unsearchable.
+        """
+        for delay in [0, *_EMBED_RETRY_DELAYS]:
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                embedding = await self._get_embedding(text[:8000])
+            except Exception:
+                logger.warning("Embedding attempt failed for %s", note_id, exc_info=True)
+                continue
+            if embedding:
+                await self._db.update(note_id, {"embedding": embedding})
+                logger.info("Embedded note %s (%d dims)", note_id, len(embedding))
+                return
+        logger.warning("Embedding gave up for %s after %d retries", note_id, len(_EMBED_RETRY_DELAYS))
 
     async def _get_embedding(self, text: str) -> list[float]:
         """Get embedding vector from Ollama."""

@@ -74,6 +74,8 @@ jobs:
             tests/test_media_pipeline.py \
             tests/test_mcp_bridge.py \
             tests/test_notes_db_async.py \
+            tests/test_notes_embed_retry.py \
+            tests/test_stop_handler.py \
             tests/test_paused_session_retention.py \
             tests/test_progress_bus_integration.py \
             tests/test_progress_emit.py \

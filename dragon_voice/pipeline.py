@@ -824,8 +824,13 @@ class VoicePipeline:
             stage=Stage.START,
             emit_legacy=self._config.progress_bus_emit_legacy,
         )
+        # W2: capture THIS turn's id NOW — a later `start` overwrites
+        # conn_state["turn_id"], and the async post-process emits its summary
+        # seconds later, so it must stamp the turn it belongs to rather than
+        # whatever turn has since started (the server root cause of S2-8).
+        post_turn_id = getattr(self, "_dictation_turn_id", "-")
         self._post_process_task = asyncio.ensure_future(
-            self._post_process_dictation(full_text)
+            self._post_process_dictation(full_text, turn_id=post_turn_id)
         )
         # Prevent "Task exception was never retrieved" warnings
         self._post_process_task.add_done_callback(self._on_post_process_done)
@@ -841,7 +846,7 @@ class VoicePipeline:
         if exc:
             logger.warning("Dictation post-processing task failed: %s", exc)
 
-    async def _post_process_dictation(self, transcript: str) -> None:
+    async def _post_process_dictation(self, transcript: str, turn_id: str = "-") -> None:
         """Generate title + summary for completed dictation via LLM.
 
         SOLID-audit follow-up: implementation extracted to
@@ -849,6 +854,10 @@ class VoicePipeline:
         resolves the active LLM (ConvEngine first, then
         pipeline._llm fallback) and forwards to the free
         function with the on_event callback + emit_legacy flag.
+
+        W2: ``turn_id`` is captured at finish_dictation time and stamped on
+        every emit from here, so a late summary stamps ITS OWN turn rather
+        than whatever turn conn_state has since moved on to (S2-8).
         """
         from dragon_voice.dictation_post import run_dictation_post_process
 
@@ -858,10 +867,17 @@ class VoicePipeline:
         elif self._llm:
             llm = self._llm
 
+        async def _on_event_stamped(event: dict) -> None:
+            # Stamp the CAPTURED turn_id (not conn_state's live one).  The
+            # downstream callback's "if turn_id not in event" guard then
+            # leaves it intact, so the late summary carries this turn's id.
+            event.setdefault("turn_id", turn_id)
+            await self._on_event(event)
+
         await run_dictation_post_process(
             transcript,
             llm=llm,
-            on_event=self._on_event,
+            on_event=_on_event_stamped,
             emit_legacy=self._config.progress_bus_emit_legacy,
         )
 

@@ -66,6 +66,33 @@ def _make_pipeline(llm: _FakeLLM) -> tuple[VoicePipeline, list[dict]]:
     return p, events
 
 
+@pytest.mark.asyncio
+async def test_late_postprocess_stamps_its_own_turn_id():
+    """W2 (S2-8): the async post-process stamps the turn_id captured at
+    finish_dictation time — NOT whatever turn _dictation_turn_id / conn_state
+    has moved on to by the time the (seconds-later) summary emits.  Pre-fix,
+    a back-to-back dictation B that started while A's summary was still
+    generating would see A's summary stamped with B's turn_id."""
+    llm = _FakeLLM(delay_s=0.02)
+    p, events = _make_pipeline(llm)
+    p._dictation_mode = True
+    p._dictation_turn_id = "turnAAAA"
+    p._dictation_segments = [
+        "this is a sufficiently long dictation transcript to summarize"
+    ]
+
+    await p.finish_dictation()        # spawns the post-process task, capturing turnAAAA
+    p._dictation_turn_id = "turnBBBB"  # a new dictation turn starts mid-post-process
+    if p._post_process_task:
+        await p._post_process_task     # let the late summary emit
+
+    summaries = [e for e in events if e.get("type") == "dictation_summary"]
+    assert summaries, "expected a dictation_summary frame"
+    # The late summary must carry the turn it BELONGS to (AAAA), not the
+    # turn that started after it (BBBB).
+    assert summaries[-1].get("turn_id") == "turnAAAA"
+
+
 # ─────────────────────────── cancel() awaits the task
 
 

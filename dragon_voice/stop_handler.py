@@ -121,6 +121,7 @@ async def handle_stop_command(
                 ws,
                 transcript=transcript,
                 notes_svc=notes_svc,
+                turn_id=conn_state.get("turn_id", "-"),
             )
         else:
             await pipeline.start_processing()
@@ -131,6 +132,7 @@ async def _maybe_auto_create_note(
     *,
     transcript: Optional[str],
     notes_svc: Optional[Any],
+    turn_id: str = "-",
 ) -> None:
     """Auto-save the dictation transcript as a Dragon note +
     emit `note_created`.  Silently skips on:
@@ -165,6 +167,9 @@ async def _maybe_auto_create_note(
                 "note_id": note.id,
                 "title": note.title,
                 "transcript": transcript[:200],
+                # W2: stamp the turn_id (note_created bypasses the pipeline
+                # callback's auto-stamp) so W4 can dedup the note by turn_id.
+                "turn_id": turn_id,
             })
     except Exception as e:
         logger.error("Failed to auto-create dictation note: %s", e)

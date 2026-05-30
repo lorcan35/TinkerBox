@@ -74,6 +74,11 @@ async def handle_start_command(
     if mode == "dictate":
         pipeline._segment_buffer.clear()
         pipeline._dictation_segments.clear()
+        # W2: stash this dictation turn's id on the pipeline so finish_dictation
+        # can capture it for the async post-process — a later `start` overwrites
+        # conn_state["turn_id"], so the post-process must stamp the turn it
+        # belongs to, not the next one (back-to-back mis-stamp, S2-8).
+        pipeline._dictation_turn_id = turn_id
 
     logger.info(
         "Connection %s: start (mode=%s, turn_id=%s, audio buffer cleared)",

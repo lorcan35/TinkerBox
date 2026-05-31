@@ -63,7 +63,7 @@ _NATIVE_TOOL_GUIDANCE = (
 # Curated fast-tier tool allowlist (~14). Keeps the common calendar/email/
 # tasks/weather/time/calc/memory verbs the user actually hits; the rarer tools
 # (gmail_read/archive, calendar_week, tasks_delete, convert, stock_ticker,
-# system_info, web_search, timesense_timer, quick_poll, schedule_reminder, note,
+# system_info, web_search, timesense_timer, quick_poll, note,
 # forget_fact) are handled by the smart/async tier. Cuts prefill tokens.
 #
 # 2026-05-31 (Wave 2): `recall` added.  `remember` was in the fast set but
@@ -74,11 +74,18 @@ _NATIVE_TOOL_GUIDANCE = (
 # Exposing recall is cache-safe: the tool list is constant across turns, so the
 # 436s→29s prefix-stable cache win is preserved; only per-turn fact INJECTION
 # (deliberately not done) would have broken it.
+#
+# `schedule_reminder` also added (Wave 2): it was registered + the durable
+# scheduler (sqlite/boot-replay) + the widget_card fire path are all complete,
+# but the Local model never saw the tool, so "remind me to X at Y" was a no-op
+# on the default mode.  parse_when already handles "in 5 minutes / today at 6pm
+# / tomorrow morning".
 _FAST_NATIVE_TOOLS = {
     "calendar_today", "calendar_create", "calendar_cancel",
     "gmail_unread", "gmail_search", "gmail_send",
     "tasks_list", "tasks_add", "tasks_complete",
     "weather", "datetime", "calculator", "remember", "recall",
+    "schedule_reminder",
 }
 _NATIVE_TOOL_DESC = {
     "calendar_today": "List/read EXISTING calendar events for today. Read-only; does NOT create events.",
@@ -94,6 +101,7 @@ _NATIVE_TOOL_DESC = {
     "tasks_complete": "Mark an existing to-do task as done/complete/finished.",
     "remember": "Store/save a NEW fact about the user for later.",
     "recall": "Retrieve previously stored facts about the user.",
+    "schedule_reminder": "Schedule a reminder/alert for a FUTURE time. Extract the message + when ('in 5 minutes', 'today at 6pm', 'tomorrow morning', 'in 2 hours').",
 }
 
 

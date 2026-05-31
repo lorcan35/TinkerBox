@@ -574,18 +574,29 @@ class VoiceServer:
         # Tab5 side (10 s idle + 5 s × 3 probes ≈ 25 s).
         ws = web.WebSocketResponse(
             max_msg_size=10 * 1024 * 1024,
-            # 2026-05-30: 180 → 60 s.  The heartbeat is also the dead-socket
-            # reaper: when a client disconnects WHILE the handler is blocked
-            # mid-request (e.g. a dictation summary / inference), aiohttp can't
-            # see the close until the next heartbeat PING fails — so the socket
-            # sits in CLOSE-WAIT for up to `heartbeat` seconds.  Under reconnect
-            # churn (or repeated device reboots) those piled up and exhausted
-            # the WS handler (live: 27-59 CLOSE-WAIT wedged :3502, new upgrades
-            # failed, Tab5 stuck CONNECTING).  60 s reaps 3x faster.  Safe: a
-            # healthy client auto-PONGs the PING at the WS protocol level
-            # (autoping), independent of what its turn is doing; the long-turn
-            # protection is receive_timeout below, untouched.
-            heartbeat=60.0,
+            # 2026-05-31 (Wave 1, reboot fix): 60 → 180 s.  The 2026-05-30 drop
+            # to 60 s (for faster CLOSE-WAIT reaping) RE-INTRODUCED the exact bug
+            # the 2026-05-17 bump to 180 s had fixed: aiohttp uses heartbeat/2 as
+            # the implicit PONG-wait window, so 60 s = a 30 s PONG budget — too
+            # tight for Tab5's single-task esp_websocket_client when it's PONG-
+            # starved under TX back-pressure (long audio segment, screenshot
+            # storm, httpd hogging).  Dragon then logged "No PONG received after
+            # 30.0 seconds", dropped the WS, Tab5's voice_is_connected() went
+            # false, and its zombie-WiFi watchdog escalated to a hard esp_wifi
+            # kick that could fail → CONTROLLED REBOOT.  180 s restores the 90 s
+            # PONG budget (well outside any realistic Tab5 back-pressure), so the
+            # idle/back-pressured WS is no longer falsely reaped and the zombie
+            # ladder never arms (it requires !voice_is_connected()).
+            #
+            # The CLOSE-WAIT concern that motivated 60 s is now handled directly,
+            # not via the heartbeat reaper: evicted sockets are explicitly closed
+            # in stale_conn_eviction.py (`await old_ws.close(GOING_AWAY)`), and
+            # the reconnect churn that piled CLOSE-WAITs up was itself driven by
+            # these zombie reboots + the typed-turn failover bug (both now fixed),
+            # so the pile-up source is gone.  A healthy client still auto-PONGs at
+            # the protocol level; receive_timeout (600 s) below is the long-turn
+            # / dead-socket guard, untouched.
+            heartbeat=180.0,
             # 2026-04-23 (#58): 120 → 600 s.  Previously Tab5 WS got dropped
             # mid-turn when TC was running a long agent task — if the TC response
             # hasn't started streaming within 120 s (normal for MiniMax + tools),

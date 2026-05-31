@@ -60,16 +60,25 @@ _NATIVE_TOOL_GUIDANCE = (
     "bullet lists, headers, or URLs/links — say the essentials only (e.g. 'You "
     "have 3 events today: standup at 7:30, the DE standup at 1, and day-end at 3')."
 )
-# Curated fast-tier tool allowlist (~13). Keeps the common calendar/email/
+# Curated fast-tier tool allowlist (~14). Keeps the common calendar/email/
 # tasks/weather/time/calc/memory verbs the user actually hits; the rarer tools
 # (gmail_read/archive, calendar_week, tasks_delete, convert, stock_ticker,
 # system_info, web_search, timesense_timer, quick_poll, schedule_reminder, note,
-# forget_fact, recall) are handled by the smart/async tier. Cuts prefill tokens.
+# forget_fact) are handled by the smart/async tier. Cuts prefill tokens.
+#
+# 2026-05-31 (Wave 2): `recall` added.  `remember` was in the fast set but
+# `recall` was not, so Local-mode turns could STORE facts but never RETRIEVE
+# them — cross-session memory was structurally dead on the default path
+# (inject_memory is also False here to keep the system prompt byte-stable for
+# the prompt cache, so a tool call is the only way the model can reach a fact).
+# Exposing recall is cache-safe: the tool list is constant across turns, so the
+# 436s→29s prefix-stable cache win is preserved; only per-turn fact INJECTION
+# (deliberately not done) would have broken it.
 _FAST_NATIVE_TOOLS = {
     "calendar_today", "calendar_create", "calendar_cancel",
     "gmail_unread", "gmail_search", "gmail_send",
     "tasks_list", "tasks_add", "tasks_complete",
-    "weather", "datetime", "calculator", "remember",
+    "weather", "datetime", "calculator", "remember", "recall",
 }
 _NATIVE_TOOL_DESC = {
     "calendar_today": "List/read EXISTING calendar events for today. Read-only; does NOT create events.",

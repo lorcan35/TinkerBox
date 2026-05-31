@@ -870,3 +870,21 @@ sequentially across the whole file (don't restart per section).
   - vmode=3: OpenClaw (when you want its 50+ skills, browser automation, broader catalog).
 - **Prevention / pattern:**  Whenever you're tempted to add a feature ONLY to `vmode=3`, ask: "does this work in `vmode=0`?  Does it need an OAuth flow?  Does Tab5 need a UI surface for it?"  If the answers are "yes, no, yes" — it's a TinkerBox-native integration, not a vmode=3-only feature.  The architecture cost is one file in `tools/integrations/{name}/` plus a tool wrapper — way cheaper than another year of "the product is a thin OpenClaw frontend" perception.
 - **Tracking:** Parent issue + per-integration child issues; plan doc at `docs/PLAN-tinkerbox-integrations.md`; this LEARNINGS entry; memory entry at `~/.claude/projects/-home-rebelforce/memory/project_tinkerbox_integrations_layer.md`.
+
+---
+
+## 2026-05-31 — Wave program: WS-heartbeat reboot + Local fast-set memory/reminders
+
+### WS heartbeat=60 silently re-broke the PONG-starvation fix (zombie-WiFi reboot)
+- **Date:** 2026-05-31
+- **Symptom:** Tab5 reboots on a cycle. Dragon journal: `WebSocket error: No PONG received after 30.0 seconds` → WS dropped; Tab5 serial: `esp_wifi_start after hard kick failed: ESP_FAIL → controlled reboot`.
+- **Root Cause:** aiohttp `WebSocketResponse(heartbeat=N)` uses **N/2** as the implicit PONG-wait window. The 2026-05-30 dictation CLOSE-WAIT work dropped heartbeat 180→60, cutting the PONG budget 90s→30s — re-introducing the exact starvation the 2026-05-17 bump to 180 had fixed. Tab5's single-task `esp_websocket_client` can't auto-PONG within 30s under TX back-pressure (long audio / screenshot storm). Tab5's own pong budget is 180s (`WS_CLIENT_PONG_SEC`), so Dragon gave up 6× sooner than the client expected. WS drop → Tab5 `voice_is_connected()` false → zombie-WiFi watchdog → hard kick → reboot.
+- **Fix:** heartbeat back to 180 (90s PONG budget). The CLOSE-WAIT concern is handled directly by the eviction-close (`stale_conn_eviction.py: await old_ws.close(GOING_AWAY)`), not the heartbeat reaper. Verified: 100s idle WS, 0 drops, no reboot. (`server.py:588`, PR #378)
+- **Prevention:** `heartbeat` couples PING cadence AND the N/2 PONG window — never tune it for socket reaping alone. The PONG budget must exceed Tab5's worst-case single-task TX back-pressure (~30-40s during a long audio segment); keep it ≥120s. Reap CLOSE-WAIT via eviction-close, not by shrinking heartbeat.
+
+### Local-mode tools are invisible unless in _FAST_NATIVE_TOOLS (recall + schedule_reminder were dead)
+- **Date:** 2026-05-31
+- **Symptom:** On Local (Granite native), "what is my daughter allergic to?" never recalled stored facts, and "remind me to X at Y" was a no-op — even though `remember`, the memory service, and the durable scheduler (sqlite + boot-replay + widget_card fire) were all built and working.
+- **Root Cause:** `conversation.py::_FAST_NATIVE_TOOLS` is a curated ~13-tool allowlist that gates which tools are exposed in the prefix-stable system prompt on the native path. `remember` was in it but `recall` and `schedule_reminder` were not, so the Local model never saw them. `inject_memory=False` (kept for prompt-cache stability) means a tool call is the ONLY way the model reaches a stored fact, so excluding `recall` made cross-session memory structurally dead.
+- **Fix:** add `recall` + `schedule_reminder` to `_FAST_NATIVE_TOOLS` (+ descriptions). Cache-safe: the tool list is constant across turns so the 436s→29s prefix-stable cache win is preserved; only per-turn fact INJECTION would have broken it. Both verified live. (PR #379)
+- **Prevention:** A registered+wired tool is NOT reachable on Local until it's in `_FAST_NATIVE_TOOLS`. When adding an LLM-facing capability, check both the registry AND the fast-set allowlist. Disambiguate lexically-confusable tools in their descriptions (`schedule_reminder` vs `remember` — "remind" ≈ "remember" on a 1B model).

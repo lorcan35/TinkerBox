@@ -139,6 +139,17 @@ Tab5 sends `{"type":"config_update","voice_mode":0|1|2|3,"llm_model":"..."}`. Dr
 - **Pipeline init resets to local defaults on reconnect:** When a device reconnects, the pipeline is re-initialized with local defaults (voice_mode 0) regardless of the previous session's mode. The client must re-send `config_update` to restore cloud mode.
 - **Per-connection config (deep copy):** Each WebSocket connection gets a deep copy of the global config via `copy.deepcopy()`. This prevents one device's config_update (e.g., switching to cloud mode) from corrupting another device's pipeline config. Without deep copy, two Tab5s connected simultaneously would share the same mutable config object.
 
+**Note on TinkerON wake word (Tab5-side, 2026-05-18 LIVE):** Tab5 has an
+optional always-on "Hey Tinker" wake-word listener running on the
+stacked TinkerON module (K144 LLM Module Kit, branded TinkerON in
+user-facing surfaces).  On wake, Tab5 fires the regular
+`voice_start_listening()` orb-tap path, so wake-triggered turns hit
+Dragon over the SAME WebSocket with the SAME `voice_mode` routing as
+a manual orb tap — no special-case server-side handling needed.
+Dragon should expect short (~1-3 s) bursts of mic PCM after a wake
+event, identical to the orb-tap shape.  See TinkerTab `feat/wakeword`
+branch + `docs/PLAN-wakeword.md` for the client-side state machine.
+
 **Note on vmode=4 / vmode=5:**  These are Tab5-side-only modes.
 Tab5 auto-downconverts to vmode=0 on the wire so Dragon never
 sees them as live state.  Treat this as a protocol feature.
